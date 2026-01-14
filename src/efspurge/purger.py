@@ -11,6 +11,15 @@ import aiofiles.os
 from .logging import log_with_context, setup_logging
 
 
+async def async_scandir(path: Path):
+    """Async wrapper for os.scandir."""
+    loop = asyncio.get_event_loop()
+    def _scandir():
+        with os.scandir(path) as entries:
+            return list(entries)
+    return await loop.run_in_executor(None, _scandir)
+
+
 class AsyncEFSPurger:
     """
     High-performance async file purger for network file systems.
@@ -127,7 +136,7 @@ class AsyncEFSPurger:
             await self.update_stats(dirs_scanned=1)
 
             # Scan directory entries
-            entries = await aiofiles.os.scandir(directory)
+            entries = await async_scandir(directory)
             
             tasks = []
             subdirs = []

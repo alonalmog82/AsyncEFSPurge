@@ -2,8 +2,8 @@
 
 High-performance asynchronous file purger designed for AWS EFS and network filesystems with millions of files.
 
-[![CI](https://github.com/yourusername/AsyncEFSPurge/workflows/CI/badge.svg)](https://github.com/yourusername/AsyncEFSPurge/actions)
-[![Docker](https://github.com/yourusername/AsyncEFSPurge/workflows/Docker/badge.svg)](https://github.com/yourusername/AsyncEFSPurge/actions)
+[![CI](https://github.com/alonalmog82/AsyncEFSPurge/workflows/CI/badge.svg)](https://github.com/alonalmog82/AsyncEFSPurge/actions)
+[![Docker](https://github.com/alonalmog82/AsyncEFSPurge/workflows/Docker/badge.svg)](https://github.com/alonalmog82/AsyncEFSPurge/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## Features
@@ -50,7 +50,7 @@ efspurge /mnt/efs --max-age-days 7 --max-concurrency 2000
 ### Option 1: From Source
 
 ```bash
-git clone https://github.com/yourusername/AsyncEFSPurge.git
+git clone https://github.com/alonalmog82/AsyncEFSPurge.git
 cd AsyncEFSPurge
 pip install -e .
 ```
@@ -64,7 +64,7 @@ docker build -t efspurge:latest .
 ### Option 3: Docker Hub
 
 ```bash
-docker pull yourusername/efspurge:latest
+docker pull alonalmog82/efspurge:latest
 ```
 
 ## Usage
@@ -131,7 +131,7 @@ spec:
           restartPolicy: OnFailure
           containers:
           - name: efspurge
-            image: yourusername/efspurge:latest
+            image: alonalmog82/efspurge:latest
             args:
               - /data
               - --max-age-days=30
@@ -285,7 +285,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing, and contr
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/AsyncEFSPurge.git
+git clone https://github.com/alonalmog82/AsyncEFSPurge.git
 cd AsyncEFSPurge
 
 # Create virtual environment

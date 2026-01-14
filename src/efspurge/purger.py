@@ -4,7 +4,6 @@ import asyncio
 import os
 import time
 from pathlib import Path
-from typing import Optional
 
 import aiofiles.os
 
@@ -137,7 +136,7 @@ class AsyncEFSPurger:
 
             # Scan directory entries
             entries = await async_scandir(directory)
-            
+
             tasks = []
             subdirs = []
 

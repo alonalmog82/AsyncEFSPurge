@@ -63,7 +63,7 @@ def main() -> None:
 
     try:
         # Run the async purger
-        stats = asyncio.run(
+        asyncio.run(
             async_main(
                 path=args.path,
                 max_age_days=args.max_age_days,

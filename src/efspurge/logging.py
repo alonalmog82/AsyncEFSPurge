@@ -55,10 +55,7 @@ def setup_logging(logger_name: str = "efspurge", level: str = "INFO") -> logging
 
 
 def log_with_context(
-    logger: logging.Logger,
-    level: str,
-    message: str,
-    extra: Optional[Dict[str, Any]] = None
+    logger: logging.Logger, level: str, message: str, extra: Optional[Dict[str, Any]] = None
 ) -> None:
     """
     Log message with additional context fields.
@@ -74,5 +71,3 @@ def log_with_context(
 
     log_method = getattr(logger, level.lower())
     log_method(message, extra={"extra_fields": extra})
-
-

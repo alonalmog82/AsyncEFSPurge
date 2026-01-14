@@ -71,3 +71,4 @@ def log_with_context(
 
     log_method = getattr(logger, level.lower())
     log_method(message, extra={"extra_fields": extra})
+

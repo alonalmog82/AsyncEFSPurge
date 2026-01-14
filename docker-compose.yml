@@ -2,8 +2,12 @@ version: '3.8'
 
 services:
   efspurge:
-    build: .
-    image: efspurge:latest
+    # Use published image from GHCR
+    image: ghcr.io/alonalmog82/asyncefspurge:latest
+    
+    # Or build locally (comment out 'image' above and uncomment below)
+    # build: .
+    
     container_name: efspurge
     
     # Command with arguments
@@ -54,8 +58,12 @@ services:
 
   # Example: Run as a scheduled job
   efspurge-cron:
-    build: .
-    image: efspurge:latest
+    # Use published image from GHCR
+    image: ghcr.io/alonalmog82/asyncefspurge:latest
+    
+    # Or build locally
+    # build: .
+    
     container_name: efspurge-cron
     
     # Override entrypoint to run with cron

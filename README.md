@@ -20,12 +20,15 @@ High-performance asynchronous file purger designed for AWS EFS and network files
 ### Using Docker (Recommended)
 
 ```bash
+# Pull from GitHub Container Registry
+docker pull ghcr.io/alonalmog82/asyncefspurge:latest
+
 # Dry run to see what would be deleted
-docker run --rm -v /mnt/efs:/data efspurge:latest \
+docker run --rm -v /mnt/efs:/data ghcr.io/alonalmog82/asyncefspurge:latest \
   /data --max-age-days 30 --dry-run
 
 # Actually delete files
-docker run --rm -v /mnt/efs:/data efspurge:latest \
+docker run --rm -v /mnt/efs:/data ghcr.io/alonalmog82/asyncefspurge:latest \
   /data --max-age-days 30
 ```
 
@@ -61,10 +64,10 @@ pip install -e .
 docker build -t efspurge:latest .
 ```
 
-### Option 3: Docker Hub
+### Option 3: GitHub Container Registry
 
 ```bash
-docker pull alonalmog82/efspurge:latest
+docker pull ghcr.io/alonalmog82/asyncefspurge:latest
 ```
 
 ## Usage
@@ -131,7 +134,7 @@ spec:
           restartPolicy: OnFailure
           containers:
           - name: efspurge
-            image: alonalmog82/efspurge:latest
+            image: ghcr.io/alonalmog82/asyncefspurge:latest
             args:
               - /data
               - --max-age-days=30

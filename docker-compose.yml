@@ -1,0 +1,77 @@
+version: '3.8'
+
+services:
+  efspurge:
+    build: .
+    image: efspurge:latest
+    container_name: efspurge
+    
+    # Command with arguments
+    command:
+      - /data
+      - --max-age-days=30
+      - --max-concurrency=1000
+      - --log-level=INFO
+      # - --dry-run  # Uncomment for testing
+    
+    # Volumes
+    volumes:
+      - /mnt/efs:/data:rw  # Mount your EFS here
+      # For testing with local directory:
+      # - ./test-data:/data:rw
+    
+    # Environment variables
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    
+    # Security
+    user: "1000:1000"
+    read_only: false  # Needs write access to delete files
+    
+    # Logging
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    
+    # Network
+    network_mode: bridge
+    
+    # Restart policy
+    restart: "no"  # One-time execution, use with cron or scheduler
+
+  # Example: Run as a scheduled job
+  efspurge-cron:
+    build: .
+    image: efspurge:latest
+    container_name: efspurge-cron
+    
+    # Override entrypoint to run with cron
+    entrypoint: /bin/sh
+    command: >
+      -c "echo '0 2 * * * efspurge /data --max-age-days=30 >> /var/log/efspurge.log 2>&1' | crontab - && crond -f"
+    
+    volumes:
+      - /mnt/efs:/data:rw
+      - efspurge-logs:/var/log
+    
+    environment:
+      - PYTHONUNBUFFERED=1
+    
+    restart: unless-stopped
+
+volumes:
+  efspurge-logs:
+

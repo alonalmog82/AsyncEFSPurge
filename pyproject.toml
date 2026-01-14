@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "efspurge"
+version = "1.0.0"
+description = "High-performance async file purger for AWS EFS and network storage"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    { name = "Alon Almog", email = "alon.almog@rivery.io" }
+]
+dependencies = [
+    "aiofiles>=23.2.1",
+    "aiobotocore>=2.11.0",  # For future AWS integration
+]
+
+[project.scripts]
+efspurge = "efspurge.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["efspurge"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "pytest-asyncio>=0.21",
+    "pytest-mock>=3.12",
+    "ruff>=0.1.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "--cov=efspurge --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["efspurge"]
+relative_files = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "pass",
+]
+
+[tool.ruff]
+line-length = 120
+exclude = [".venv", "venv", "build", "__pycache__"]
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+]
+ignore = []
+
+

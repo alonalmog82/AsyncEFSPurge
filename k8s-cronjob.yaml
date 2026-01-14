@@ -1,0 +1,110 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: efs-purge
+  namespace: default
+spec:
+  # Run daily at 2 AM UTC
+  schedule: "0 2 * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  concurrencyPolicy: Forbid
+  
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 7200  # 2 hour timeout
+      
+      template:
+        metadata:
+          labels:
+            app: efspurge
+            version: "1.0.0"
+        
+        spec:
+          restartPolicy: OnFailure
+          
+          # Security context
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            fsGroup: 1000
+          
+          containers:
+          - name: efspurge
+            image: ghcr.io/yourusername/asyncefspurge:latest
+            imagePullPolicy: IfNotPresent
+            
+            args:
+              - /data
+              - --max-age-days=30
+              - --max-concurrency=1000
+              - --log-level=INFO
+            
+            # Security context
+            securityContext:
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities:
+                drop:
+                  - ALL
+            
+            # Resource limits
+            resources:
+              requests:
+                memory: "256Mi"
+                cpu: "500m"
+              limits:
+                memory: "512Mi"
+                cpu: "1000m"
+            
+            # Volume mounts
+            volumeMounts:
+            - name: efs-volume
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+            
+            # Environment variables
+            env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          
+          # Volumes
+          volumes:
+          - name: efs-volume
+            persistentVolumeClaim:
+              claimName: efs-pvc
+          - name: tmp
+            emptyDir: {}
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: efs-pvc
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 1Gi  # Placeholder, EFS doesn't enforce this
+
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs-sc
+provisioner: efs.csi.aws.com
+parameters:
+  provisioningMode: efs-ap
+  fileSystemId: fs-12345678  # Replace with your EFS ID
+  directoryPerms: "700"
+  gidRangeStart: "1000"
+  gidRangeEnd: "2000"
+  basePath: "/purge-data"
+

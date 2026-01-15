@@ -103,6 +103,11 @@ class AsyncEFSPurger:
         self.last_progress_log = time.time()
         self.progress_interval = 30  # Log progress every 30 seconds
 
+        # Memory back-pressure tracking
+        self.last_memory_warning = 0  # Track last warning time
+        self.memory_warning_interval = 60  # Only warn once per minute
+        self.memory_check_lock = asyncio.Lock()  # Prevent concurrent checks
+
     async def update_stats(self, **kwargs) -> None:
         """Thread-safe update of statistics."""
         async with self.stats_lock:
@@ -145,25 +150,39 @@ class AsyncEFSPurger:
                 )
 
     async def check_memory_pressure(self) -> None:
-        """Check if memory usage is high and apply back-pressure if needed."""
+        """
+        Check if memory usage is high and apply back-pressure if needed.
+
+        Uses a lock to prevent concurrent checks and rate-limits warning messages
+        to avoid log spam.
+        """
         if self.memory_limit_mb <= 0:
             return  # No limit set
 
-        memory_mb = get_memory_usage_mb()
-        if memory_mb > self.memory_limit_mb:
-            # We're over the soft limit, apply back-pressure
-            await self.update_stats(memory_backpressure_events=1)
-            self.logger.warning(
-                f"Memory usage ({memory_mb:.1f} MB) exceeds limit ({self.memory_limit_mb} MB), "
-                "applying back-pressure..."
-            )
-            # Wait a bit for garbage collection and memory to be freed
-            await asyncio.sleep(1)
+        # Use lock to prevent multiple concurrent checks
+        async with self.memory_check_lock:
+            memory_mb = get_memory_usage_mb()
+            if memory_mb > self.memory_limit_mb:
+                current_time = time.time()
 
-            # Force garbage collection
-            import gc
+                # Only log warning once per interval to avoid spam
+                if current_time - self.last_memory_warning >= self.memory_warning_interval:
+                    self.logger.warning(
+                        f"Memory usage ({memory_mb:.1f} MB) exceeds limit ({self.memory_limit_mb} MB), "
+                        f"applying back-pressure (logged once per {self.memory_warning_interval}s to avoid spam)..."
+                    )
+                    self.last_memory_warning = current_time
 
-            gc.collect()
+                # Track back-pressure event
+                await self.update_stats(memory_backpressure_events=1)
+
+                # Apply actual back-pressure: pause briefly and force GC
+                await asyncio.sleep(0.5)  # Shorter pause, but happens under lock
+
+                # Force garbage collection
+                import gc
+
+                gc.collect()
 
     async def process_file(self, file_path: Path) -> None:
         """
@@ -258,6 +277,7 @@ class AsyncEFSPurger:
                     batch = tasks[i : i + self.task_batch_size]
 
                     # Check memory pressure before processing each batch
+                    # (but lock prevents spam from concurrent checks)
                     await self.check_memory_pressure()
 
                     await asyncio.gather(*batch, return_exceptions=True)
@@ -270,7 +290,8 @@ class AsyncEFSPurger:
 
             # FIX #1: Recursively process subdirectories CONCURRENTLY (not sequentially)
             if subdirs:
-                # Check memory pressure before spawning subdirectory tasks
+                # Only check memory once before spawning all subdirectory tasks
+                # (not per subdirectory, to reduce overhead)
                 await self.check_memory_pressure()
 
                 # Process all subdirectories concurrently for massive performance boost

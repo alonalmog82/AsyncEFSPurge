@@ -54,9 +54,7 @@ def setup_logging(logger_name: str = "efspurge", level: str = "INFO") -> logging
     return logger
 
 
-def log_with_context(
-    logger: logging.Logger, level: str, message: str, extra: Optional[Dict[str, Any]] = None
-) -> None:
+def log_with_context(logger: logging.Logger, level: str, message: str, extra: Optional[Dict[str, Any]] = None) -> None:
     """
     Log message with additional context fields.
 

@@ -35,4 +35,3 @@ async def test_purger_initialization():
     assert purger.root_path.name == "test"
     assert purger.max_age_days == 30
     assert purger.dry_run is True
-

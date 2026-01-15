@@ -293,6 +293,48 @@ class AsyncEFSPurger:
             )
             await self.update_stats(errors=1)
 
+    async def _background_progress_reporter(self) -> None:
+        """
+        Background task that logs progress every N seconds.
+
+        This ensures progress updates even when processing is slow or
+        there are long periods of directory traversal without file processing.
+        """
+        while True:
+            await asyncio.sleep(self.progress_interval)
+
+            # Log current progress
+            async with self.stats_lock:
+                current_time = time.time()
+                elapsed = current_time - self.stats.get("start_time", current_time)
+                rate = self.stats["files_scanned"] / elapsed if elapsed > 0 else 0
+                memory_mb = get_memory_usage_mb()
+                memory_percent = (memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
+
+                log_with_context(
+                    self.logger,
+                    "info",
+                    "Progress update",
+                    {
+                        "files_scanned": self.stats["files_scanned"],
+                        "files_to_purge": self.stats["files_to_purge"],
+                        "files_purged": self.stats["files_purged"],
+                        "dirs_scanned": self.stats["dirs_scanned"],
+                        "errors": self.stats["errors"],
+                        "memory_backpressure_events": self.stats.get("memory_backpressure_events", 0),
+                        "elapsed_seconds": round(elapsed, 1),
+                        "files_per_second": round(rate, 1),
+                        "memory_mb": round(memory_mb, 1),
+                        "memory_limit_mb": self.memory_limit_mb,
+                        "memory_usage_percent": round(memory_percent, 1),
+                        "memory_mb_per_1k_files": (
+                            round(memory_mb / (self.stats["files_scanned"] / 1000), 2)
+                            if self.stats["files_scanned"] > 0
+                            else 0.0
+                        ),
+                    },
+                )
+
     async def purge(self) -> dict:
         """
         Main purge operation - scan and clean the file system.
@@ -325,8 +367,19 @@ class AsyncEFSPurger:
             log_with_context(self.logger, "error", error_msg, {"root_path": str(self.root_path)})
             raise FileNotFoundError(error_msg)
 
-        # Start the recursive scan
-        await self.scan_directory(self.root_path)
+        # Start background progress reporter
+        progress_task = asyncio.create_task(self._background_progress_reporter())
+
+        try:
+            # Start the recursive scan
+            await self.scan_directory(self.root_path)
+        finally:
+            # Cancel background reporter
+            progress_task.cancel()
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass  # Expected
 
         # Log one final progress update if we haven't logged recently
         elapsed = time.time() - self.stats.get("start_time", time.time())

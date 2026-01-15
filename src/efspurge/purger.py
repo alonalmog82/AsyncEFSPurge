@@ -10,6 +10,23 @@ import aiofiles.os
 from .logging import log_with_context, setup_logging
 
 
+def get_memory_usage_mb() -> float:
+    """Get current memory usage in MB."""
+    try:
+        import psutil
+
+        process = psutil.Process()
+        return process.memory_info().rss / 1024 / 1024  # Convert bytes to MB
+    except ImportError:
+        # If psutil not available, try alternative method
+        try:
+            import resource
+
+            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # KB to MB on Linux
+        except Exception:
+            return 0.0  # Return 0 if we can't measure
+
+
 async def async_scandir(path: Path):
     """Async wrapper for os.scandir."""
     loop = asyncio.get_event_loop()
@@ -92,6 +109,7 @@ class AsyncEFSPurger:
                 self.last_progress_log = current_time
                 elapsed = current_time - self.stats.get("start_time", current_time)
                 rate = self.stats["files_scanned"] / elapsed if elapsed > 0 else 0
+                memory_mb = get_memory_usage_mb()
 
                 log_with_context(
                     self.logger,
@@ -105,6 +123,12 @@ class AsyncEFSPurger:
                         "errors": self.stats["errors"],
                         "elapsed_seconds": round(elapsed, 1),
                         "files_per_second": round(rate, 1),
+                        "memory_mb": round(memory_mb, 1),
+                        "memory_mb_per_1k_files": (
+                            round(memory_mb / (self.stats["files_scanned"] / 1000), 2)
+                            if self.stats["files_scanned"] > 0
+                            else 0.0
+                        ),
                     },
                 )
 
@@ -256,12 +280,14 @@ class AsyncEFSPurger:
         duration = time.time() - start_time
         files_per_sec = self.stats["files_scanned"] / duration if duration > 0 else 0
         mb_freed = self.stats["bytes_freed"] / (1024 * 1024)
+        memory_mb = get_memory_usage_mb()
 
         final_stats = {
             **self.stats,
             "duration_seconds": round(duration, 2),
             "files_per_second": round(files_per_sec, 2),
             "mb_freed": round(mb_freed, 2),
+            "peak_memory_mb": round(memory_mb, 1),
         }
 
         log_with_context(

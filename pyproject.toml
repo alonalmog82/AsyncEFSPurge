@@ -15,6 +15,7 @@ authors = [
 dependencies = [
     "aiofiles>=23.2.1",
     "aiobotocore>=2.11.0",  # For future AWS integration
+    "psutil>=5.9.0",  # For memory monitoring
 ]
 
 [project.scripts]

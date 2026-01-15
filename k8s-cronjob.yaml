@@ -38,7 +38,7 @@ spec:
             args:
               - /data
               - --max-age-days=30
-              - --max-concurrency=1000
+              - --max-concurrency=1000  # Lower this if you see high memory usage
               - --log-level=INFO
             
             # Security context
@@ -50,13 +50,15 @@ spec:
                   - ALL
             
             # Resource limits
+            # For millions of files, monitor memory usage and adjust as needed
+            # Rule of thumb: ~0.5-1MB per 1000 files with concurrency=1000
             resources:
               requests:
-                memory: "256Mi"
+                memory: "512Mi"   # Minimum memory guaranteed
                 cpu: "500m"
               limits:
-                memory: "512Mi"
-                cpu: "1000m"
+                memory: "1Gi"     # Increased limit for large datasets
+                cpu: "2000m"      # More CPU for better performance
             
             # Volume mounts
             volumeMounts:

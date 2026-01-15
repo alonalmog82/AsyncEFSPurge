@@ -264,6 +264,7 @@ class AsyncEFSPurger:
                 "cutoff_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.cutoff_time)),
                 "max_concurrency": self.max_concurrency,
                 "dry_run": self.dry_run,
+                "progress_interval_seconds": self.progress_interval,
             },
         )
 
@@ -275,6 +276,28 @@ class AsyncEFSPurger:
 
         # Start the recursive scan
         await self.scan_directory(self.root_path)
+
+        # Log one final progress update if we haven't logged recently
+        elapsed = time.time() - self.stats.get("start_time", time.time())
+        if elapsed > self.progress_interval and (time.time() - self.last_progress_log) > 10:
+            # Force a final progress update
+            rate = self.stats["files_scanned"] / elapsed if elapsed > 0 else 0
+            memory_mb = get_memory_usage_mb()
+            log_with_context(
+                self.logger,
+                "info",
+                "Final progress before completion",
+                {
+                    "files_scanned": self.stats["files_scanned"],
+                    "files_to_purge": self.stats["files_to_purge"],
+                    "files_purged": self.stats["files_purged"],
+                    "dirs_scanned": self.stats["dirs_scanned"],
+                    "errors": self.stats["errors"],
+                    "elapsed_seconds": round(elapsed, 1),
+                    "files_per_second": round(rate, 1),
+                    "memory_mb": round(memory_mb, 1),
+                },
+            )
 
         # Calculate final statistics
         duration = time.time() - start_time

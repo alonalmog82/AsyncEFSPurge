@@ -56,6 +56,8 @@ class AsyncEFSPurger:
         max_concurrency: int = 1000,
         dry_run: bool = True,
         log_level: str = "INFO",
+        memory_limit_mb: int = 800,
+        task_batch_size: int = 5000,
     ):
         """
         Initialize the async EFS purger.
@@ -66,12 +68,16 @@ class AsyncEFSPurger:
             max_concurrency: Maximum concurrent async operations
             dry_run: If True, only report what would be deleted
             log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
+            memory_limit_mb: Soft memory limit in MB (triggers back-pressure)
+            task_batch_size: Maximum tasks to create at once (prevents OOM)
         """
         self.root_path = Path(root_path)
         self.max_age_days = max_age_days
         self.cutoff_time = time.time() - (max_age_days * 86400)  # Convert days to seconds
         self.max_concurrency = max_concurrency
         self.dry_run = dry_run
+        self.memory_limit_mb = memory_limit_mb
+        self.task_batch_size = task_batch_size
 
         # Statistics
         self.stats = {
@@ -83,6 +89,7 @@ class AsyncEFSPurger:
             "errors": 0,
             "bytes_freed": 0,
             "start_time": time.time(),
+            "memory_backpressure_events": 0,
         }
 
         # Concurrency control
@@ -121,9 +128,14 @@ class AsyncEFSPurger:
                         "files_purged": self.stats["files_purged"],
                         "dirs_scanned": self.stats["dirs_scanned"],
                         "errors": self.stats["errors"],
+                        "memory_backpressure_events": self.stats["memory_backpressure_events"],
                         "elapsed_seconds": round(elapsed, 1),
                         "files_per_second": round(rate, 1),
                         "memory_mb": round(memory_mb, 1),
+                        "memory_limit_mb": self.memory_limit_mb,
+                        "memory_usage_percent": round((memory_mb / self.memory_limit_mb) * 100, 1)
+                        if self.memory_limit_mb > 0
+                        else 0.0,
                         "memory_mb_per_1k_files": (
                             round(memory_mb / (self.stats["files_scanned"] / 1000), 2)
                             if self.stats["files_scanned"] > 0
@@ -131,6 +143,27 @@ class AsyncEFSPurger:
                         ),
                     },
                 )
+
+    async def check_memory_pressure(self) -> None:
+        """Check if memory usage is high and apply back-pressure if needed."""
+        if self.memory_limit_mb <= 0:
+            return  # No limit set
+
+        memory_mb = get_memory_usage_mb()
+        if memory_mb > self.memory_limit_mb:
+            # We're over the soft limit, apply back-pressure
+            await self.update_stats(memory_backpressure_events=1)
+            self.logger.warning(
+                f"Memory usage ({memory_mb:.1f} MB) exceeds limit ({self.memory_limit_mb} MB), "
+                "applying back-pressure..."
+            )
+            # Wait a bit for garbage collection and memory to be freed
+            await asyncio.sleep(1)
+
+            # Force garbage collection
+            import gc
+
+            gc.collect()
 
     async def process_file(self, file_path: Path) -> None:
         """
@@ -219,13 +252,29 @@ class AsyncEFSPurger:
                     )
                     await self.update_stats(errors=1)
 
-            # Process all files in this directory concurrently
+            # FIX #2: Process files in batches to prevent OOM from unbounded task creation
             if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                for i in range(0, len(tasks), self.task_batch_size):
+                    batch = tasks[i : i + self.task_batch_size]
 
-            # Recursively process subdirectories
-            for subdir in subdirs:
-                await self.scan_directory(subdir)
+                    # Check memory pressure before processing each batch
+                    await self.check_memory_pressure()
+
+                    await asyncio.gather(*batch, return_exceptions=True)
+
+                    batch_num = i // self.task_batch_size + 1
+                    total_batches = (len(tasks) + self.task_batch_size - 1) // self.task_batch_size
+                    self.logger.debug(
+                        f"Processed batch {batch_num}/{total_batches} ({len(batch)} files) in {directory}"
+                    )
+
+            # FIX #1: Recursively process subdirectories CONCURRENTLY (not sequentially)
+            if subdirs:
+                # Check memory pressure before spawning subdirectory tasks
+                await self.check_memory_pressure()
+
+                # Process all subdirectories concurrently for massive performance boost
+                await asyncio.gather(*[self.scan_directory(subdir) for subdir in subdirs], return_exceptions=True)
 
         except PermissionError as e:
             log_with_context(
@@ -265,6 +314,8 @@ class AsyncEFSPurger:
                 "max_concurrency": self.max_concurrency,
                 "dry_run": self.dry_run,
                 "progress_interval_seconds": self.progress_interval,
+                "memory_limit_mb": self.memory_limit_mb,
+                "task_batch_size": self.task_batch_size,
             },
         )
 
@@ -329,6 +380,8 @@ async def async_main(
     max_concurrency: int = 1000,
     dry_run: bool = True,
     log_level: str = "INFO",
+    memory_limit_mb: int = 800,
+    task_batch_size: int = 5000,
 ) -> dict:
     """
     Async entry point for the purger.
@@ -339,6 +392,8 @@ async def async_main(
         max_concurrency: Maximum concurrent operations
         dry_run: If True, don't actually delete files
         log_level: Logging level
+        memory_limit_mb: Soft memory limit in MB (0 = no limit)
+        task_batch_size: Maximum tasks to create at once
 
     Returns:
         Operation statistics
@@ -349,6 +404,8 @@ async def async_main(
         max_concurrency=max_concurrency,
         dry_run=dry_run,
         log_level=log_level,
+        memory_limit_mb=memory_limit_mb,
+        task_batch_size=task_batch_size,
     )
 
     return await purger.purge()

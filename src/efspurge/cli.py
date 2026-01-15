@@ -35,6 +35,20 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--memory-limit-mb",
+        type=int,
+        default=800,
+        help="Soft memory limit in MB (triggers back-pressure, 0 = no limit)",
+    )
+
+    parser.add_argument(
+        "--task-batch-size",
+        type=int,
+        default=5000,
+        help="Maximum tasks to create at once (prevents OOM)",
+    )
+
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Don't actually delete files, just report what would be deleted",
@@ -70,6 +84,8 @@ def main() -> None:
                 max_concurrency=args.max_concurrency,
                 dry_run=args.dry_run,
                 log_level=args.log_level,
+                memory_limit_mb=args.memory_limit_mb,
+                task_batch_size=args.task_batch_size,
             )
         )
 

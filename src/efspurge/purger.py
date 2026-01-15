@@ -65,6 +65,7 @@ class AsyncEFSPurger:
             "symlinks_skipped": 0,
             "errors": 0,
             "bytes_freed": 0,
+            "start_time": time.time(),
         }
 
         # Concurrency control
@@ -74,12 +75,38 @@ class AsyncEFSPurger:
         # Logging
         self.logger = setup_logging("efspurge", log_level)
 
+        # Progress tracking
+        self.last_progress_log = time.time()
+        self.progress_interval = 30  # Log progress every 30 seconds
+
     async def update_stats(self, **kwargs) -> None:
         """Thread-safe update of statistics."""
         async with self.stats_lock:
             for key, value in kwargs.items():
                 if key in self.stats:
                     self.stats[key] += value
+
+            # Log progress periodically
+            current_time = time.time()
+            if current_time - self.last_progress_log >= self.progress_interval:
+                self.last_progress_log = current_time
+                elapsed = current_time - self.stats.get("start_time", current_time)
+                rate = self.stats["files_scanned"] / elapsed if elapsed > 0 else 0
+
+                log_with_context(
+                    self.logger,
+                    "info",
+                    "Progress update",
+                    {
+                        "files_scanned": self.stats["files_scanned"],
+                        "files_to_purge": self.stats["files_to_purge"],
+                        "files_purged": self.stats["files_purged"],
+                        "dirs_scanned": self.stats["dirs_scanned"],
+                        "errors": self.stats["errors"],
+                        "elapsed_seconds": round(elapsed, 1),
+                        "files_per_second": round(rate, 1),
+                    },
+                )
 
     async def process_file(self, file_path: Path) -> None:
         """

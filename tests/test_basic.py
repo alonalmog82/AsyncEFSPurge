@@ -7,7 +7,7 @@ def test_version():
     """Test that version is defined."""
     from efspurge import __version__
 
-    assert __version__ == "1.2.0"
+    assert __version__ == "1.3.0"
 
 
 def test_imports():

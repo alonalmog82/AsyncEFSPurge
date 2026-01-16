@@ -144,39 +144,8 @@ class AsyncEFSPurger:
                 if key in self.stats:
                     self.stats[key] += value
 
-            # Log progress periodically
-            current_time = time.time()
-            if current_time - self.last_progress_log >= self.progress_interval:
-                self.last_progress_log = current_time
-                elapsed = current_time - self.stats.get("start_time", current_time)
-                rate = self.stats["files_scanned"] / elapsed if elapsed > 0 else 0
-                memory_mb = get_memory_usage_mb()
-
-                log_with_context(
-                    self.logger,
-                    "info",
-                    "Progress update",
-                    {
-                        "files_scanned": self.stats["files_scanned"],
-                        "files_to_purge": self.stats["files_to_purge"],
-                        "files_purged": self.stats["files_purged"],
-                        "dirs_scanned": self.stats["dirs_scanned"],
-                        "errors": self.stats["errors"],
-                        "memory_backpressure_events": self.stats["memory_backpressure_events"],
-                        "elapsed_seconds": round(elapsed, 1),
-                        "files_per_second": round(rate, 1),
-                        "memory_mb": round(memory_mb, 1),
-                        "memory_limit_mb": self.memory_limit_mb,
-                        "memory_usage_percent": round((memory_mb / self.memory_limit_mb) * 100, 1)
-                        if self.memory_limit_mb > 0
-                        else 0.0,
-                        "memory_mb_per_1k_files": (
-                            round(memory_mb / (self.stats["files_scanned"] / 1000), 2)
-                            if self.stats["files_scanned"] > 0
-                            else 0.0
-                        ),
-                    },
-                )
+            # Progress logging is handled by _background_progress_reporter()
+            # Removed duplicate logging here to prevent duplicate log entries
 
     async def check_memory_pressure(self) -> None:
         """
@@ -313,6 +282,16 @@ class AsyncEFSPurger:
         if not self.empty_dirs:
             return
 
+        # Log start of empty directory removal
+        async with self.stats_lock:
+            empty_dir_count = len(self.empty_dirs)
+        log_with_context(
+            self.logger,
+            "info",
+            "Starting empty directory removal",
+            {"empty_dirs_found": empty_dir_count},
+        )
+
         # Get initial set of empty directories (copy under lock)
         async with self.stats_lock:
             initial_empty_dirs = set(self.empty_dirs)
@@ -394,12 +373,48 @@ class AsyncEFSPurger:
                 )
                 await self.update_stats(errors=1)
 
+        # Log progress after first pass
+        async with self.stats_lock:
+            deleted_count = self.stats.get("empty_dirs_deleted", 0)
+        log_with_context(
+            self.logger,
+            "info",
+            "Empty directory removal progress",
+            {"empty_dirs_deleted": deleted_count, "phase": "first_pass"},
+        )
+
+        # Log before second pass
+        if new_empty_parents:
+            log_with_context(
+                self.logger,
+                "info",
+                "Starting cascading empty directory removal",
+                {"parents_to_check": len(new_empty_parents)},
+            )
+
         # Second pass: Process parents that became empty (cascading deletion)
         # Continue until no new empty parents are found
+        iteration = 0
         while new_empty_parents:
+            iteration += 1
             # Get next batch of parents to process
             parents_to_process = sorted(new_empty_parents, key=lambda p: len(p.parts), reverse=True)
             new_empty_parents = set()  # Reset for next iteration
+
+            # Log progress every 100 iterations or every 1000 directories processed
+            if iteration % 100 == 0 or len(parents_to_process) > 1000:
+                async with self.stats_lock:
+                    current_count = self.stats.get("empty_dirs_deleted", 0)
+                log_with_context(
+                    self.logger,
+                    "info",
+                    "Cascading empty directory removal progress",
+                    {
+                        "iteration": iteration,
+                        "empty_dirs_deleted": current_count,
+                        "parents_remaining": len(parents_to_process),
+                    },
+                )
 
             for parent in parents_to_process:
                 if parent in processed_dirs:
@@ -458,6 +473,16 @@ class AsyncEFSPurger:
                         {"directory": str(parent), "error": str(e)},
                     )
                     await self.update_stats(errors=1)
+
+        # Log completion
+        async with self.stats_lock:
+            final_count = self.stats.get("empty_dirs_deleted", 0)
+        log_with_context(
+            self.logger,
+            "info",
+            "Empty directory removal completed",
+            {"total_empty_dirs_deleted": final_count, "iterations": iteration},
+        )
 
     async def _process_file_batch(self, file_tasks: list) -> None:
         """

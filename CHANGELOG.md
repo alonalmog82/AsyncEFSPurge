@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.2] - 2026-01-16
+
+### Fixed
+- **Duplicate Progress Logging**: Removed duplicate progress logs from `update_stats()` method
+- **Empty Directory Removal Visibility**: Fixed duplicate "Starting cascading empty directory removal" log message
+- **Progress Logging During Cascading Deletion**: Improved progress logging to every 100 iterations or 1000 directories (instead of every 10 iterations) for better visibility during long-running operations
+
+### Added
+- **Logging Tests**: Added comprehensive test suite (`tests/test_logging.py`) to catch duplicate logging bugs
+  - Tests verify no duplicate progress logs
+  - Tests verify empty directory removal logs appear when enabled
+  - Tests verify startup log includes `remove_empty_dirs` setting
+
 ## [1.6.1] - 2026-01-16
 
 ### Changed

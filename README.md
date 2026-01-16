@@ -17,6 +17,7 @@ High-performance asynchronous file purger designed for AWS EFS and network files
 - 🎯 **Flexible** - Age-based filtering with day precision
 - 🐳 **Production Ready** - Docker support with security best practices
 - 📈 **Detailed Stats** - Files scanned, purged, bytes freed, errors, and performance metrics
+- 🗂️ **Empty Directory Cleanup** - Optional post-order deletion of empty directories with rate limiting
 
 ## Quick Start
 
@@ -89,7 +90,8 @@ options:
   --memory-limit-mb MB      Soft memory limit in MB, triggers back-pressure (default: 800)
   --task-batch-size N       Maximum tasks to create at once, prevents OOM (default: 5000)
   --dry-run                 Don't actually delete files, just report what would be deleted
-  --remove-empty-dirs      Remove empty directories after scanning (post-order deletion)
+  --remove-empty-dirs       Remove empty directories after scanning (post-order deletion)
+  --max-empty-dirs-to-delete N  Maximum empty directories to delete per run (0 = unlimited, default: 500)
   --log-level LEVEL         Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL (default: INFO)
   --version                 Show version and exit
   -h, --help                Show this help message and exit
@@ -120,6 +122,18 @@ efspurge /mnt/efs/temp --max-age-days 1 --log-level DEBUG
 **Remove empty directories after purging:**
 ```bash
 efspurge /mnt/efs --max-age-days 30 --remove-empty-dirs
+```
+
+**Rate-limited empty directory removal (default: 500/run):**
+```bash
+# Default: removes up to 500 empty directories per run
+efspurge /mnt/efs --max-age-days 30 --remove-empty-dirs
+
+# First run with many empty directories: use unlimited
+efspurge /mnt/efs --max-age-days 30 --remove-empty-dirs --max-empty-dirs-to-delete 0
+
+# Custom rate limit: 100 directories per run for very gradual cleanup
+efspurge /mnt/efs --max-age-days 30 --remove-empty-dirs --max-empty-dirs-to-delete 100
 ```
 
 ## Deployment
@@ -336,6 +350,40 @@ ruff format .
 - `PYTHONUNBUFFERED=1` - Recommended for real-time logging in containers
 - `PYTHONDONTWRITEBYTECODE=1` - Prevents `.pyc` file creation
 - `EFSPURGE_REMOVE_EMPTY_DIRS=1` - Enable empty directory removal (same as `--remove-empty-dirs` flag)
+- `EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE=N` - Maximum empty directories to delete per run (0 = unlimited, default: 500)
+
+### Empty Directory Rate Limiting
+
+The `--max-empty-dirs-to-delete` parameter controls the maximum number of empty directories to delete per run. **Default: 500 directories per run.**
+
+**Why Rate Limiting?**
+- **Avoid metadata storms**: On network filesystems like AWS EFS, deleting thousands of directories simultaneously can overwhelm the metadata service, causing performance degradation for other operations
+- **Predictable behavior**: Limit sudden large-scale changes to your filesystem
+- **Gradual cleanup**: Spread directory deletion across multiple CronJob runs for smoother operations
+- **Reduced impact**: Your applications and other processes continue operating normally during cleanup
+
+**Per-Run Design:**
+Since this tool typically runs as a **CronJob**, the rate limit is per-execution (not per-time). Your CronJob schedule provides the time-based component:
+- **Daily CronJob** with `--max-empty-dirs-to-delete=500` → **500 dirs/day max**
+- **Hourly CronJob** with `--max-empty-dirs-to-delete=500` → **500 dirs/hour max**
+
+**Common Scenarios:**
+
+| Scenario | Recommended Setting | Environment Variable |
+|----------|-------------------|---------------------|
+| **Default (safe)** | 500 (default) | `EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE=500` |
+| **Initial cleanup** | 0 (unlimited) | `EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE=0` |
+| **Very conservative** | 100 | `EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE=100` |
+| **Aggressive** | 2000 | `EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE=2000` |
+
+**Example workflow:**
+```bash
+# First run: unlimited to clean up existing backlog
+efspurge /data --max-age-days 30 --remove-empty-dirs --max-empty-dirs-to-delete 0
+
+# Subsequent runs: use default (500) for safe, gradual cleanup
+efspurge /data --max-age-days 30 --remove-empty-dirs
+```
 
 ### Tuning Concurrency
 

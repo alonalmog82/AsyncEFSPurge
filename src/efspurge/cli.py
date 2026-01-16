@@ -71,6 +71,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--max-empty-dirs-to-delete",
+        type=int,
+        default=int(os.getenv("EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE", "500")),
+        help="Maximum empty directories to delete per run (0 = unlimited, default: 500)",
+    )
+
+    parser.add_argument(
         "--version",
         action="version",
         version=f"efspurge {__version__}",
@@ -95,6 +102,7 @@ def main() -> None:
                 memory_limit_mb=args.memory_limit_mb,
                 task_batch_size=args.task_batch_size,
                 remove_empty_dirs=args.remove_empty_dirs,
+                max_empty_dirs_to_delete=args.max_empty_dirs_to_delete,
             )
         )
 

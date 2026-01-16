@@ -60,6 +60,7 @@ class AsyncEFSPurger:
         memory_limit_mb: int = 800,
         task_batch_size: int = 5000,
         remove_empty_dirs: bool = False,
+        max_empty_dirs_to_delete: int = 500,
     ):
         """
         Initialize the async EFS purger.
@@ -73,6 +74,7 @@ class AsyncEFSPurger:
             memory_limit_mb: Soft memory limit in MB (triggers back-pressure, 0 = disabled)
             task_batch_size: Maximum tasks to create at once (prevents OOM)
             remove_empty_dirs: If True, remove empty directories after scanning (post-order)
+            max_empty_dirs_to_delete: Maximum empty directories to delete per run (0 = unlimited, default: 500)
 
         Raises:
             ValueError: If invalid parameters are provided
@@ -90,6 +92,9 @@ class AsyncEFSPurger:
         if memory_limit_mb < 0:
             raise ValueError(f"memory_limit_mb must be >= 0, got {memory_limit_mb}")
 
+        if max_empty_dirs_to_delete < 0:
+            raise ValueError(f"max_empty_dirs_to_delete must be >= 0, got {max_empty_dirs_to_delete}")
+
         # Ensure root_path is absolute
         root_path_obj = Path(root_path)
         if not root_path_obj.is_absolute():
@@ -103,6 +108,7 @@ class AsyncEFSPurger:
         self.memory_limit_mb = memory_limit_mb
         self.task_batch_size = task_batch_size
         self.remove_empty_dirs = remove_empty_dirs
+        self.max_empty_dirs_to_delete = max_empty_dirs_to_delete
 
         # Statistics
         self.stats = {
@@ -315,6 +321,23 @@ class AsyncEFSPurger:
             if directory in processed_dirs:
                 continue
 
+            # Check rate limit
+            if self.max_empty_dirs_to_delete > 0:
+                async with self.stats_lock:
+                    deleted_count = self.stats.get("empty_dirs_deleted", 0)
+                if deleted_count >= self.max_empty_dirs_to_delete:
+                    log_with_context(
+                        self.logger,
+                        "info",
+                        "Rate limit reached for empty directory deletion",
+                        {
+                            "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
+                            "empty_dirs_deleted": deleted_count,
+                            "empty_dirs_remaining": len(sorted_dirs) - len(processed_dirs),
+                        },
+                    )
+                    break
+
             try:
                 # Normalize directory path for comparison
                 try:
@@ -420,6 +443,25 @@ class AsyncEFSPurger:
             for parent in parents_to_process:
                 if parent in processed_dirs:
                     continue
+
+                # Check rate limit
+                if self.max_empty_dirs_to_delete > 0:
+                    async with self.stats_lock:
+                        deleted_count = self.stats.get("empty_dirs_deleted", 0)
+                    if deleted_count >= self.max_empty_dirs_to_delete:
+                        log_with_context(
+                            self.logger,
+                            "info",
+                            "Rate limit reached during cascading deletion",
+                            {
+                                "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
+                                "empty_dirs_deleted": deleted_count,
+                                "parents_remaining": len(parents_to_process) - len(processed_dirs),
+                            },
+                        )
+                        # Exit both loops
+                        new_empty_parents = set()
+                        break
 
                 try:
                     # Normalize parent path
@@ -667,6 +709,7 @@ class AsyncEFSPurger:
                 "memory_limit_mb": self.memory_limit_mb,
                 "task_batch_size": self.task_batch_size,
                 "remove_empty_dirs": self.remove_empty_dirs,
+                "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
             },
         )
 
@@ -749,6 +792,7 @@ async def async_main(
     memory_limit_mb: int = 800,
     task_batch_size: int = 5000,
     remove_empty_dirs: bool = False,
+    max_empty_dirs_to_delete: int = 500,
 ) -> dict:
     """
     Async entry point for the purger.
@@ -762,6 +806,7 @@ async def async_main(
         memory_limit_mb: Soft memory limit in MB (0 = no limit)
         task_batch_size: Maximum tasks to create at once
         remove_empty_dirs: If True, remove empty directories after scanning
+        max_empty_dirs_to_delete: Maximum empty directories to delete per run (0 = unlimited, default: 500)
 
     Returns:
         Operation statistics
@@ -775,6 +820,7 @@ async def async_main(
         memory_limit_mb=memory_limit_mb,
         task_batch_size=task_batch_size,
         remove_empty_dirs=remove_empty_dirs,
+        max_empty_dirs_to_delete=max_empty_dirs_to_delete,
     )
 
     return await purger.purge()

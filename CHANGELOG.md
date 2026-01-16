@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-01-16
+
+### Added
+- **Empty Directory Rate Limiting**: New `--max-empty-dirs-to-delete` parameter to control deletion rate (default: 500 per run)
+  - Prevents filesystem metadata storms on network filesystems like AWS EFS
+  - Configurable via CLI flag or `EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE` environment variable
+  - Set to 0 for unlimited deletion (useful for initial cleanup runs)
+  - Per-run limiting design aligns with CronJob deployment pattern
+- **Comprehensive Rate Limiting Documentation**: Added detailed explanation of rate limiting rationale, use cases, and common scenarios
+- **5 New Tests**: Complete test coverage for rate limiting feature including edge cases and validation
+
+### Changed
+- **Default Behavior**: Empty directory deletion now limited to 500 directories per run by default (was unlimited)
+- **Improved Documentation**: Enhanced README with metadata storm explanation and CronJob-based rate limiting design
+
 ## [1.6.3] - 2026-01-16
 
 ### Added

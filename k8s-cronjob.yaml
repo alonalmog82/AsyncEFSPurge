@@ -32,7 +32,7 @@ spec:
           
           containers:
           - name: efspurge
-            image: ghcr.io/alonalmog82/asyncefspurge:1.6.3
+            image: ghcr.io/alonalmog82/asyncefspurge:1.7.0
             imagePullPolicy: IfNotPresent
             
             args:
@@ -41,6 +41,8 @@ spec:
               - --max-concurrency=1000
               - --memory-limit-mb=800
               - --task-batch-size=5000
+              - --remove-empty-dirs              # Enable empty directory cleanup (default: 500/run)
+              # - --max-empty-dirs-to-delete=500 # Optional: override default (0=unlimited)
               - --log-level=INFO
             
             # Security context

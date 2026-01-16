@@ -639,6 +639,7 @@ class AsyncEFSPurger:
                 "progress_interval_seconds": self.progress_interval,
                 "memory_limit_mb": self.memory_limit_mb,
                 "task_batch_size": self.task_batch_size,
+                "remove_empty_dirs": self.remove_empty_dirs,
             },
         )
 

@@ -84,14 +84,15 @@ positional arguments:
   path                  Root path to scan and purge
 
 options:
-  --max-age-days DAYS   Files older than this (in days) will be purged (default: 30.0)
-  --max-concurrency N   Maximum concurrent async operations (default: 1000)
-  --memory-limit-mb MB  Soft memory limit in MB, triggers back-pressure (default: 800)
-  --task-batch-size N   Maximum tasks to create at once, prevents OOM (default: 5000)
-  --dry-run            Don't actually delete files, just report what would be deleted
-  --log-level LEVEL    Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL (default: INFO)
-  --version            Show version and exit
-  -h, --help           Show this help message and exit
+  --max-age-days DAYS       Files older than this (in days) will be purged (default: 30.0)
+  --max-concurrency N       Maximum concurrent async operations (default: 1000)
+  --memory-limit-mb MB      Soft memory limit in MB, triggers back-pressure (default: 800)
+  --task-batch-size N       Maximum tasks to create at once, prevents OOM (default: 5000)
+  --dry-run                 Don't actually delete files, just report what would be deleted
+  --remove-empty-dirs      Remove empty directories after scanning (post-order deletion)
+  --log-level LEVEL         Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL (default: INFO)
+  --version                 Show version and exit
+  -h, --help                Show this help message and exit
 ```
 
 ### Examples
@@ -114,6 +115,11 @@ efspurge /mnt/efs --max-age-days 7 --max-concurrency 2000 --memory-limit-mb 1600
 **Debug mode with detailed logging:**
 ```bash
 efspurge /mnt/efs/temp --max-age-days 1 --log-level DEBUG
+```
+
+**Remove empty directories after purging:**
+```bash
+efspurge /mnt/efs --max-age-days 30 --remove-empty-dirs
 ```
 
 ## Deployment
@@ -144,6 +150,9 @@ spec:
               - /data
               - --max-age-days=30
               - --max-concurrency=1000
+              - --memory-limit-mb=800
+              - --task-batch-size=5000
+              - --remove-empty-dirs
               - --log-level=INFO
             volumeMounts:
             - name: efs-volume
@@ -271,6 +280,7 @@ Logs are JSON-formatted for easy parsing and integration with logging systems:
     "files_to_purge": 25000,
     "files_purged": 25000,
     "dirs_scanned": 5000,
+    "empty_dirs_deleted": 125,
     "symlinks_skipped": 150,
     "errors": 0,
     "bytes_freed": 52428800000,
@@ -283,11 +293,13 @@ Logs are JSON-formatted for easy parsing and integration with logging systems:
 
 ## Safety Features
 
-- **Dry Run Mode**: Preview operations without making changes
+- **Dry Run Mode**: Preview operations without making changes (applies to both files and empty directories)
 - **Symlink Handling**: Skips symbolic links to prevent accidental deletion
+- **Root Directory Protection**: Root directory is never deleted, even if empty
 - **Error Isolation**: Individual file errors don't stop the entire operation
 - **Permission Handling**: Gracefully handles permission denied errors
 - **Atomic Operations**: Uses filesystem-level operations for safety
+- **Post-Order Deletion**: Empty directories deleted in safe order (children before parents)
 
 ## Development
 
@@ -323,6 +335,7 @@ ruff format .
 
 - `PYTHONUNBUFFERED=1` - Recommended for real-time logging in containers
 - `PYTHONDONTWRITEBYTECODE=1` - Prevents `.pyc` file creation
+- `EFSPURGE_REMOVE_EMPTY_DIRS=1` - Enable empty directory removal (same as `--remove-empty-dirs` flag)
 
 ### Tuning Concurrency
 
@@ -372,6 +385,22 @@ MIT License - see [LICENSE](LICENSE) file for details.
 Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests.
 
 ## Changelog
+
+### Version 1.6.0 (2026-01-16)
+- **New Feature**: Empty directory removal (`--remove-empty-dirs` flag)
+  - Post-order deletion (children before parents)
+  - Cascading deletion (parents checked after children deleted)
+  - Root directory always preserved
+  - Respects `--dry-run` mode
+- **Critical Bug Fixes**:
+  - Fixed race condition: Duplicate directory entries from concurrent scans
+  - Fixed list modification during iteration
+  - Fixed path comparison edge cases
+  - Fixed cascading deletion logic
+- **Improvements**:
+  - Added `remove_empty_dirs` to startup log output
+  - Comprehensive test coverage (40 tests passing)
+- See [CHANGELOG.md](CHANGELOG.md) for detailed changelog
 
 ### Version 1.4.0 (2026-01-15)
 - **Major performance improvements**:

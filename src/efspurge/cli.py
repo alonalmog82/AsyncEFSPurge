@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import os
 import sys
 
 from . import __version__
@@ -63,6 +64,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--remove-empty-dirs",
+        action="store_true",
+        default=os.getenv("EFSPURGE_REMOVE_EMPTY_DIRS", "").lower() in ("1", "true", "yes"),
+        help="Remove empty directories after scanning (post-order deletion)",
+    )
+
+    parser.add_argument(
         "--version",
         action="version",
         version=f"efspurge {__version__}",
@@ -86,6 +94,7 @@ def main() -> None:
                 log_level=args.log_level,
                 memory_limit_mb=args.memory_limit_mb,
                 task_batch_size=args.task_batch_size,
+                remove_empty_dirs=args.remove_empty_dirs,
             )
         )
 

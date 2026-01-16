@@ -58,6 +58,7 @@ class AsyncEFSPurger:
         log_level: str = "INFO",
         memory_limit_mb: int = 800,
         task_batch_size: int = 5000,
+        remove_empty_dirs: bool = False,
     ):
         """
         Initialize the async EFS purger.
@@ -68,16 +69,39 @@ class AsyncEFSPurger:
             max_concurrency: Maximum concurrent async operations
             dry_run: If True, only report what would be deleted
             log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
-            memory_limit_mb: Soft memory limit in MB (triggers back-pressure)
+            memory_limit_mb: Soft memory limit in MB (triggers back-pressure, 0 = disabled)
             task_batch_size: Maximum tasks to create at once (prevents OOM)
+            remove_empty_dirs: If True, remove empty directories after scanning (post-order)
+
+        Raises:
+            ValueError: If invalid parameters are provided
         """
-        self.root_path = Path(root_path)
+        # Input validation
+        if max_age_days < 0:
+            raise ValueError(f"max_age_days must be >= 0, got {max_age_days}")
+
+        if max_concurrency < 1:
+            raise ValueError(f"max_concurrency must be >= 1, got {max_concurrency}")
+
+        if task_batch_size < 1:
+            raise ValueError(f"task_batch_size must be >= 1, got {task_batch_size}")
+
+        if memory_limit_mb < 0:
+            raise ValueError(f"memory_limit_mb must be >= 0, got {memory_limit_mb}")
+
+        # Ensure root_path is absolute
+        root_path_obj = Path(root_path)
+        if not root_path_obj.is_absolute():
+            root_path_obj = root_path_obj.resolve()
+
+        self.root_path = root_path_obj
         self.max_age_days = max_age_days
         self.cutoff_time = time.time() - (max_age_days * 86400)  # Convert days to seconds
         self.max_concurrency = max_concurrency
         self.dry_run = dry_run
         self.memory_limit_mb = memory_limit_mb
         self.task_batch_size = task_batch_size
+        self.remove_empty_dirs = remove_empty_dirs
 
         # Statistics
         self.stats = {
@@ -90,7 +114,12 @@ class AsyncEFSPurger:
             "bytes_freed": 0,
             "start_time": time.time(),
             "memory_backpressure_events": 0,
+            "empty_dirs_deleted": 0,
         }
+
+        # Track empty directories for post-order deletion
+        # Use set to prevent duplicates from concurrent scans
+        self.empty_dirs: set[Path] = set()
 
         # Concurrency control
         self.semaphore = asyncio.Semaphore(max_concurrency)
@@ -229,6 +258,207 @@ class AsyncEFSPurger:
                 )
                 await self.update_stats(errors=1)
 
+    async def _check_empty_directory(self, directory: Path) -> None:
+        """
+        Check if directory is empty and add to deletion set if so.
+
+        This is called after all subdirectories have been processed,
+        so we can safely check if the directory is now empty.
+
+        Args:
+            directory: Directory path to check
+        """
+        # Normalize paths for comparison (handle symlinks, relative paths, etc.)
+        try:
+            dir_resolved = directory.resolve()
+            root_resolved = self.root_path.resolve()
+        except (OSError, RuntimeError):
+            # If resolve fails (e.g., broken symlink), use original paths
+            dir_resolved = directory
+            root_resolved = self.root_path
+
+        # Never delete root directory
+        if dir_resolved == root_resolved:
+            return
+
+        # Lock entire check-and-add operation to prevent race conditions
+        async with self.stats_lock:
+            # Double-check directory is still empty (might have been populated)
+            # This check happens under lock to prevent race conditions
+            try:
+                entries = await async_scandir(directory)
+                if len(entries) == 0:
+                    # Directory is empty, add to deletion set
+                    # Set automatically prevents duplicates from concurrent scans
+                    self.empty_dirs.add(directory)
+                    self.logger.debug(f"Found empty directory: {directory}")
+            except (FileNotFoundError, PermissionError):
+                # Directory was deleted or permission denied - ignore
+                pass
+            except Exception as e:
+                # Log but don't fail
+                self.logger.debug(f"Error checking empty directory {directory}: {e}")
+
+    async def _remove_empty_directories(self) -> None:
+        """
+        Remove empty directories in post-order (children before parents).
+
+        This ensures we can delete nested empty directories correctly.
+        After deleting a directory, we check if its parent is now empty.
+
+        Uses a two-pass approach to avoid modifying list during iteration:
+        1. First pass: Delete all directories in the initial set
+        2. Second pass: Check parents and delete if they became empty
+        """
+        if not self.empty_dirs:
+            return
+
+        # Get initial set of empty directories (copy under lock)
+        async with self.stats_lock:
+            initial_empty_dirs = set(self.empty_dirs)
+
+        # Normalize root path for comparison
+        try:
+            root_resolved = self.root_path.resolve()
+        except (OSError, RuntimeError):
+            root_resolved = self.root_path
+
+        # Sort directories by depth (deepest first) for post-order deletion
+        # This ensures children are deleted before parents
+        sorted_dirs = sorted(initial_empty_dirs, key=lambda p: len(p.parts), reverse=True)
+
+        processed_dirs = set()  # Track which dirs we've processed
+        new_empty_parents = set()  # Track parents that become empty
+
+        # First pass: Delete all initially empty directories
+        for directory in sorted_dirs:
+            if directory in processed_dirs:
+                continue
+
+            try:
+                # Normalize directory path for comparison
+                try:
+                    dir_resolved = directory.resolve()
+                except (OSError, RuntimeError):
+                    dir_resolved = directory
+
+                # Never delete root directory
+                if dir_resolved == root_resolved:
+                    processed_dirs.add(directory)
+                    continue
+
+                # Double-check directory is still empty (might have been populated)
+                entries = await async_scandir(directory)
+                if len(entries) > 0:
+                    # Directory is no longer empty, skip it
+                    processed_dirs.add(directory)
+                    continue
+
+                if not self.dry_run:
+                    await aiofiles.os.rmdir(directory)
+                    await self.update_stats(empty_dirs_deleted=1)
+                    self.logger.debug(f"Removed empty directory: {directory}")
+                else:
+                    await self.update_stats(empty_dirs_deleted=1)
+                    self.logger.debug(f"Would remove empty directory: {directory}")
+
+                processed_dirs.add(directory)
+
+                # After deleting a directory, check if its parent is now empty
+                parent = directory.parent
+                # Check parent is valid and not root
+                if parent != directory and parent not in processed_dirs:
+                    try:
+                        parent_resolved = parent.resolve()
+                        if parent_resolved != root_resolved:
+                            # Check if parent is now empty
+                            parent_entries = await async_scandir(parent)
+                            if len(parent_entries) == 0:
+                                # Parent is now empty, add to set for second pass
+                                new_empty_parents.add(parent)
+                    except (FileNotFoundError, PermissionError, OSError, RuntimeError):
+                        pass  # Parent doesn't exist, no permission, or resolve failed
+
+            except FileNotFoundError:
+                # Directory was already deleted by another process
+                processed_dirs.add(directory)
+                self.logger.debug(f"Empty directory already deleted: {directory}")
+            except OSError as e:
+                # Directory might have been populated or permission denied
+                processed_dirs.add(directory)
+                log_with_context(
+                    self.logger,
+                    "warning",
+                    "Could not remove empty directory",
+                    {"directory": str(directory), "error": str(e)},
+                )
+                await self.update_stats(errors=1)
+
+        # Second pass: Process parents that became empty (cascading deletion)
+        # Continue until no new empty parents are found
+        while new_empty_parents:
+            # Get next batch of parents to process
+            parents_to_process = sorted(new_empty_parents, key=lambda p: len(p.parts), reverse=True)
+            new_empty_parents = set()  # Reset for next iteration
+
+            for parent in parents_to_process:
+                if parent in processed_dirs:
+                    continue
+
+                try:
+                    # Normalize parent path
+                    try:
+                        parent_resolved = parent.resolve()
+                    except (OSError, RuntimeError):
+                        parent_resolved = parent
+
+                    # Never delete root directory
+                    if parent_resolved == root_resolved:
+                        processed_dirs.add(parent)
+                        continue
+
+                    # Double-check parent is still empty
+                    entries = await async_scandir(parent)
+                    if len(entries) > 0:
+                        # Parent is no longer empty, skip it
+                        processed_dirs.add(parent)
+                        continue
+
+                    if not self.dry_run:
+                        await aiofiles.os.rmdir(parent)
+                        await self.update_stats(empty_dirs_deleted=1)
+                        self.logger.debug(f"Removed empty parent directory: {parent}")
+                    else:
+                        await self.update_stats(empty_dirs_deleted=1)
+                        self.logger.debug(f"Would remove empty parent directory: {parent}")
+
+                    processed_dirs.add(parent)
+
+                    # Check if parent's parent is now empty (cascading)
+                    grandparent = parent.parent
+                    if grandparent != parent and grandparent not in processed_dirs:
+                        try:
+                            grandparent_resolved = grandparent.resolve()
+                            if grandparent_resolved != root_resolved:
+                                grandparent_entries = await async_scandir(grandparent)
+                                if len(grandparent_entries) == 0:
+                                    new_empty_parents.add(grandparent)
+                        except (FileNotFoundError, PermissionError, OSError, RuntimeError):
+                            pass
+
+                except FileNotFoundError:
+                    processed_dirs.add(parent)
+                    self.logger.debug(f"Empty parent directory already deleted: {parent}")
+                except OSError as e:
+                    processed_dirs.add(parent)
+                    log_with_context(
+                        self.logger,
+                        "warning",
+                        "Could not remove empty parent directory",
+                        {"directory": str(parent), "error": str(e)},
+                    )
+                    await self.update_stats(errors=1)
+
     async def _process_file_batch(self, file_tasks: list) -> None:
         """
         Process a batch of file tasks and free memory immediately.
@@ -287,8 +517,10 @@ class AsyncEFSPurger:
 
                         # STREAMING: Process and clear buffer when it reaches batch size
                         if len(file_task_buffer) >= self.task_batch_size:
-                            await self._process_file_batch(file_task_buffer)
-                            file_task_buffer.clear()  # Free memory immediately!
+                            try:
+                                await self._process_file_batch(file_task_buffer)
+                            finally:
+                                file_task_buffer.clear()  # Always clear, even on exception
 
                     elif entry.is_dir(follow_symlinks=False):
                         subdirs.append(entry_path)
@@ -304,14 +536,26 @@ class AsyncEFSPurger:
 
             # STREAMING: Process any remaining files in buffer
             if file_task_buffer:
-                await self._process_file_batch(file_task_buffer)
-                file_task_buffer.clear()
+                try:
+                    await self._process_file_batch(file_task_buffer)
+                finally:
+                    file_task_buffer.clear()  # Always clear, even on exception
 
             # Process subdirectories concurrently
-            # Note: Could also limit concurrent subdirs if memory is still an issue
+            # Limit concurrent subdirs to prevent memory explosion (max 100 at a time)
             if subdirs:
                 await self.check_memory_pressure()
-                await asyncio.gather(*[self.scan_directory(subdir) for subdir in subdirs], return_exceptions=True)
+                max_concurrent_subdirs = 100
+                for i in range(0, len(subdirs), max_concurrent_subdirs):
+                    batch_subdirs = subdirs[i : i + max_concurrent_subdirs]
+                    subdir_tasks = [self.scan_directory(subdir) for subdir in batch_subdirs]
+                    await asyncio.gather(*subdir_tasks, return_exceptions=True)
+
+            # Check if directory is empty (AFTER all subdirs have been fully processed recursively)
+            # This ensures nested empty directories are handled correctly
+            # Only check if remove_empty_dirs is enabled
+            if self.remove_empty_dirs:
+                await self._check_empty_directory(directory)
 
         except PermissionError as e:
             log_with_context(
@@ -410,6 +654,10 @@ class AsyncEFSPurger:
         try:
             # Start the recursive scan
             await self.scan_directory(self.root_path)
+
+            # After all scanning is complete, remove empty directories in post-order
+            if self.remove_empty_dirs:
+                await self._remove_empty_directories()
         finally:
             # Cancel background reporter
             progress_task.cancel()
@@ -472,6 +720,7 @@ async def async_main(
     log_level: str = "INFO",
     memory_limit_mb: int = 800,
     task_batch_size: int = 5000,
+    remove_empty_dirs: bool = False,
 ) -> dict:
     """
     Async entry point for the purger.
@@ -484,6 +733,7 @@ async def async_main(
         log_level: Logging level
         memory_limit_mb: Soft memory limit in MB (0 = no limit)
         task_batch_size: Maximum tasks to create at once
+        remove_empty_dirs: If True, remove empty directories after scanning
 
     Returns:
         Operation statistics
@@ -496,6 +746,7 @@ async def async_main(
         log_level=log_level,
         memory_limit_mb=memory_limit_mb,
         task_batch_size=task_batch_size,
+        remove_empty_dirs=remove_empty_dirs,
     )
 
     return await purger.purge()

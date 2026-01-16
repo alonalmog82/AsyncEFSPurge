@@ -10,7 +10,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME: ${{ github.repository_owner }}/asyncefspurge
 
 jobs:
   build-and-test:
@@ -97,13 +97,29 @@ jobs:
         cache-to: type=gha,mode=max
         platforms: linux/amd64,linux/arm64  # Multi-platform support
     
+    - name: Set image tag for SBOM
+      if: github.event_name != 'pull_request'
+      id: sbom-tag
+      run: |
+        if [ "${{ github.ref_type }}" == "tag" ]; then
+          # For tags like v1.6.2, use 1.6.2 (strip 'v' prefix)
+          TAG="${{ github.ref_name }}"
+          TAG="${TAG#v}"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+        elif [ "${{ github.ref_name }}" == "main" ]; then
+          echo "tag=latest" >> $GITHUB_OUTPUT
+        else
+          echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+        fi
+    
     - name: Generate SBOM
       if: github.event_name != 'pull_request'
       uses: anchore/sbom-action@v0
       with:
-        image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+        image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.sbom-tag.outputs.tag }}
         format: spdx-json
         output-file: sbom.spdx.json
+      continue-on-error: true
     
     - name: Scan image for vulnerabilities
       if: github.event_name != 'pull_request'

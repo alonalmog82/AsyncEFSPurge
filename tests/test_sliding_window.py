@@ -163,4 +163,3 @@ async def test_mixed_files_and_directories(temp_dir):
     # Should process all files (15 in root + 5 in subdirs)
     assert purger.stats["files_scanned"] == 20
     assert purger.stats["dirs_scanned"] == 6  # Root + 5 subdirs
-

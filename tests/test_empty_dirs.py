@@ -220,4 +220,3 @@ async def test_multiple_empty_dirs(temp_dir):
     assert purger.stats["empty_dirs_deleted"] == 5
     for i in range(5):
         assert not (temp_dir / f"empty{i}").exists()
-

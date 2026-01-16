@@ -172,4 +172,3 @@ async def test_root_path_protection_absolute_vs_relative(temp_dir):
     await purger1.scan_directory(temp_dir)
     await purger1._remove_empty_directories()
     assert temp_dir.exists()  # Root preserved
-

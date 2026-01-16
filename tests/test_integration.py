@@ -205,4 +205,3 @@ async def test_progress_updates(large_test_structure):
 
     stats = await task
     assert stats["files_scanned"] == 1000
-

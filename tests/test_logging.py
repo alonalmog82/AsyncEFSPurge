@@ -53,8 +53,7 @@ async def test_no_duplicate_progress_logging_code(temp_dir):
     # Should NOT have any "Progress update" logs from update_stats
     progress_logs = [call for call in log_calls if "Progress update" in str(call)]
     assert len(progress_logs) == 0, (
-        "update_stats() should not log progress updates. "
-        "Only _background_progress_reporter() should log progress."
+        "update_stats() should not log progress updates. Only _background_progress_reporter() should log progress."
     )
 
 
@@ -125,9 +124,7 @@ async def test_empty_dir_removal_no_logs_when_disabled(temp_dir):
     await purger.purge()
 
     # Check for empty directory removal messages
-    empty_dir_messages = [
-        call for call in log_calls if "empty directory removal" in str(call).lower()
-    ]
+    empty_dir_messages = [call for call in log_calls if "empty directory removal" in str(call).lower()]
 
     # Should have NO empty directory removal messages
     assert len(empty_dir_messages) == 0, (
@@ -163,9 +160,7 @@ async def test_startup_log_includes_remove_empty_dirs(temp_dir):
     assert startup_log_extra.get("remove_empty_dirs") is True, (
         f"Startup log should include remove_empty_dirs=True. Got: {startup_log_extra}"
     )
-    assert "version" in startup_log_extra, (
-        f"Startup log should include version. Got: {startup_log_extra}"
-    )
+    assert "version" in startup_log_extra, f"Startup log should include version. Got: {startup_log_extra}"
     assert startup_log_extra.get("version") is not None, (
         f"Startup log version should not be None. Got: {startup_log_extra}"
     )

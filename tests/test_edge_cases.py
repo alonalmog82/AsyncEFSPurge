@@ -266,4 +266,3 @@ async def test_memory_limit_zero(temp_dir):
     # Should work without memory checks
     assert purger.stats["files_scanned"] == 10
     assert purger.stats["memory_backpressure_events"] == 0
-

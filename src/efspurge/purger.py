@@ -7,6 +7,7 @@ from pathlib import Path
 
 import aiofiles.os
 
+from . import __version__
 from .logging import log_with_context, setup_logging
 
 
@@ -656,6 +657,7 @@ class AsyncEFSPurger:
             "info",
             f"Starting EFS purge - {mode} MODE",
             {
+                "version": __version__,
                 "root_path": str(self.root_path),
                 "max_age_days": self.max_age_days,
                 "cutoff_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.cutoff_time)),

@@ -163,3 +163,9 @@ async def test_startup_log_includes_remove_empty_dirs(temp_dir):
     assert startup_log_extra.get("remove_empty_dirs") is True, (
         f"Startup log should include remove_empty_dirs=True. Got: {startup_log_extra}"
     )
+    assert "version" in startup_log_extra, (
+        f"Startup log should include version. Got: {startup_log_extra}"
+    )
+    assert startup_log_extra.get("version") is not None, (
+        f"Startup log version should not be None. Got: {startup_log_extra}"
+    )

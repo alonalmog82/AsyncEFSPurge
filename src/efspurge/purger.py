@@ -229,9 +229,33 @@ class AsyncEFSPurger:
                 )
                 await self.update_stats(errors=1)
 
+    async def _process_file_batch(self, file_tasks: list) -> None:
+        """
+        Process a batch of file tasks and free memory immediately.
+
+        Args:
+            file_tasks: List of file processing tasks
+        """
+        if not file_tasks:
+            return
+
+        # Check memory before processing
+        await self.check_memory_pressure()
+
+        # Process batch
+        await asyncio.gather(*file_tasks, return_exceptions=True)
+
+        self.logger.debug(f"Processed batch of {len(file_tasks)} files")
+
     async def scan_directory(self, directory: Path) -> None:
         """
-        Recursively scan a directory and process all files.
+        Recursively scan a directory and process files using TRUE STREAMING.
+
+        This implementation uses a sliding window approach:
+        - Accumulates files into a buffer
+        - Processes and frees buffer when it reaches batch_size
+        - Never holds all files in memory at once
+        - Much lower memory footprint
 
         Args:
             directory: Directory path to scan
@@ -242,7 +266,8 @@ class AsyncEFSPurger:
             # Scan directory entries
             entries = await async_scandir(directory)
 
-            tasks = []
+            # STREAMING: Use buffer instead of accumulating all tasks
+            file_task_buffer = []
             subdirs = []
 
             for entry in entries:
@@ -256,9 +281,15 @@ class AsyncEFSPurger:
                         self.logger.debug(f"Skipping symlink: {entry_path}")
                         continue
 
-                    # Process files and queue subdirectories
+                    # Handle files with streaming buffer
                     if entry.is_file(follow_symlinks=False):
-                        tasks.append(self.process_file(entry_path))
+                        file_task_buffer.append(self.process_file(entry_path))
+
+                        # STREAMING: Process and clear buffer when it reaches batch size
+                        if len(file_task_buffer) >= self.task_batch_size:
+                            await self._process_file_batch(file_task_buffer)
+                            file_task_buffer.clear()  # Free memory immediately!
+
                     elif entry.is_dir(follow_symlinks=False):
                         subdirs.append(entry_path)
 
@@ -271,30 +302,15 @@ class AsyncEFSPurger:
                     )
                     await self.update_stats(errors=1)
 
-            # FIX #2: Process files in batches to prevent OOM from unbounded task creation
-            if tasks:
-                for i in range(0, len(tasks), self.task_batch_size):
-                    batch = tasks[i : i + self.task_batch_size]
+            # STREAMING: Process any remaining files in buffer
+            if file_task_buffer:
+                await self._process_file_batch(file_task_buffer)
+                file_task_buffer.clear()
 
-                    # Check memory pressure before processing each batch
-                    # (but lock prevents spam from concurrent checks)
-                    await self.check_memory_pressure()
-
-                    await asyncio.gather(*batch, return_exceptions=True)
-
-                    batch_num = i // self.task_batch_size + 1
-                    total_batches = (len(tasks) + self.task_batch_size - 1) // self.task_batch_size
-                    self.logger.debug(
-                        f"Processed batch {batch_num}/{total_batches} ({len(batch)} files) in {directory}"
-                    )
-
-            # FIX #1: Recursively process subdirectories CONCURRENTLY (not sequentially)
+            # Process subdirectories concurrently
+            # Note: Could also limit concurrent subdirs if memory is still an issue
             if subdirs:
-                # Only check memory once before spawning all subdirectory tasks
-                # (not per subdirectory, to reduce overhead)
                 await self.check_memory_pressure()
-
-                # Process all subdirectories concurrently for massive performance boost
                 await asyncio.gather(*[self.scan_directory(subdir) for subdir in subdirs], return_exceptions=True)
 
         except PermissionError as e:

@@ -312,8 +312,96 @@ Logs are JSON-formatted for easy parsing and integration with logging systems:
 - **Root Directory Protection**: Root directory is never deleted, even if empty
 - **Error Isolation**: Individual file errors don't stop the entire operation
 - **Permission Handling**: Gracefully handles permission denied errors
-- **Atomic Operations**: Uses filesystem-level operations for safety
 - **Post-Order Deletion**: Empty directories deleted in safe order (children before parents)
+- **Transparent Limitations**: See [Race Condition Considerations](#race-condition-considerations-toctou) for POSIX-inherent limitations that affect all file purgers
+
+## Race Condition Considerations (TOCTOU)
+
+### The Inherent POSIX Limitation
+
+All file purgers—including this tool, `find -delete`, and custom bash scripts—face an inherent **Time-of-Check-Time-of-Use (TOCTOU)** race condition on POSIX systems:
+
+```
+1. stat() file → get mtime         ← Check
+2. ... time passes ...             ← Race window  
+3. if mtime < cutoff: remove()     ← Use (delete based on stale info)
+```
+
+Between checking the file's modification time and deleting it, the file could be:
+- **Modified** (updating mtime, meaning it should no longer be deleted)
+- **Replaced** (deleted and recreated with the same name)
+
+**There is no atomic "delete-if-mtime-older-than-X" operation in POSIX.** This limitation affects every file cleanup tool.
+
+### Risk Assessment
+
+The **risk scales with the lag time** between detection and deletion:
+
+| Scenario | Lag Time | Risk Level |
+|----------|----------|------------|
+| Sequential bash `find -delete` | Milliseconds per file | Very Low |
+| This tool (small batches) | Milliseconds per file | Very Low |
+| This tool (large batches, high concurrency) | Seconds to minutes | Low |
+| Two-phase scan-then-delete scripts | Minutes to hours | Medium |
+
+### Why We Don't Double-Stat
+
+A common mitigation is to `stat()` the file twice—once during scanning and again immediately before deletion—to verify the mtime hasn't changed. We consciously chose **not** to implement this because:
+
+1. **2× I/O overhead on network filesystems**: On AWS EFS with ~5ms latency per `stat()`, deleting 1 million files would add ~83 minutes of overhead (1M × 5ms × 2 extra stats).
+
+2. **Doesn't eliminate the race**: The window shrinks from seconds to microseconds, but still exists between the second `stat()` and `remove()`.
+
+3. **Use case fit**: This tool is designed for **temp files, caches, and logs** where:
+   - Files are typically write-once or append-only
+   - Occasional loss of a recently-modified file is acceptable
+   - The cutoff age (e.g., 30 days) provides a large safety margin
+
+4. **Operational alternatives exist**: If you need stronger guarantees, see mitigations below.
+
+### Comparison: AsyncEFSPurge vs. Bash Scripts
+
+| Aspect | AsyncEFSPurge | `find -mtime +30 -delete` |
+|--------|---------------|---------------------------|
+| **TOCTOU window** | Same (inherent to POSIX) | Same (inherent to POSIX) |
+| **Throughput on EFS** | 1,000-2,000 files/sec | 10-50 files/sec |
+| **Memory usage** | Bounded (streaming) | Minimal |
+| **Concurrency** | Configurable (overlaps I/O) | Sequential |
+| **Progress reporting** | Real-time JSON logs | None (or custom) |
+| **Error handling** | Continues on errors, reports stats | Stops or silent |
+| **Dry-run mode** | Built-in | Requires separate command |
+| **Empty dir cleanup** | Built-in with rate limiting | Requires separate pass |
+
+**When to use bash:**
+- Simple one-off cleanup on local disk
+- Very small file counts (< 10,000)
+- Environments where installing Python isn't feasible
+
+**When to use AsyncEFSPurge:**
+- Network filesystems (EFS, NFS) with high latency
+- Large file counts (100K+)
+- Production workloads needing observability
+- Automated/scheduled cleanup (CronJobs)
+
+### Mitigations If You Need Stronger Guarantees
+
+If your use case requires minimizing TOCTOU risk:
+
+1. **Increase the age margin**: Use `--max-age-days 90` instead of `30`. Files 90 days old are far less likely to be actively modified.
+
+2. **Schedule during quiet periods**: Run the purger during maintenance windows when no writes are expected.
+
+3. **Use filesystem snapshots**: On EFS, take a snapshot, mount read-only, scan it, then delete from the live filesystem.
+
+4. **Implement application-level coordination**: Have your application stop writing before the purge runs.
+
+5. **Accept and monitor**: For most temp/cache use cases, the risk is acceptable. Monitor the `files_purged` metric and investigate anomalies.
+
+### The Bottom Line
+
+For temp file cleanup on network filesystems, the practical risk of TOCTOU is **extremely low**—a file would need to be modified in the exact milliseconds between stat and delete. The performance cost of double-stat on high-latency filesystems outweighs the marginal safety benefit.
+
+If you're purging files where accidental deletion would be catastrophic, consider whether a purger is the right tool, or implement one of the mitigations above.
 
 ## Development
 

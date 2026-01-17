@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.1] - 2026-01-17
+
+### Fixed
+- **Rate Limit Logging Bug**: Fixed negative count bug in rate limit reached messages
+  - Changed `empty_dirs_remaining` to `unprocessed_dirs_in_batch` (accurate count of unprocessed directories)
+  - Changed `parents_remaining` to `unprocessed_parents_in_batch` (accurate count of unprocessed parent directories)
+  - Both fields now correctly show non-negative values representing actual unprocessed items in current batch
+  - Previously could show negative numbers due to incorrect calculation using global `processed_dirs` count
+
+### Added
+- **Separate Counters for Dry-Run Clarity**: Added `empty_dirs_to_delete` counter to match file deletion pattern
+  - `empty_dirs_to_delete`: Directories that would be deleted (increments in both dry-run and real mode)
+  - `empty_dirs_deleted`: Directories actually deleted (0 in dry-run, real count in real mode)
+  - Consistent with existing `files_to_purge` vs `files_purged` pattern
+  - Makes dry-run behavior crystal clear in logs
+
+### Changed
+- **Breaking Change in Stats Output**: Output now includes both `empty_dirs_to_delete` and `empty_dirs_deleted` fields
+  - Old: `"empty_dirs_deleted": 3000` (ambiguous in dry-run)
+  - New: `"empty_dirs_to_delete": 3000, "empty_dirs_deleted": 0` (clear dry-run indication)
+
 ## [1.7.0] - 2026-01-16
 
 ### Added

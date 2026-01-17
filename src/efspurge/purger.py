@@ -121,7 +121,8 @@ class AsyncEFSPurger:
             "bytes_freed": 0,
             "start_time": time.time(),
             "memory_backpressure_events": 0,
-            "empty_dirs_deleted": 0,
+            "empty_dirs_to_delete": 0,  # Directories that would be deleted (increments in dry-run)
+            "empty_dirs_deleted": 0,  # Directories actually deleted (0 in dry-run)
         }
 
         # Track empty directories for post-order deletion
@@ -321,19 +322,21 @@ class AsyncEFSPurger:
             if directory in processed_dirs:
                 continue
 
-            # Check rate limit
+            # Check rate limit (based on directories processed, not just deleted)
             if self.max_empty_dirs_to_delete > 0:
                 async with self.stats_lock:
-                    deleted_count = self.stats.get("empty_dirs_deleted", 0)
-                if deleted_count >= self.max_empty_dirs_to_delete:
+                    to_delete_count = self.stats.get("empty_dirs_to_delete", 0)
+                if to_delete_count >= self.max_empty_dirs_to_delete:
+                    # Count unprocessed directories in this batch
+                    unprocessed_count = sum(1 for d in sorted_dirs if d not in processed_dirs)
                     log_with_context(
                         self.logger,
                         "info",
                         "Rate limit reached for empty directory deletion",
                         {
                             "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
-                            "empty_dirs_deleted": deleted_count,
-                            "empty_dirs_remaining": len(sorted_dirs) - len(processed_dirs),
+                            "empty_dirs_to_delete": to_delete_count,
+                            "unprocessed_dirs_in_batch": unprocessed_count,
                         },
                     )
                     break
@@ -359,10 +362,10 @@ class AsyncEFSPurger:
 
                 if not self.dry_run:
                     await aiofiles.os.rmdir(directory)
-                    await self.update_stats(empty_dirs_deleted=1)
+                    await self.update_stats(empty_dirs_to_delete=1, empty_dirs_deleted=1)
                     self.logger.debug(f"Removed empty directory: {directory}")
                 else:
-                    await self.update_stats(empty_dirs_deleted=1)
+                    await self.update_stats(empty_dirs_to_delete=1)
                     self.logger.debug(f"Would remove empty directory: {directory}")
 
                 processed_dirs.add(directory)
@@ -428,14 +431,16 @@ class AsyncEFSPurger:
             # Log progress every 100 iterations or every 1000 directories processed
             if iteration % 100 == 0 or len(parents_to_process) > 1000:
                 async with self.stats_lock:
-                    current_count = self.stats.get("empty_dirs_deleted", 0)
+                    to_delete_count = self.stats.get("empty_dirs_to_delete", 0)
+                    deleted_count = self.stats.get("empty_dirs_deleted", 0)
                 log_with_context(
                     self.logger,
                     "info",
                     "Cascading empty directory removal progress",
                     {
                         "iteration": iteration,
-                        "empty_dirs_deleted": current_count,
+                        "empty_dirs_to_delete": to_delete_count,
+                        "empty_dirs_deleted": deleted_count,
                         "parents_remaining": len(parents_to_process),
                     },
                 )
@@ -444,19 +449,21 @@ class AsyncEFSPurger:
                 if parent in processed_dirs:
                     continue
 
-                # Check rate limit
+                # Check rate limit (based on directories processed, not just deleted)
                 if self.max_empty_dirs_to_delete > 0:
                     async with self.stats_lock:
-                        deleted_count = self.stats.get("empty_dirs_deleted", 0)
-                    if deleted_count >= self.max_empty_dirs_to_delete:
+                        to_delete_count = self.stats.get("empty_dirs_to_delete", 0)
+                    if to_delete_count >= self.max_empty_dirs_to_delete:
+                        # Count unprocessed parents in current batch
+                        unprocessed_count = sum(1 for p in parents_to_process if p not in processed_dirs)
                         log_with_context(
                             self.logger,
                             "info",
                             "Rate limit reached during cascading deletion",
                             {
                                 "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
-                                "empty_dirs_deleted": deleted_count,
-                                "parents_remaining": len(parents_to_process) - len(processed_dirs),
+                                "empty_dirs_to_delete": to_delete_count,
+                                "unprocessed_parents_in_batch": unprocessed_count,
                             },
                         )
                         # Exit both loops
@@ -484,10 +491,10 @@ class AsyncEFSPurger:
 
                     if not self.dry_run:
                         await aiofiles.os.rmdir(parent)
-                        await self.update_stats(empty_dirs_deleted=1)
+                        await self.update_stats(empty_dirs_to_delete=1, empty_dirs_deleted=1)
                         self.logger.debug(f"Removed empty parent directory: {parent}")
                     else:
-                        await self.update_stats(empty_dirs_deleted=1)
+                        await self.update_stats(empty_dirs_to_delete=1)
                         self.logger.debug(f"Would remove empty parent directory: {parent}")
 
                     processed_dirs.add(parent)
@@ -519,12 +526,17 @@ class AsyncEFSPurger:
 
         # Log completion
         async with self.stats_lock:
-            final_count = self.stats.get("empty_dirs_deleted", 0)
+            to_delete_count = self.stats.get("empty_dirs_to_delete", 0)
+            deleted_count = self.stats.get("empty_dirs_deleted", 0)
         log_with_context(
             self.logger,
             "info",
             "Empty directory removal completed",
-            {"total_empty_dirs_deleted": final_count, "iterations": iteration},
+            {
+                "total_empty_dirs_to_delete": to_delete_count,
+                "total_empty_dirs_deleted": deleted_count,
+                "iterations": iteration,
+            },
         )
 
     async def _process_file_batch(self, file_tasks: list) -> None:

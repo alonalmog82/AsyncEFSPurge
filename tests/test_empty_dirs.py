@@ -195,8 +195,9 @@ async def test_dry_run_reports_empty_dirs(temp_dir):
 
     # Directory should still exist (dry run)
     assert empty_dir.exists()
-    # But should be counted
-    assert purger.stats["empty_dirs_deleted"] == 1
+    # But should be counted in "to_delete" (not actually deleted)
+    assert purger.stats["empty_dirs_to_delete"] == 1
+    assert purger.stats["empty_dirs_deleted"] == 0
 
 
 @pytest.mark.asyncio

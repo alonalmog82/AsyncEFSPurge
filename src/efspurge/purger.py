@@ -61,6 +61,7 @@ class AsyncEFSPurger:
         task_batch_size: int = 5000,
         remove_empty_dirs: bool = False,
         max_empty_dirs_to_delete: int = 500,
+        max_concurrent_subdirs: int = 100,
     ):
         """
         Initialize the async EFS purger.
@@ -75,6 +76,7 @@ class AsyncEFSPurger:
             task_batch_size: Maximum tasks to create at once (prevents OOM)
             remove_empty_dirs: If True, remove empty directories after scanning (post-order)
             max_empty_dirs_to_delete: Maximum empty directories to delete per run (0 = unlimited, default: 500)
+            max_concurrent_subdirs: Maximum subdirectories to scan concurrently (lower = less memory, default: 100)
 
         Raises:
             ValueError: If invalid parameters are provided
@@ -94,6 +96,9 @@ class AsyncEFSPurger:
 
         if max_empty_dirs_to_delete < 0:
             raise ValueError(f"max_empty_dirs_to_delete must be >= 0, got {max_empty_dirs_to_delete}")
+
+        if max_concurrent_subdirs < 1:
+            raise ValueError(f"max_concurrent_subdirs must be >= 1, got {max_concurrent_subdirs}")
 
         # Ensure root_path is absolute
         root_path_obj = Path(root_path)
@@ -139,6 +144,7 @@ class AsyncEFSPurger:
         self.task_batch_size = task_batch_size
         self.remove_empty_dirs = remove_empty_dirs
         self.max_empty_dirs_to_delete = max_empty_dirs_to_delete
+        self.max_concurrent_subdirs = max_concurrent_subdirs
 
         # Statistics
         self.stats = {
@@ -670,12 +676,11 @@ class AsyncEFSPurger:
                     file_task_buffer.clear()  # Always clear, even on exception
 
             # Process subdirectories concurrently
-            # Limit concurrent subdirs to prevent memory explosion (max 100 at a time)
+            # Limit concurrent subdirs to prevent memory explosion
             if subdirs:
                 await self.check_memory_pressure()
-                max_concurrent_subdirs = 100
-                for i in range(0, len(subdirs), max_concurrent_subdirs):
-                    batch_subdirs = subdirs[i : i + max_concurrent_subdirs]
+                for i in range(0, len(subdirs), self.max_concurrent_subdirs):
+                    batch_subdirs = subdirs[i : i + self.max_concurrent_subdirs]
                     subdir_tasks = [self.scan_directory(subdir) for subdir in batch_subdirs]
                     await asyncio.gather(*subdir_tasks, return_exceptions=True)
 
@@ -771,6 +776,7 @@ class AsyncEFSPurger:
                 "progress_interval_seconds": self.progress_interval,
                 "memory_limit_mb": self.memory_limit_mb,
                 "task_batch_size": self.task_batch_size,
+                "max_concurrent_subdirs": self.max_concurrent_subdirs,
                 "remove_empty_dirs": self.remove_empty_dirs,
                 "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
             },
@@ -856,6 +862,7 @@ async def async_main(
     task_batch_size: int = 5000,
     remove_empty_dirs: bool = False,
     max_empty_dirs_to_delete: int = 500,
+    max_concurrent_subdirs: int = 100,
 ) -> dict:
     """
     Async entry point for the purger.
@@ -870,6 +877,7 @@ async def async_main(
         task_batch_size: Maximum tasks to create at once
         remove_empty_dirs: If True, remove empty directories after scanning
         max_empty_dirs_to_delete: Maximum empty directories to delete per run (0 = unlimited, default: 500)
+        max_concurrent_subdirs: Maximum subdirectories to scan concurrently (lower = less memory, default: 100)
 
     Returns:
         Operation statistics
@@ -884,6 +892,7 @@ async def async_main(
         task_batch_size=task_batch_size,
         remove_empty_dirs=remove_empty_dirs,
         max_empty_dirs_to_delete=max_empty_dirs_to_delete,
+        max_concurrent_subdirs=max_concurrent_subdirs,
     )
 
     return await purger.purge()

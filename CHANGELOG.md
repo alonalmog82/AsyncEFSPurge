@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.3] - 2026-01-17
+
+### Added
+- **New Parameter: `--max-concurrent-subdirs`**: Controls maximum subdirectories scanned concurrently (default: 100)
+  - Fixes OOM issues on deep directory trees where recursive scanning created exponential coroutine explosion
+  - Environment variable: `EFSPURGE_MAX_CONCURRENT_SUBDIRS`
+  - Lower values (10-20) recommended for memory-constrained environments or deep trees
+
+### Documentation
+- Added "Tuning Memory for Deep Directory Trees" section explaining the recursive explosion problem
+- Updated Troubleshooting section with guidance for OOM kills on deep vs flat directories
+- Added key diagnostic insight: if `dirs_scanned` grows but `files_scanned=0`, reduce `--max-concurrent-subdirs`
+
 ## [1.7.2] - 2026-01-17
 
 ### Fixed

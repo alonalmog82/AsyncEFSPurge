@@ -89,6 +89,7 @@ options:
   --max-concurrency N       Maximum concurrent async operations (default: 1000)
   --memory-limit-mb MB      Soft memory limit in MB, triggers back-pressure (default: 800)
   --task-batch-size N       Maximum tasks to create at once, prevents OOM (default: 5000)
+  --max-concurrent-subdirs N  Maximum subdirectories to scan concurrently (default: 100)
   --dry-run                 Don't actually delete files, just report what would be deleted
   --remove-empty-dirs       Remove empty directories after scanning (post-order deletion)
   --max-empty-dirs-to-delete N  Maximum empty directories to delete per run (0 = unlimited, default: 500)
@@ -439,6 +440,7 @@ ruff format .
 - `PYTHONDONTWRITEBYTECODE=1` - Prevents `.pyc` file creation
 - `EFSPURGE_REMOVE_EMPTY_DIRS=1` - Enable empty directory removal (same as `--remove-empty-dirs` flag)
 - `EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE=N` - Maximum empty directories to delete per run (0 = unlimited, default: 500)
+- `EFSPURGE_MAX_CONCURRENT_SUBDIRS=N` - Maximum subdirectories to scan concurrently (default: 100, lower for deep trees)
 
 ### Empty Directory Rate Limiting
 
@@ -484,6 +486,49 @@ The `--max-concurrency` parameter should be tuned based on your filesystem:
 
 Start with defaults and increase if you're not saturating network/IOPS.
 
+### Tuning Memory for Deep Directory Trees
+
+The `--max-concurrent-subdirs` parameter controls how many subdirectories are scanned concurrently at each level of the directory tree. **Default: 100.**
+
+**Why This Matters:**
+
+On deep directory trees, concurrent subdirectory scanning creates a recursive explosion of coroutines:
+
+```
+Level 1: 100 concurrent scans
+Level 2: 100 × 100 = 10,000 pending coroutines
+Level 3: 100 × 100 × 100 = 1,000,000 pending coroutines
+→ Memory explodes before any files are processed!
+```
+
+**When to Reduce This Value:**
+
+- Pod getting OOM killed despite low `--max-concurrency`
+- Memory usage spikes during directory traversal (before file processing)
+- Deep directory hierarchies (many nested folders)
+- Memory-constrained environments (small Kubernetes pods)
+
+**Recommended Settings by Environment:**
+
+| Environment | `--max-concurrent-subdirs` | Notes |
+|-------------|---------------------------|-------|
+| **Default** | 100 | Good for most use cases |
+| **Memory-constrained (512Mi-1Gi pod)** | 10-20 | Prevents recursive explosion |
+| **Very deep trees (10+ levels)** | 5-10 | Keeps memory bounded |
+| **Large memory (4Gi+ pod)** | 100-200 | Can handle more parallelism |
+
+**Example for memory-constrained environments:**
+```bash
+efspurge /data \
+  --max-age-days 30 \
+  --max-concurrency=100 \
+  --task-batch-size=500 \
+  --max-concurrent-subdirs=10 \
+  --memory-limit-mb=400
+```
+
+**Environment Variable:** `EFSPURGE_MAX_CONCURRENT_SUBDIRS`
+
 ## Troubleshooting
 
 ### Permission Errors
@@ -493,13 +538,29 @@ Start with defaults and increase if you're not saturating network/IOPS.
 docker run --rm -v /mnt/efs:/data:rw efspurge:latest /data --max-age-days 30
 ```
 
-### Memory Issues
+### Memory Issues / OOM Kills
 
-For extremely large directories (millions of files), increase container memory:
+**For deep directory trees (memory explodes during traversal):**
 
 ```bash
-docker run --rm -m 2g -v /mnt/efs:/data efspurge:latest /data --max-age-days 30
+# Reduce concurrent subdirectory scanning
+efspurge /data --max-age-days 30 \
+  --max-concurrent-subdirs=10 \
+  --max-concurrency=100 \
+  --task-batch-size=500
 ```
+
+**For large flat directories (millions of files):**
+
+```bash
+# Reduce batch sizes and increase container memory
+docker run --rm -m 2g -v /mnt/efs:/data efspurge:latest /data \
+  --max-age-days 30 \
+  --task-batch-size=1000 \
+  --memory-limit-mb=1200
+```
+
+**Key insight:** If memory spikes with `dirs_scanned` but `files_scanned=0`, the problem is `--max-concurrent-subdirs` (directory traversal), not file processing.
 
 ### Slow Performance
 
@@ -522,16 +583,15 @@ Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for de
 
 ## Changelog
 
+### Version 1.7.3 (2026-01-17)
+- **New Parameter**: `--max-concurrent-subdirs` to fix OOM on deep directory trees
+  - Default: 100 (unchanged behavior)
+  - Set to 10-20 for memory-constrained pods or very deep trees
+- See [CHANGELOG.md](CHANGELOG.md) for detailed changelog
+
 ### Version 1.7.2 (2026-01-17)
-- **Bug Fixes**:
-  - Fixed deprecated `asyncio.get_event_loop()` for Python 3.10+ compatibility
-  - Fixed silent exception swallowing in batch processing
-  - Fixed `last_progress_log` not being updated by background reporter
-- **Safety Improvements**:
-  - Block dangerous system directories (`/proc`, `/sys`, `/dev`, `/etc`, etc.)
-  - Track and skip special file types (sockets, FIFOs, devices)
-- **Documentation**:
-  - Added TOCTOU race condition explanation in README
+- **Bug Fixes**: Python 3.10+ compatibility, exception logging, progress tracking
+- **Safety**: Block system directories, track special files
 - See [CHANGELOG.md](CHANGELOG.md) for detailed changelog
 
 ### Version 1.7.0 (2026-01-16)

@@ -30,7 +30,7 @@ def get_memory_usage_mb() -> float:
 
 async def async_scandir(path: Path):
     """Async wrapper for os.scandir."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _scandir():
         with os.scandir(path) as entries:
@@ -100,6 +100,36 @@ class AsyncEFSPurger:
         if not root_path_obj.is_absolute():
             root_path_obj = root_path_obj.resolve()
 
+        # Block dangerous system directories that should never be purged
+        # These contain special files (device nodes, virtual filesystems) that would cause errors
+        # and potential system instability if deleted
+        dangerous_paths = {
+            "/proc",
+            "/sys",
+            "/dev",
+            "/run",
+            "/var/run",
+            "/boot",
+            "/bin",
+            "/sbin",
+            "/lib",
+            "/lib64",
+            "/usr/bin",
+            "/usr/sbin",
+            "/usr/lib",
+            "/etc",
+        }
+
+        # Check if root_path is or is inside a dangerous path
+        root_str = str(root_path_obj)
+        for dangerous in dangerous_paths:
+            if root_str == dangerous or root_str.startswith(dangerous + "/"):
+                raise ValueError(
+                    f"Refusing to purge system directory: {root_path_obj}. "
+                    f"This path is inside '{dangerous}' which contains critical system files. "
+                    f"Purging this directory could cause system instability or data loss."
+                )
+
         self.root_path = root_path_obj
         self.max_age_days = max_age_days
         self.cutoff_time = time.time() - (max_age_days * 86400)  # Convert days to seconds
@@ -117,6 +147,7 @@ class AsyncEFSPurger:
             "files_purged": 0,
             "dirs_scanned": 0,
             "symlinks_skipped": 0,
+            "special_files_skipped": 0,  # Sockets, FIFOs, device nodes, etc.
             "errors": 0,
             "bytes_freed": 0,
             "start_time": time.time(),
@@ -552,8 +583,19 @@ class AsyncEFSPurger:
         # Check memory before processing
         await self.check_memory_pressure()
 
-        # Process batch
-        await asyncio.gather(*file_tasks, return_exceptions=True)
+        # Process batch - return_exceptions=True prevents one failure from canceling others
+        results = await asyncio.gather(*file_tasks, return_exceptions=True)
+
+        # Log any unexpected exceptions that weren't handled by process_file
+        # (process_file handles its own exceptions, but defensive check is good)
+        for result in results:
+            if isinstance(result, Exception):
+                log_with_context(
+                    self.logger,
+                    "error",
+                    "Unexpected exception in batch processing",
+                    {"error": str(result), "error_type": type(result).__name__},
+                )
 
         self.logger.debug(f"Processed batch of {len(file_tasks)} files")
 
@@ -604,6 +646,12 @@ class AsyncEFSPurger:
 
                     elif entry.is_dir(follow_symlinks=False):
                         subdirs.append(entry_path)
+
+                    else:
+                        # Special file types: sockets, FIFOs, block/char devices, etc.
+                        # These are skipped and counted separately
+                        await self.update_stats(special_files_skipped=1)
+                        self.logger.debug(f"Skipping special file: {entry_path}")
 
                 except OSError as e:
                     log_with_context(
@@ -695,6 +743,9 @@ class AsyncEFSPurger:
                         ),
                     },
                 )
+
+                # Track when we last logged progress (used by final progress check)
+                self.last_progress_log = current_time
 
     async def purge(self) -> dict:
         """

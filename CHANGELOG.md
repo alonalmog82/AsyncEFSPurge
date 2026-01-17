@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.2] - 2026-01-17
+
+### Fixed
+- **Deprecated API**: Replaced `asyncio.get_event_loop()` with `asyncio.get_running_loop()` for Python 3.10+ compatibility
+- **Silent Exception Swallowing**: Batch processing now logs unexpected exceptions instead of silently discarding them
+- **Progress Tracking Bug**: `last_progress_log` is now properly updated by background reporter, fixing final progress log timing
+
+### Added
+- **System Directory Protection**: Blocks dangerous system directories (`/proc`, `/sys`, `/dev`, `/run`, `/boot`, `/bin`, `/sbin`, `/lib`, `/etc`, etc.) with clear error messages to prevent accidental system damage
+- **Special File Handling**: Sockets, FIFOs, block/char devices are now detected, skipped, and tracked via `special_files_skipped` stat
+- **TOCTOU Documentation**: Added comprehensive "Race Condition Considerations" section to README explaining the inherent POSIX limitation and design decisions
+
+### Tests
+- Added `test_system_directory_blocked` - Verifies dangerous paths are rejected
+- Added `test_safe_paths_allowed` - Verifies safe paths are accepted
+- Added `test_special_files_skipped` - Tests Unix socket detection
+- Added `test_fifo_skipped` - Tests FIFO (named pipe) detection
+- All 53 tests passing
+
 ## [1.7.1] - 2026-01-17
 
 ### Fixed

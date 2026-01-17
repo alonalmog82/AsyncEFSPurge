@@ -266,3 +266,103 @@ async def test_memory_limit_zero(temp_dir):
     # Should work without memory checks
     assert purger.stats["files_scanned"] == 10
     assert purger.stats["memory_backpressure_events"] == 0
+
+
+def test_system_directory_blocked():
+    """Test that dangerous system directories are blocked."""
+    dangerous_paths = [
+        "/proc",
+        "/proc/self",
+        "/sys",
+        "/sys/class",
+        "/dev",
+        "/dev/null",  # Path inside /dev
+        "/run",
+        "/boot",
+        "/etc",
+        "/etc/passwd",
+    ]
+
+    for path in dangerous_paths:
+        with pytest.raises(ValueError) as excinfo:
+            AsyncEFSPurger(
+                root_path=path,
+                max_age_days=30,
+            )
+        assert "Refusing to purge system directory" in str(excinfo.value)
+        assert "system instability" in str(excinfo.value)
+
+
+def test_safe_paths_allowed():
+    """Test that safe paths are allowed."""
+    safe_paths = [
+        "/tmp",
+        "/home/user/data",
+        "/mnt/efs",
+        "/var/log",  # Not in dangerous list (logs can be purged)
+        "/data",
+    ]
+
+    for path in safe_paths:
+        # Should not raise - the path might not exist but that's checked later
+        purger = AsyncEFSPurger(
+            root_path=path,
+            max_age_days=30,
+        )
+        assert purger.root_path == Path(path)
+
+
+@pytest.mark.asyncio
+async def test_special_files_skipped(temp_dir):
+    """Test that special files (sockets, FIFOs) are skipped."""
+    import socket
+
+    # Create a regular file
+    (temp_dir / "regular.txt").write_text("content")
+
+    # Create a Unix socket (special file)
+    socket_path = temp_dir / "test.sock"
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.bind(str(socket_path))
+
+        purger = AsyncEFSPurger(
+            root_path=str(temp_dir),
+            max_age_days=30,
+        )
+
+        await purger.scan_directory(temp_dir)
+
+        # Regular file should be scanned, socket should be skipped
+        assert purger.stats["files_scanned"] == 1
+        assert purger.stats["special_files_skipped"] == 1
+    finally:
+        sock.close()
+        if socket_path.exists():
+            socket_path.unlink()
+
+
+@pytest.mark.asyncio
+async def test_fifo_skipped(temp_dir):
+    """Test that FIFOs (named pipes) are skipped."""
+    # Create a regular file
+    (temp_dir / "regular.txt").write_text("content")
+
+    # Create a FIFO (named pipe)
+    fifo_path = temp_dir / "test.fifo"
+    os.mkfifo(fifo_path)
+
+    try:
+        purger = AsyncEFSPurger(
+            root_path=str(temp_dir),
+            max_age_days=30,
+        )
+
+        await purger.scan_directory(temp_dir)
+
+        # Regular file should be scanned, FIFO should be skipped
+        assert purger.stats["files_scanned"] == 1
+        assert purger.stats["special_files_skipped"] == 1
+    finally:
+        if fifo_path.exists():
+            fifo_path.unlink()

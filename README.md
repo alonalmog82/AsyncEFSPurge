@@ -522,20 +522,25 @@ Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for de
 
 ## Changelog
 
+### Version 1.7.2 (2026-01-17)
+- **Bug Fixes**:
+  - Fixed deprecated `asyncio.get_event_loop()` for Python 3.10+ compatibility
+  - Fixed silent exception swallowing in batch processing
+  - Fixed `last_progress_log` not being updated by background reporter
+- **Safety Improvements**:
+  - Block dangerous system directories (`/proc`, `/sys`, `/dev`, `/etc`, etc.)
+  - Track and skip special file types (sockets, FIFOs, devices)
+- **Documentation**:
+  - Added TOCTOU race condition explanation in README
+- See [CHANGELOG.md](CHANGELOG.md) for detailed changelog
+
+### Version 1.7.0 (2026-01-16)
+- **New Feature**: Empty directory rate limiting (`--max-empty-dirs-to-delete`)
+- Default: 500 directories per run to prevent metadata storms
+
 ### Version 1.6.0 (2026-01-16)
 - **New Feature**: Empty directory removal (`--remove-empty-dirs` flag)
-  - Post-order deletion (children before parents)
-  - Cascading deletion (parents checked after children deleted)
-  - Root directory always preserved
-  - Respects `--dry-run` mode
-- **Critical Bug Fixes**:
-  - Fixed race condition: Duplicate directory entries from concurrent scans
-  - Fixed list modification during iteration
-  - Fixed path comparison edge cases
-  - Fixed cascading deletion logic
-- **Improvements**:
-  - Added `remove_empty_dirs` to startup log output
-  - Comprehensive test coverage (40 tests passing)
+- Post-order deletion with cascading parent cleanup
 - See [CHANGELOG.md](CHANGELOG.md) for detailed changelog
 
 ### Version 1.4.0 (2026-01-15)

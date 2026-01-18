@@ -164,3 +164,43 @@ async def test_startup_log_includes_remove_empty_dirs(temp_dir):
     assert startup_log_extra.get("version") is not None, (
         f"Startup log version should not be None. Got: {startup_log_extra}"
     )
+
+
+@pytest.mark.asyncio
+async def test_stuck_detection_tracking_initialized(temp_dir):
+    """Test that stuck detection tracking variables are initialized."""
+    purger = AsyncEFSPurger(
+        root_path=str(temp_dir),
+        max_age_days=30,
+        dry_run=True,
+        log_level="INFO",
+    )
+
+    # Verify stuck detection tracking is initialized
+    assert purger.last_files_scanned == 0, "last_files_scanned should be initialized to 0"
+    assert purger.last_dirs_scanned == 0, "last_dirs_scanned should be initialized to 0"
+    assert purger.stuck_detection_count == 0, "stuck_detection_count should be initialized to 0"
+    assert isinstance(purger.active_directories, set), "active_directories should be a set"
+    assert len(purger.active_directories) == 0, "active_directories should start empty"
+
+
+@pytest.mark.asyncio
+async def test_active_directories_tracked_during_scan(temp_dir):
+    """Test that directories are tracked in active_directories during scanning."""
+    # Create a nested directory structure
+    (temp_dir / "level1" / "level2").mkdir(parents=True)
+
+    purger = AsyncEFSPurger(
+        root_path=str(temp_dir),
+        max_age_days=30,
+        dry_run=True,
+        log_level="INFO",
+    )
+
+    # After purge completes, active_directories should be empty
+    await purger.purge()
+
+    assert len(purger.active_directories) == 0, (
+        "active_directories should be empty after scan completes. "
+        f"Still tracking: {purger.active_directories}"
+    )

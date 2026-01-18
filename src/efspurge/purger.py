@@ -162,6 +162,15 @@ class AsyncEFSPurger:
             "empty_dirs_deleted": 0,  # Directories actually deleted (0 in dry-run)
         }
 
+        # Stuck detection: track progress for detecting hangs
+        self.last_files_scanned = 0
+        self.last_dirs_scanned = 0
+        self.stuck_detection_count = 0  # How many consecutive progress checks showed no change
+
+        # Track directories currently being scanned (for diagnostics when stuck)
+        self.active_directories: set[Path] = set()
+        self.active_directories_lock = asyncio.Lock()
+
         # Track empty directories for post-order deletion
         # Use set to prevent duplicates from concurrent scans
         self.empty_dirs: set[Path] = set()
@@ -618,6 +627,10 @@ class AsyncEFSPurger:
         Args:
             directory: Directory path to scan
         """
+        # Track this directory as actively being scanned (for stuck detection diagnostics)
+        async with self.active_directories_lock:
+            self.active_directories.add(directory)
+
         try:
             await self.update_stats(dirs_scanned=1)
 
@@ -706,6 +719,10 @@ class AsyncEFSPurger:
                 {"directory": str(directory), "error": str(e), "error_type": type(e).__name__},
             )
             await self.update_stats(errors=1)
+        finally:
+            # Remove from active directories when done (success or failure)
+            async with self.active_directories_lock:
+                self.active_directories.discard(directory)
 
     async def _background_progress_reporter(self) -> None:
         """
@@ -713,6 +730,7 @@ class AsyncEFSPurger:
 
         This ensures progress updates even when processing is slow or
         there are long periods of directory traversal without file processing.
+        Also detects stuck conditions and provides diagnostic information.
         """
         while True:
             await asyncio.sleep(self.progress_interval)
@@ -725,15 +743,18 @@ class AsyncEFSPurger:
                 memory_mb = get_memory_usage_mb()
                 memory_percent = (memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
 
+                current_files = self.stats["files_scanned"]
+                current_dirs = self.stats["dirs_scanned"]
+
                 log_with_context(
                     self.logger,
                     "info",
                     "Progress update",
                     {
-                        "files_scanned": self.stats["files_scanned"],
+                        "files_scanned": current_files,
                         "files_to_purge": self.stats["files_to_purge"],
                         "files_purged": self.stats["files_purged"],
-                        "dirs_scanned": self.stats["dirs_scanned"],
+                        "dirs_scanned": current_dirs,
                         "errors": self.stats["errors"],
                         "memory_backpressure_events": self.stats.get("memory_backpressure_events", 0),
                         "elapsed_seconds": round(elapsed, 1),
@@ -751,6 +772,52 @@ class AsyncEFSPurger:
 
                 # Track when we last logged progress (used by final progress check)
                 self.last_progress_log = current_time
+
+            # Stuck detection: check if progress has stalled
+            if current_files == self.last_files_scanned and current_dirs == self.last_dirs_scanned:
+                self.stuck_detection_count += 1
+
+                # After 2 consecutive checks with no progress (60+ seconds), warn user
+                if self.stuck_detection_count >= 2:
+                    async with self.active_directories_lock:
+                        active_dirs_copy = list(self.active_directories)
+
+                    # Log warning with diagnostic information
+                    log_with_context(
+                        self.logger,
+                        "warning",
+                        "POSSIBLE HANG DETECTED: No progress in last "
+                        f"{self.stuck_detection_count * self.progress_interval} seconds",
+                        {
+                            "files_scanned": current_files,
+                            "dirs_scanned": current_dirs,
+                            "active_directories_count": len(active_dirs_copy),
+                            "stuck_intervals": self.stuck_detection_count,
+                        },
+                    )
+
+                    # Log the directories currently being scanned (likely culprits)
+                    if active_dirs_copy:
+                        # Show up to 10 directories being scanned
+                        dirs_to_show = active_dirs_copy[:10]
+                        log_with_context(
+                            self.logger,
+                            "warning",
+                            "Directories currently being scanned (potential hang location)",
+                            {
+                                "directories": [str(d) for d in dirs_to_show],
+                                "total_active": len(active_dirs_copy),
+                                "hint": "If this persists, the filesystem may be unresponsive. "
+                                "Consider excluding problematic paths or checking NFS/EFS health.",
+                            },
+                        )
+            else:
+                # Progress was made, reset stuck counter
+                self.stuck_detection_count = 0
+
+            # Update last known values for next comparison
+            self.last_files_scanned = current_files
+            self.last_dirs_scanned = current_dirs
 
     async def purge(self) -> dict:
         """

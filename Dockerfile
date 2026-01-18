@@ -43,7 +43,7 @@ CMD ["--help"]
 # Labels for metadata
 LABEL org.opencontainers.image.title="AsyncEFSPurge"
 LABEL org.opencontainers.image.description="High-performance async file purger for AWS EFS"
-LABEL org.opencontainers.image.version="1.8.0"
+LABEL org.opencontainers.image.version="1.8.1"
 LABEL org.opencontainers.image.authors="Alon Almog <alon.almog@rivery.io>"
 LABEL org.opencontainers.image.licenses="MIT"
 

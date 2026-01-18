@@ -51,7 +51,7 @@ jobs:
           type=raw,value=latest,enable={{is_default_branch}}
     
     - name: Build Docker image
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v6
       with:
         context: .
         push: false
@@ -89,7 +89,7 @@ jobs:
         rm -rf /tmp/test-efs
     
     - name: Build and push Docker image
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v6
       with:
         context: .
         push: ${{ github.event_name != 'pull_request' }}
@@ -171,7 +171,7 @@ jobs:
   #         type=raw,value=latest,enable={{is_default_branch}}
   #   
   #   - name: Build and push to Docker Hub
-  #     uses: docker/build-push-action@v5
+  #     uses: docker/build-push-action@v6
   #     with:
   #       context: .
   #       push: true

@@ -1,5 +1,5 @@
 # Multi-stage build for optimal image size
-FROM python:3.11-slim as builder
+FROM python:3.14-slim as builder
 
 WORKDIR /build
 
@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir .
 
 # Final stage - minimal runtime image
-FROM python:3.11-slim
+FROM python:3.14-slim
 
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash --uid 1000 efspurge

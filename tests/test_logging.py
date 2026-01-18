@@ -179,9 +179,11 @@ async def test_stuck_detection_tracking_initialized(temp_dir):
     # Verify stuck detection tracking is initialized
     assert purger.last_files_scanned == 0, "last_files_scanned should be initialized to 0"
     assert purger.last_dirs_scanned == 0, "last_dirs_scanned should be initialized to 0"
+    assert purger.last_empty_dirs_deleted == 0, "last_empty_dirs_deleted should be initialized to 0"
     assert purger.stuck_detection_count == 0, "stuck_detection_count should be initialized to 0"
     assert isinstance(purger.active_directories, set), "active_directories should be a set"
     assert len(purger.active_directories) == 0, "active_directories should start empty"
+    assert purger.current_phase == "initializing", "current_phase should be 'initializing'"
 
 
 @pytest.mark.asyncio

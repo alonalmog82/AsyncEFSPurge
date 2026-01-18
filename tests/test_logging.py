@@ -201,6 +201,5 @@ async def test_active_directories_tracked_during_scan(temp_dir):
     await purger.purge()
 
     assert len(purger.active_directories) == 0, (
-        "active_directories should be empty after scan completes. "
-        f"Still tracking: {purger.active_directories}"
+        f"active_directories should be empty after scan completes. Still tracking: {purger.active_directories}"
     )

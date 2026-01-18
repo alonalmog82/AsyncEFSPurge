@@ -1,5 +1,5 @@
 # Multi-stage build for optimal image size
-FROM python:3.11-slim as builder
+FROM python:3.14-slim as builder
 
 WORKDIR /build
 
@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir .
 
 # Final stage - minimal runtime image
-FROM python:3.11-slim
+FROM python:3.14-slim
 
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash --uid 1000 efspurge
@@ -26,7 +26,7 @@ RUN useradd --create-home --shell /bin/bash --uid 1000 efspurge
 WORKDIR /app
 
 # Copy installed packages from builder
-COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/lib/python3.14/site-packages /usr/local/lib/python3.14/site-packages
 COPY --from=builder /usr/local/bin/efspurge /usr/local/bin/efspurge
 
 # Switch to non-root user
@@ -43,7 +43,7 @@ CMD ["--help"]
 # Labels for metadata
 LABEL org.opencontainers.image.title="AsyncEFSPurge"
 LABEL org.opencontainers.image.description="High-performance async file purger for AWS EFS"
-LABEL org.opencontainers.image.version="1.0.0"
+LABEL org.opencontainers.image.version="1.8.0"
 LABEL org.opencontainers.image.authors="Alon Almog <alon.almog@rivery.io>"
 LABEL org.opencontainers.image.licenses="MIT"
 

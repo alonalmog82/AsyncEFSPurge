@@ -3,6 +3,9 @@ FROM python:3.14-slim as builder
 
 WORKDIR /build
 
+# Set non-interactive frontend for apt to suppress debconf warnings
+ENV DEBIAN_FRONTEND=noninteractive
+
 # Install build dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \

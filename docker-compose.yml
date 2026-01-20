@@ -14,7 +14,8 @@ services:
     command:
       - /data
       - --max-age-days=30
-      - --max-concurrency=1000
+      - --max-concurrency-scanning=1000
+      - --max-concurrency-deletion=1000
       - --log-level=INFO
       # - --dry-run  # Uncomment for testing
     

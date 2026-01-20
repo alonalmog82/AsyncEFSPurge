@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-01-XX
+
+### Breaking Changes
+- **Split Concurrency Parameters**: `--max-concurrency` is now deprecated
+  - Use `--max-concurrency-scanning` and `--max-concurrency-deletion` instead
+  - Allows independent tuning of scanning (stat) vs deletion (remove) operations
+  - Deprecated parameter still works but shows deprecation warnings
+- **Environment Variable Changes**: `EFSPURGE_MAX_CONCURRENCY` is deprecated
+  - Use `EFSPURGE_MAX_CONCURRENCY_SCANNING` and `EFSPURGE_MAX_CONCURRENCY_DELETION` instead
+  - Deprecated env var still works but shows deprecation warnings
+
+### Added
+- **New Parameters**: `--max-concurrency-scanning` and `--max-concurrency-deletion`
+  - Independent concurrency limits for file scanning and deletion phases
+  - Scanning can often handle higher concurrency than deletion
+  - Environment variables: `EFSPURGE_MAX_CONCURRENCY_SCANNING`, `EFSPURGE_MAX_CONCURRENCY_DELETION`
+- **Environment Variable Support**: All configuration parameters now support environment variables
+  - `EFSPURGE_MAX_AGE_DAYS` (default: 30.0)
+  - `EFSPURGE_MEMORY_LIMIT_MB` (default: 800)
+  - `EFSPURGE_TASK_BATCH_SIZE` (default: 5000)
+  - `EFSPURGE_LOG_LEVEL` (default: INFO)
+  - Makes Kubernetes ConfigMap/Secret management easier
+- **Enhanced Metrics**: Progress logs now include separate concurrency metrics
+  - `max_concurrency_scanning` and `max_concurrency_deletion` in progress logs
+  - Better visibility for tuning each phase independently
+
+### Changed
+- **Concurrency Control**: File operations now use separate semaphores
+  - Scanning operations use `scanning_semaphore`
+  - Deletion operations use `deletion_semaphore`
+  - Empty directory deletion remains sequential (unchanged)
+
+### Documentation
+- Updated `CONCURRENCY_TUNING.md` with split concurrency guidance
+- Updated `README.md` with new parameters and deprecation notices
+- Updated `k8s-cronjob.yaml` example to use environment variables
+- Added migration guide for deprecated parameters
+
 ## [1.7.3] - 2026-01-17
 
 ### Added

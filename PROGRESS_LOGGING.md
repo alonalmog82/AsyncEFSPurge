@@ -62,7 +62,8 @@ docker run --rm -v /tmp/progress-test:/data \
   ghcr.io/alonalmog82/asyncefspurge:latest \
   /data \
   --max-age-days 0 \
-  --max-concurrency 100 \
+  --max-concurrency-scanning 100 \
+  --max-concurrency-deletion 100 \
   --dry-run \
   --log-level INFO
 \`\`\`

@@ -32,18 +32,11 @@ spec:
           
           containers:
           - name: efspurge
-            image: ghcr.io/alonalmog82/asyncefspurge:1.7.4
+            image: ghcr.io/alonalmog82/asyncefspurge:1.9.0
             imagePullPolicy: IfNotPresent
             
             args:
-              - /data
-              - --max-age-days=30
-              - --max-concurrency=1000
-              - --memory-limit-mb=800
-              - --task-batch-size=5000
-              - --remove-empty-dirs              # Enable empty directory cleanup (default: 500/run)
-              # - --max-empty-dirs-to-delete=500 # Optional: override default (0=unlimited)
-              - --log-level=INFO
+              - /data  # Path is required positional argument, cannot be env var
             
             # Security context
             securityContext:
@@ -74,10 +67,32 @@ spec:
             
             # Environment variables
             env:
+            # Python runtime settings
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: PYTHONDONTWRITEBYTECODE
               value: "1"
+            # Application configuration (all configurable via env vars)
+            - name: EFSPURGE_MAX_AGE_DAYS
+              value: "30"
+            - name: EFSPURGE_MEMORY_LIMIT_MB
+              value: "800"
+            - name: EFSPURGE_TASK_BATCH_SIZE
+              value: "5000"
+            - name: EFSPURGE_LOG_LEVEL
+              value: "INFO"
+            # Concurrency settings
+            - name: EFSPURGE_MAX_CONCURRENCY_SCANNING
+              value: "1000"
+            - name: EFSPURGE_MAX_CONCURRENCY_DELETION
+              value: "1000"
+            - name: EFSPURGE_MAX_CONCURRENT_SUBDIRS
+              value: "100"
+            # Empty directory cleanup
+            - name: EFSPURGE_REMOVE_EMPTY_DIRS
+              value: "1"  # Enable empty directory cleanup
+            # - name: EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE
+            #   value: "500"  # Optional: override default (0=unlimited)
           
           # Volumes
           volumes:

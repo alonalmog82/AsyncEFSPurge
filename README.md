@@ -48,8 +48,8 @@ efspurge /mnt/efs --max-age-days 30 --dry-run
 # Purge files older than 30 days
 efspurge /mnt/efs --max-age-days 30
 
-# High concurrency for network storage
-efspurge /mnt/efs --max-age-days 7 --max-concurrency 2000
+# High concurrency for network storage (separate limits for scanning and deletion)
+efspurge /mnt/efs --max-age-days 7 --max-concurrency-scanning 2000 --max-concurrency-deletion 1000
 ```
 
 ## Installation
@@ -86,7 +86,9 @@ positional arguments:
 
 options:
   --max-age-days DAYS       Files older than this (in days) will be purged (default: 30.0)
-  --max-concurrency N       Maximum concurrent async operations (default: 1000)
+  --max-concurrency N       [DEPRECATED] Maximum concurrent async operations (use --max-concurrency-scanning/deletion)
+  --max-concurrency-scanning N  Maximum concurrent file scanning (stat) operations (default: 1000)
+  --max-concurrency-deletion N  Maximum concurrent file deletion (remove) operations (default: 1000)
   --memory-limit-mb MB      Soft memory limit in MB, triggers back-pressure (default: 800)
   --task-batch-size N       Maximum tasks to create at once, prevents OOM (default: 5000)
   --max-concurrent-subdirs N  Maximum subdirectories to scan concurrently (default: 100)
@@ -112,7 +114,7 @@ efspurge /mnt/efs/old-files --max-age-days 90
 
 **High-performance mode for very large filesystems:**
 ```bash
-efspurge /mnt/efs --max-age-days 7 --max-concurrency 2000 --memory-limit-mb 1600
+efspurge /mnt/efs --max-age-days 7 --max-concurrency-scanning 2000 --max-concurrency-deletion 1000 --memory-limit-mb 1600
 ```
 
 **Debug mode with detailed logging:**
@@ -164,7 +166,8 @@ spec:
             args:
               - /data
               - --max-age-days=30
-              - --max-concurrency=1000
+              - --max-concurrency-scanning=1000
+              - --max-concurrency-deletion=1000
               - --memory-limit-mb=800
               - --task-batch-size=5000
               - --remove-empty-dirs
@@ -225,7 +228,8 @@ Example ECS task definition:
       "command": [
         "/mnt/efs",
         "--max-age-days=30",
-        "--max-concurrency=1000"
+        "--max-concurrency-scanning=1000",
+        "--max-concurrency-deletion=1000"
       ],
       "mountPoints": [
         {
@@ -441,6 +445,9 @@ ruff format .
 - `EFSPURGE_REMOVE_EMPTY_DIRS=1` - Enable empty directory removal (same as `--remove-empty-dirs` flag)
 - `EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE=N` - Maximum empty directories to delete per run (0 = unlimited, default: 500)
 - `EFSPURGE_MAX_CONCURRENT_SUBDIRS=N` - Maximum subdirectories to scan concurrently (default: 100, lower for deep trees)
+- `EFSPURGE_MAX_CONCURRENCY=N` - [DEPRECATED] Maximum concurrent operations (use `EFSPURGE_MAX_CONCURRENCY_SCANNING`/`EFSPURGE_MAX_CONCURRENCY_DELETION`)
+- `EFSPURGE_MAX_CONCURRENCY_SCANNING=N` - Maximum concurrent file scanning operations (default: 1000)
+- `EFSPURGE_MAX_CONCURRENCY_DELETION=N` - Maximum concurrent file deletion operations (default: 1000)
 
 ### Empty Directory Rate Limiting
 
@@ -477,14 +484,23 @@ efspurge /data --max-age-days 30 --remove-empty-dirs
 
 ### Tuning Concurrency
 
-The `--max-concurrency` parameter should be tuned based on your filesystem:
+The `--max-concurrency-scanning` and `--max-concurrency-deletion` parameters should be tuned based on your filesystem:
 
-- **Local disk**: 100-500
+**Scanning (stat operations):**
+- **Local disk**: 500-1000
+- **Network filesystem (NFS/SMB)**: 1000-2000
+- **AWS EFS**: 2000-3000 (higher is better due to high latency)
+- **Object storage**: 3000-5000
+
+**Deletion (remove operations):**
+- **Local disk**: 500-1000
 - **Network filesystem (NFS/SMB)**: 500-1000
-- **AWS EFS**: 1000-2000 (higher is better due to high latency)
-- **Object storage**: 2000-5000
+- **AWS EFS**: 1000-2000 (may be slower than scanning)
+- **Object storage**: 1000-2000
 
-Start with defaults and increase if you're not saturating network/IOPS.
+**Note:** `--max-concurrency` is deprecated but still works (sets both scanning and deletion to the same value). Use separate parameters for better control.
+
+Start with defaults and increase if you're not saturating network/IOPS. See [CONCURRENCY_TUNING.md](CONCURRENCY_TUNING.md) for detailed guidance.
 
 ### Tuning Memory for Deep Directory Trees
 
@@ -546,7 +562,8 @@ docker run --rm -v /mnt/efs:/data:rw efspurge:latest /data --max-age-days 30
 # Reduce concurrent subdirectory scanning
 efspurge /data --max-age-days 30 \
   --max-concurrent-subdirs=10 \
-  --max-concurrency=100 \
+  --max-concurrency-scanning=100 \
+  --max-concurrency-deletion=100 \
   --task-batch-size=500
 ```
 
@@ -564,10 +581,11 @@ docker run --rm -m 2g -v /mnt/efs:/data efspurge:latest /data \
 
 ### Slow Performance
 
-1. Increase `--max-concurrency` (try 2000-5000 for EFS)
-2. Ensure network connectivity is good
-3. Check filesystem IOPS limits (AWS EFS scales with size)
-4. Use `--log-level WARNING` to reduce logging overhead
+1. Increase `--max-concurrency-scanning` (try 2000-3000 for EFS)
+2. Increase `--max-concurrency-deletion` (try 1000-2000 for EFS)
+3. Ensure network connectivity is good
+4. Check filesystem IOPS limits (AWS EFS scales with size)
+5. Use `--log-level WARNING` to reduce logging overhead
 
 ## License
 
@@ -582,6 +600,20 @@ MIT License - see [LICENSE](LICENSE) file for details.
 Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests.
 
 ## Changelog
+
+### Version 1.9.0 (2026-01-XX)
+- **BREAKING CHANGE**: Split concurrency parameters into separate scanning and deletion limits
+  - `--max-concurrency` is deprecated (use `--max-concurrency-scanning` and `--max-concurrency-deletion`)
+  - `EFSPURGE_MAX_CONCURRENCY` env var is deprecated (use `EFSPURGE_MAX_CONCURRENCY_SCANNING`/`EFSPURGE_MAX_CONCURRENCY_DELETION`)
+  - New parameters: `--max-concurrency-scanning` and `--max-concurrency-deletion` for independent control
+  - Deprecated parameters still work but show warnings
+- **New Feature**: All configuration parameters now support environment variables
+  - `EFSPURGE_MAX_AGE_DAYS`, `EFSPURGE_MEMORY_LIMIT_MB`, `EFSPURGE_TASK_BATCH_SIZE`, `EFSPURGE_LOG_LEVEL`
+  - Makes Kubernetes ConfigMap/Secret management easier
+- **Enhancement**: Enhanced concurrency metrics in progress logs
+  - Separate tracking for scanning vs deletion concurrency utilization
+  - Better visibility for tuning each phase independently
+- See [CHANGELOG.md](CHANGELOG.md) for detailed changelog
 
 ### Version 1.7.3 (2026-01-17)
 - **New Parameter**: `--max-concurrent-subdirs` to fix OOM on deep directory trees

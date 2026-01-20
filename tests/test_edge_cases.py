@@ -32,7 +32,8 @@ async def test_file_deleted_during_processing(temp_dir):
         root_path=str(temp_dir),
         max_age_days=30,
         dry_run=False,
-        max_concurrency=1,
+        max_concurrency_scanning=1,
+        max_concurrency_deletion=1,
     )
 
     # Delete file manually (simulating race condition)
@@ -229,7 +230,8 @@ async def test_concurrent_file_processing(temp_dir):
     purger = AsyncEFSPurger(
         root_path=str(temp_dir),
         max_age_days=30,
-        max_concurrency=10,
+        max_concurrency_scanning=10,
+        max_concurrency_deletion=10,
     )
 
     await purger.scan_directory(temp_dir)

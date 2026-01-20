@@ -3,6 +3,7 @@
 import asyncio
 import os
 import time
+from collections import deque
 from pathlib import Path
 
 import aiofiles.os
@@ -39,6 +40,141 @@ async def async_scandir(path: Path):
     return await loop.run_in_executor(None, _scandir)
 
 
+class RateTracker:
+    """
+    Track rates for different phases and time windows.
+
+    Supports:
+    - Per-phase rate tracking (scanning, deletion, removing_empty_dirs)
+    - Time-windowed rates (instant 10s, short-term 60s, overall)
+    - Peak rate tracking
+    """
+
+    def __init__(self):
+        """Initialize the rate tracker."""
+        # Store samples as (timestamp, phase, metric_type, count)
+        # Using deque for efficient append/popleft operations
+        self.samples: deque[tuple[float, str, str, int]] = deque(maxlen=10000)
+
+        # Track peak rates
+        self.peak_rates = {
+            "files_per_second": {"value": 0.0, "timestamp": None},
+            "dirs_per_second": {"value": 0.0, "timestamp": None},
+            "files_deleted_per_second": {"value": 0.0, "timestamp": None},
+            "empty_dirs_per_second": {"value": 0.0, "timestamp": None},
+        }
+
+        # Track phase start times for per-phase rate calculation
+        self.phase_start_times = {
+            "scanning": None,
+            "deletion": None,
+            "removing_empty_dirs": None,
+        }
+
+        # Track phase-specific counters
+        self.phase_counts = {
+            "scanning": {"files": 0, "dirs": 0},
+            "deletion": {"files": 0},
+            "removing_empty_dirs": {"dirs": 0},
+        }
+
+    def record(self, phase: str, metric_type: str, count: int = 1) -> None:
+        """
+        Record a metric sample.
+
+        Args:
+            phase: Current phase ("scanning", "deletion", "removing_empty_dirs")
+            metric_type: Type of metric ("files", "dirs")
+            count: Count to record (default: 1)
+        """
+        timestamp = time.time()
+        self.samples.append((timestamp, phase, metric_type, count))
+
+        # Update phase counts
+        if phase in self.phase_counts:
+            if metric_type in self.phase_counts[phase]:
+                self.phase_counts[phase][metric_type] += count
+
+    def get_rate(self, phase: str, metric_type: str, window_seconds: float) -> float:
+        """
+        Calculate rate for a specific phase/metric over time window.
+
+        Args:
+            phase: Phase to filter by
+            metric_type: Metric type to filter by ("files", "dirs")
+            window_seconds: Time window in seconds
+
+        Returns:
+            Rate (count per second) over the specified window
+        """
+        if window_seconds <= 0:
+            return 0.0
+
+        cutoff = time.time() - window_seconds
+
+        # Filter samples within window, matching phase and metric_type
+        relevant = [s for s in self.samples if s[0] > cutoff and s[1] == phase and s[2] == metric_type]
+
+        if not relevant:
+            return 0.0
+
+        total = sum(s[3] for s in relevant)
+        time_span = relevant[-1][0] - relevant[0][0] if len(relevant) > 1 else 1.0
+
+        return total / time_span if time_span > 0 else 0.0
+
+    def get_phase_rate(self, phase: str, metric_type: str) -> float:
+        """
+        Calculate rate for a phase since phase started.
+
+        Args:
+            phase: Phase name
+            metric_type: Metric type ("files", "dirs")
+
+        Returns:
+            Rate since phase started, or 0 if phase hasn't started
+        """
+        if phase not in self.phase_start_times or self.phase_start_times[phase] is None:
+            return 0.0
+
+        elapsed = time.time() - self.phase_start_times[phase]
+        if elapsed <= 0:
+            return 0.0
+
+        if phase not in self.phase_counts:
+            return 0.0
+
+        count = self.phase_counts[phase].get(metric_type, 0)
+        return count / elapsed
+
+    def set_phase_start(self, phase: str) -> None:
+        """
+        Mark the start of a phase.
+
+        Args:
+            phase: Phase name
+        """
+        self.phase_start_times[phase] = time.time()
+        # Reset phase counts when phase starts
+        if phase in self.phase_counts:
+            self.phase_counts[phase] = {k: 0 for k in self.phase_counts[phase]}
+
+    def update_peak_rate(self, metric_name: str, rate: float) -> None:
+        """
+        Update peak rate if current rate exceeds previous peak.
+
+        Args:
+            metric_name: Name of the metric ("files_per_second", etc.)
+            rate: Current rate value
+        """
+        if metric_name in self.peak_rates:
+            if rate > self.peak_rates[metric_name]["value"]:
+                self.peak_rates[metric_name] = {
+                    "value": rate,
+                    "timestamp": time.time(),
+                }
+
+
 class AsyncEFSPurger:
     """
     High-performance async file purger for network file systems.
@@ -54,7 +190,9 @@ class AsyncEFSPurger:
         self,
         root_path: str,
         max_age_days: float,
-        max_concurrency: int = 1000,
+        max_concurrency: int | None = None,
+        max_concurrency_scanning: int | None = None,
+        max_concurrency_deletion: int | None = None,
         dry_run: bool = True,
         log_level: str = "INFO",
         memory_limit_mb: int = 800,
@@ -69,7 +207,9 @@ class AsyncEFSPurger:
         Args:
             root_path: Root directory to scan
             max_age_days: Files older than this (in days) will be purged
-            max_concurrency: Maximum concurrent async operations
+            max_concurrency: Maximum concurrent async operations (deprecated, use max_concurrency_scanning/deletion)
+            max_concurrency_scanning: Maximum concurrent file scanning (stat) operations (default: 1000)
+            max_concurrency_deletion: Maximum concurrent file deletion (remove) operations (default: 1000)
             dry_run: If True, only report what would be deleted
             log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
             memory_limit_mb: Soft memory limit in MB (triggers back-pressure, 0 = disabled)
@@ -85,8 +225,38 @@ class AsyncEFSPurger:
         if max_age_days < 0:
             raise ValueError(f"max_age_days must be >= 0, got {max_age_days}")
 
-        if max_concurrency < 1:
-            raise ValueError(f"max_concurrency must be >= 1, got {max_concurrency}")
+        # Handle concurrency parameters: backward compatibility with max_concurrency
+        # If max_concurrency is provided, use it for both scanning and deletion
+        # Otherwise, use individual parameters with defaults
+        if max_concurrency is not None:
+            if max_concurrency < 1:
+                raise ValueError(f"max_concurrency must be >= 1, got {max_concurrency}")
+            # Deprecation warning
+            import warnings
+
+            warnings.warn(
+                "max_concurrency is deprecated. Use max_concurrency_scanning and max_concurrency_deletion instead. "
+                f"Setting both to {max_concurrency} for backward compatibility.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            # Use max_concurrency for both if individual params not specified
+            if max_concurrency_scanning is None:
+                max_concurrency_scanning = max_concurrency
+            if max_concurrency_deletion is None:
+                max_concurrency_deletion = max_concurrency
+        else:
+            # Default to 1000 if neither max_concurrency nor individual params are provided
+            if max_concurrency_scanning is None:
+                max_concurrency_scanning = 1000
+            if max_concurrency_deletion is None:
+                max_concurrency_deletion = 1000
+
+        # Validate individual concurrency parameters
+        if max_concurrency_scanning < 1:
+            raise ValueError(f"max_concurrency_scanning must be >= 1, got {max_concurrency_scanning}")
+        if max_concurrency_deletion < 1:
+            raise ValueError(f"max_concurrency_deletion must be >= 1, got {max_concurrency_deletion}")
 
         if task_batch_size < 1:
             raise ValueError(f"task_batch_size must be >= 1, got {task_batch_size}")
@@ -138,7 +308,10 @@ class AsyncEFSPurger:
         self.root_path = root_path_obj
         self.max_age_days = max_age_days
         self.cutoff_time = time.time() - (max_age_days * 86400)  # Convert days to seconds
-        self.max_concurrency = max_concurrency
+        # Store concurrency limits (for backward compatibility, max_concurrency is the max of both)
+        self.max_concurrency_scanning = max_concurrency_scanning
+        self.max_concurrency_deletion = max_concurrency_deletion
+        self.max_concurrency = max(max_concurrency_scanning, max_concurrency_deletion)  # For backward compatibility
         self.dry_run = dry_run
         self.memory_limit_mb = memory_limit_mb
         self.task_batch_size = task_batch_size
@@ -175,13 +348,22 @@ class AsyncEFSPurger:
         # Track current phase for better progress reporting
         self.current_phase = "initializing"  # "scanning", "removing_empty_dirs", "completed"
 
+        # Rate tracking for enhanced metrics
+        self.rate_tracker = RateTracker()
+
         # Track empty directories for post-order deletion
         # Use set to prevent duplicates from concurrent scans
         self.empty_dirs: set[Path] = set()
 
-        # Concurrency control
-        self.semaphore = asyncio.Semaphore(max_concurrency)
+        # Concurrency control - separate semaphores for scanning and deletion
+        self.scanning_semaphore = asyncio.Semaphore(max_concurrency_scanning)
+        self.deletion_semaphore = asyncio.Semaphore(max_concurrency_deletion)
         self.stats_lock = asyncio.Lock()
+
+        # Track active tasks for concurrency utilization metrics
+        self.active_tasks = 0
+        self.max_active_tasks = 0
+        self.active_tasks_lock = asyncio.Lock()
 
         # Logging
         self.logger = setup_logging("efspurge", log_level)
@@ -247,43 +429,60 @@ class AsyncEFSPurger:
         Args:
             file_path: Path to the file to process
         """
-        async with self.semaphore:
-            try:
-                # Get file stats asynchronously
-                stat = await aiofiles.os.stat(file_path)
-                await self.update_stats(files_scanned=1)
+        # Track active tasks for concurrency metrics
+        async with self.active_tasks_lock:
+            self.active_tasks += 1
+            self.max_active_tasks = max(self.max_active_tasks, self.active_tasks)
 
-                # Check if file is old enough to purge
-                if stat.st_mtime < self.cutoff_time:
-                    await self.update_stats(files_to_purge=1)
+        try:
+            # Use scanning semaphore for stat operation
+            async with self.scanning_semaphore:
+                try:
+                    # Get file stats asynchronously
+                    stat = await aiofiles.os.stat(file_path)
+                    await self.update_stats(files_scanned=1)
+                    # Record sample for rate tracking
+                    self.rate_tracker.record(self.current_phase, "files", 1)
 
-                    if not self.dry_run:
-                        # Delete the file
-                        await aiofiles.os.remove(file_path)
-                        await self.update_stats(files_purged=1, bytes_freed=stat.st_size)
-                        self.logger.debug(f"Purged: {file_path}")
-                    else:
-                        self.logger.debug(f"Would purge: {file_path}")
+                    # Check if file is old enough to purge
+                    if stat.st_mtime < self.cutoff_time:
+                        await self.update_stats(files_to_purge=1)
 
-            except FileNotFoundError:
-                # File was deleted by another process - not an error
-                self.logger.debug(f"File already deleted: {file_path}")
-            except PermissionError as e:
-                log_with_context(
-                    self.logger,
-                    "warning",
-                    "Permission denied",
-                    {"file": str(file_path), "error": str(e)},
-                )
-                await self.update_stats(errors=1)
-            except Exception as e:
-                log_with_context(
-                    self.logger,
-                    "error",
-                    "Error processing file",
-                    {"file": str(file_path), "error": str(e), "error_type": type(e).__name__},
-                )
-                await self.update_stats(errors=1)
+                        if not self.dry_run:
+                            # Use deletion semaphore for remove operation
+                            async with self.deletion_semaphore:
+                                # Delete the file
+                                await aiofiles.os.remove(file_path)
+                                await self.update_stats(files_purged=1, bytes_freed=stat.st_size)
+                                # Record deletion sample (use "deletion" phase for purged files)
+                                self.rate_tracker.record("deletion", "files", 1)
+                                self.logger.debug(f"Purged: {file_path}")
+                        else:
+                            self.logger.debug(f"Would purge: {file_path}")
+
+                except FileNotFoundError:
+                    # File was deleted by another process - not an error
+                    self.logger.debug(f"File already deleted: {file_path}")
+                except PermissionError as e:
+                    log_with_context(
+                        self.logger,
+                        "warning",
+                        "Permission denied",
+                        {"file": str(file_path), "error": str(e)},
+                    )
+                    await self.update_stats(errors=1)
+                except Exception as e:
+                    log_with_context(
+                        self.logger,
+                        "error",
+                        "Error processing file",
+                        {"file": str(file_path), "error": str(e), "error_type": type(e).__name__},
+                    )
+                    await self.update_stats(errors=1)
+        finally:
+            # Decrement active tasks counter
+            async with self.active_tasks_lock:
+                self.active_tasks -= 1
 
     async def _check_empty_directory(self, directory: Path) -> None:
         """
@@ -342,6 +541,7 @@ class AsyncEFSPurger:
 
         # Set phase for progress reporting
         self.current_phase = "removing_empty_dirs"
+        self.rate_tracker.set_phase_start("removing_empty_dirs")
 
         # Log start of empty directory removal
         async with self.stats_lock:
@@ -416,6 +616,8 @@ class AsyncEFSPurger:
                 if not self.dry_run:
                     await aiofiles.os.rmdir(directory)
                     await self.update_stats(empty_dirs_to_delete=1, empty_dirs_deleted=1)
+                    # Record sample for rate tracking
+                    self.rate_tracker.record("removing_empty_dirs", "dirs", 1)
                     self.logger.debug(f"Removed empty directory: {directory}")
                 else:
                     await self.update_stats(empty_dirs_to_delete=1)
@@ -545,6 +747,8 @@ class AsyncEFSPurger:
                     if not self.dry_run:
                         await aiofiles.os.rmdir(parent)
                         await self.update_stats(empty_dirs_to_delete=1, empty_dirs_deleted=1)
+                        # Record sample for rate tracking
+                        self.rate_tracker.record("removing_empty_dirs", "dirs", 1)
                         self.logger.debug(f"Removed empty parent directory: {parent}")
                     else:
                         await self.update_stats(empty_dirs_to_delete=1)
@@ -640,6 +844,8 @@ class AsyncEFSPurger:
 
         try:
             await self.update_stats(dirs_scanned=1)
+            # Record sample for rate tracking
+            self.rate_tracker.record(self.current_phase, "dirs", 1)
 
             # Scan directory entries
             entries = await async_scandir(directory)
@@ -753,6 +959,45 @@ class AsyncEFSPurger:
                 current_files = self.stats["files_scanned"]
                 current_dirs = self.stats["dirs_scanned"]
 
+                # Calculate enhanced rate metrics
+                # Overall rates (since start)
+                files_per_second_overall = rate
+                dirs_per_second_overall = current_dirs / elapsed if elapsed > 0 else 0.0
+
+                # Time-windowed rates (instant 10s, short-term 60s)
+                files_per_second_instant = self.rate_tracker.get_rate("scanning", "files", 10.0)
+                dirs_per_second_instant = self.rate_tracker.get_rate("scanning", "dirs", 10.0)
+                files_per_second_short = self.rate_tracker.get_rate("scanning", "files", 60.0)
+                dirs_per_second_short = self.rate_tracker.get_rate("scanning", "dirs", 60.0)
+
+                # Per-phase rates
+                scanning_files_rate = self.rate_tracker.get_phase_rate("scanning", "files")
+                scanning_dirs_rate = self.rate_tracker.get_phase_rate("scanning", "dirs")
+                deletion_files_rate = self.rate_tracker.get_phase_rate("deletion", "files")
+                empty_dirs_rate = self.rate_tracker.get_phase_rate("removing_empty_dirs", "dirs")
+
+                # Update peak rates
+                self.rate_tracker.update_peak_rate("files_per_second", files_per_second_overall)
+                self.rate_tracker.update_peak_rate("dirs_per_second", dirs_per_second_overall)
+                if deletion_files_rate > 0:
+                    self.rate_tracker.update_peak_rate("files_deleted_per_second", deletion_files_rate)
+                if empty_dirs_rate > 0:
+                    self.rate_tracker.update_peak_rate("empty_dirs_per_second", empty_dirs_rate)
+
+                # Get concurrency utilization metrics
+                async with self.active_tasks_lock:
+                    current_active_tasks = self.active_tasks
+                    peak_active_tasks = self.max_active_tasks
+
+                # Calculate semaphore availability (approximate)
+                # Note: Semaphore doesn't expose available count, so we estimate
+                # For backward compatibility, use max of both limits
+                max_concurrency_total = max(self.max_concurrency_scanning, self.max_concurrency_deletion)
+                available_slots = max(0, max_concurrency_total - current_active_tasks)
+                concurrency_utilization_percent = (
+                    (current_active_tasks / max_concurrency_total * 100) if max_concurrency_total > 0 else 0.0
+                )
+
                 # Build progress update with phase-specific info
                 progress_data = {
                     "phase": self.current_phase,
@@ -763,7 +1008,40 @@ class AsyncEFSPurger:
                     "errors": self.stats["errors"],
                     "memory_backpressure_events": self.stats.get("memory_backpressure_events", 0),
                     "elapsed_seconds": round(elapsed, 1),
-                    "files_per_second": round(rate, 1),
+                    # Overall rates (backward compatible)
+                    "files_per_second": round(files_per_second_overall, 1),
+                    # Enhanced rate metrics - overall
+                    "files_per_second_overall": round(files_per_second_overall, 1),
+                    "dirs_per_second_overall": round(dirs_per_second_overall, 1),
+                    # Enhanced rate metrics - time-windowed
+                    "files_per_second_instant": round(files_per_second_instant, 1),
+                    "dirs_per_second_instant": round(dirs_per_second_instant, 1),
+                    "files_per_second_short": round(files_per_second_short, 1),
+                    "dirs_per_second_short": round(dirs_per_second_short, 1),
+                    # Enhanced rate metrics - per-phase
+                    "scanning_files_per_second": round(scanning_files_rate, 1),
+                    "scanning_dirs_per_second": round(scanning_dirs_rate, 1),
+                    "deletion_files_per_second": round(deletion_files_rate, 1),
+                    "empty_dirs_per_second": round(empty_dirs_rate, 1),
+                    # Peak rates
+                    "peak_files_per_second": round(self.rate_tracker.peak_rates["files_per_second"]["value"], 1),
+                    "peak_dirs_per_second": round(self.rate_tracker.peak_rates["dirs_per_second"]["value"], 1),
+                    "peak_files_deleted_per_second": round(
+                        self.rate_tracker.peak_rates["files_deleted_per_second"]["value"], 1
+                    ),
+                    "peak_empty_dirs_per_second": round(
+                        self.rate_tracker.peak_rates["empty_dirs_per_second"]["value"], 1
+                    ),
+                    # Concurrency utilization metrics (for tuning concurrency limits)
+                    "active_tasks": current_active_tasks,
+                    "max_active_tasks": peak_active_tasks,
+                    "max_concurrency_scanning": self.max_concurrency_scanning,
+                    "max_concurrency_deletion": self.max_concurrency_deletion,
+                    # For backward compatibility
+                    "max_concurrency": max(self.max_concurrency_scanning, self.max_concurrency_deletion),
+                    "available_concurrency_slots": available_slots,
+                    "concurrency_utilization_percent": round(concurrency_utilization_percent, 1),
+                    # Memory metrics
                     "memory_mb": round(memory_mb, 1),
                     "memory_limit_mb": self.memory_limit_mb,
                     "memory_usage_percent": round(memory_percent, 1),
@@ -888,7 +1166,9 @@ class AsyncEFSPurger:
                 "root_path": str(self.root_path),
                 "max_age_days": self.max_age_days,
                 "cutoff_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.cutoff_time)),
-                "max_concurrency": self.max_concurrency,
+                "max_concurrency_scanning": self.max_concurrency_scanning,
+                "max_concurrency_deletion": self.max_concurrency_deletion,
+                "max_concurrency": self.max_concurrency,  # For backward compatibility
                 "dry_run": self.dry_run,
                 "progress_interval_seconds": self.progress_interval,
                 "memory_limit_mb": self.memory_limit_mb,
@@ -911,6 +1191,7 @@ class AsyncEFSPurger:
         try:
             # Start the recursive scan
             self.current_phase = "scanning"
+            self.rate_tracker.set_phase_start("scanning")
             await self.scan_directory(self.root_path)
 
             # After all scanning is complete, remove empty directories in post-order
@@ -973,7 +1254,9 @@ class AsyncEFSPurger:
 async def async_main(
     path: str,
     max_age_days: float,
-    max_concurrency: int = 1000,
+    max_concurrency: int | None = None,
+    max_concurrency_scanning: int | None = None,
+    max_concurrency_deletion: int | None = None,
     dry_run: bool = True,
     log_level: str = "INFO",
     memory_limit_mb: int = 800,
@@ -988,7 +1271,9 @@ async def async_main(
     Args:
         path: Root path to purge
         max_age_days: Maximum age of files in days
-        max_concurrency: Maximum concurrent operations
+        max_concurrency: Maximum concurrent operations (deprecated, use max_concurrency_scanning/deletion)
+        max_concurrency_scanning: Maximum concurrent file scanning operations (default: 1000)
+        max_concurrency_deletion: Maximum concurrent file deletion operations (default: 1000)
         dry_run: If True, don't actually delete files
         log_level: Logging level
         memory_limit_mb: Soft memory limit in MB (0 = no limit)
@@ -1004,6 +1289,8 @@ async def async_main(
         root_path=path,
         max_age_days=max_age_days,
         max_concurrency=max_concurrency,
+        max_concurrency_scanning=max_concurrency_scanning,
+        max_concurrency_deletion=max_concurrency_deletion,
         dry_run=dry_run,
         log_level=log_level,
         memory_limit_mb=memory_limit_mb,

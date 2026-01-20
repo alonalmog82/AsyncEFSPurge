@@ -56,7 +56,8 @@ async def test_large_flat_directory(large_test_structure):
     purger = AsyncEFSPurger(
         root_path=str(flat_dir),
         max_age_days=30,
-        max_concurrency=100,
+        max_concurrency_scanning=100,
+        max_concurrency_deletion=100,
         memory_limit_mb=200,
         task_batch_size=200,
         dry_run=True,
@@ -80,7 +81,8 @@ async def test_large_nested_directory(large_test_structure):
     purger = AsyncEFSPurger(
         root_path=str(nested_dir),
         max_age_days=30,
-        max_concurrency=100,
+        max_concurrency_scanning=100,
+        max_concurrency_deletion=100,
         memory_limit_mb=200,
         task_batch_size=200,
         dry_run=True,
@@ -108,7 +110,8 @@ async def test_actual_deletion_large_structure(large_test_structure):
     purger = AsyncEFSPurger(
         root_path=str(flat_dir),
         max_age_days=30,
-        max_concurrency=100,
+        max_concurrency_scanning=100,
+        max_concurrency_deletion=100,
         memory_limit_mb=200,
         task_batch_size=200,
         dry_run=False,
@@ -134,7 +137,8 @@ async def test_memory_stress_test(large_test_structure):
     purger = AsyncEFSPurger(
         root_path=str(nested_dir),
         max_age_days=30,
-        max_concurrency=100,
+        max_concurrency_scanning=100,
+        max_concurrency_deletion=100,
         memory_limit_mb=50,  # Very low limit
         task_batch_size=50,  # Small batches
         dry_run=True,
@@ -184,7 +188,8 @@ async def test_progress_updates(large_test_structure):
     purger = AsyncEFSPurger(
         root_path=str(nested_dir),
         max_age_days=30,
-        max_concurrency=10,  # Lower concurrency = slower = more progress updates
+        max_concurrency_scanning=10,  # Lower concurrency = slower = more progress updates
+        max_concurrency_deletion=10,
         dry_run=True,
     )
 

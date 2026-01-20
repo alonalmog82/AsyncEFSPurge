@@ -39,7 +39,8 @@ async def test_purger_initialization():
     purger = AsyncEFSPurger(
         root_path="/tmp/test",
         max_age_days=30,
-        max_concurrency=100,
+        max_concurrency_scanning=100,
+        max_concurrency_deletion=100,
         dry_run=True,
         log_level="INFO",
     )

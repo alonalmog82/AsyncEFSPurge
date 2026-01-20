@@ -27,7 +27,8 @@ docker run --rm -v "$TEST_DIR:/data" \
   ghcr.io/alonalmog82/asyncefspurge:latest \
   /data \
   --max-age-days 0 \
-  --max-concurrency 50 \
+  --max-concurrency-scanning 50 \
+  --max-concurrency-deletion 50 \
   --dry-run \
   --log-level INFO
 

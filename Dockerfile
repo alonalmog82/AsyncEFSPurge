@@ -13,12 +13,25 @@ RUN apt-get update && \
 COPY pyproject.toml ./
 COPY src/ ./src/
 
+# Extract version from pyproject.toml and save it for later stages
+RUN python3 -c "import tomllib; f=open('pyproject.toml','rb'); d=tomllib.load(f); print(d['project']['version'])" > /build/VERSION
+
 # Install the application
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir .
 
 # Final stage - minimal runtime image
 FROM python:3.14-slim
+
+# ARG for version (passed from CI/CD or extracted from pyproject.toml in builder stage)
+# For local builds: docker build --build-arg VERSION=$(python3 -c "import tomllib; f=open('pyproject.toml','rb'); d=tomllib.load(f); print(d['project']['version'])")
+ARG VERSION
+
+# Copy version file from builder (fallback if VERSION arg not provided)
+COPY --from=builder /build/VERSION /tmp/VERSION
+
+# Set VERSION from file if not provided as build arg (for local builds)
+RUN if [ -z "$VERSION" ]; then export VERSION=$(cat /tmp/VERSION); fi
 
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash --uid 1000 efspurge
@@ -41,9 +54,10 @@ ENTRYPOINT ["efspurge"]
 CMD ["--help"]
 
 # Labels for metadata
+# Version is passed as ARG VERSION (extracted from pyproject.toml in CI/CD or builder stage)
 LABEL org.opencontainers.image.title="AsyncEFSPurge"
 LABEL org.opencontainers.image.description="High-performance async file purger for AWS EFS"
-LABEL org.opencontainers.image.version="1.8.1"
+LABEL org.opencontainers.image.version="${VERSION}"
 LABEL org.opencontainers.image.authors="Alon Almog <alon.almog@rivery.io>"
 LABEL org.opencontainers.image.licenses="MIT"
 

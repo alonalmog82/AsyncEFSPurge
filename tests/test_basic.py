@@ -4,10 +4,22 @@ import pytest
 
 
 def test_version():
-    """Test that version is defined."""
+    """Test that version is defined and matches pyproject.toml."""
+    import tomllib
+    from pathlib import Path
+
     from efspurge import __version__
 
-    assert __version__ == "1.8.1"
+    # Read version from pyproject.toml (single source of truth)
+    pyproject_path = Path(__file__).parent.parent / "pyproject.toml"
+    with open(pyproject_path, "rb") as f:
+        pyproject = tomllib.load(f)
+        expected_version = pyproject["project"]["version"]
+
+    # Version should match pyproject.toml
+    assert __version__ == expected_version, f"Version mismatch: {__version__} != {expected_version}"
+    # Version should be a valid semantic version format
+    assert __version__.count(".") >= 1, f"Invalid version format: {__version__}"
 
 
 def test_imports():

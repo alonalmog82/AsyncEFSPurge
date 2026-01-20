@@ -36,6 +36,12 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     
+    - name: Extract version from pyproject.toml
+      id: version
+      run: |
+        VERSION=$(python3 -c "import tomllib; f=open('pyproject.toml','rb'); d=tomllib.load(f); print(d['project']['version'])")
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+    
     - name: Extract metadata (tags, labels)
       id: meta
       uses: docker/metadata-action@v5
@@ -57,6 +63,8 @@ jobs:
         push: false
         load: true
         tags: efspurge:test
+        build-args: |
+          VERSION=${{ steps.version.outputs.version }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
     
@@ -95,6 +103,8 @@ jobs:
         push: ${{ github.event_name != 'pull_request' }}
         tags: ${{ steps.meta.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
+        build-args: |
+          VERSION=${{ steps.version.outputs.version }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
         platforms: linux/amd64,linux/arm64  # Multi-platform support

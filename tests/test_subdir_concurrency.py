@@ -7,11 +7,9 @@ These tests verify that:
 4. The hybrid approach maintains high utilization
 """
 
-import asyncio
 import tempfile
 import time
 from pathlib import Path
-from unittest.mock import Mock, patch
 
 import pytest
 
@@ -153,7 +151,7 @@ async def test_tasks_created_on_demand(temp_dir):
         # Count how many tasks are created
         # The method should never create more than max_concurrent_subdirs at once
         nonlocal max_tasks_seen, task_counts
-        
+
         # Call original and track task creation
         # We can't easily track internal task creation, but we can verify
         # the method completes successfully
@@ -205,29 +203,29 @@ async def test_memory_bounded_with_many_subdirs(temp_dir):
 @pytest.mark.asyncio
 async def test_deep_directory_tree_memory_safety(temp_dir):
     """Test that deep directory trees don't cause memory explosion.
-    
+
     IMPORTANT: This test uses 40×40×40 (65,641 dirs) for reasonable CI runtime.
-    
+
     Before committing changes to subdirectory concurrency logic (especially
     _process_subdirs_with_constant_concurrency or scan_directory), please test
     manually with 80×80×80 (518,481 dirs) to ensure no deadlock or memory issues:
-    
+
         # Change range(3) to use 80 dirs per level
         for i in range(80):  # 80 dirs per level
         expected_dirs = 1 + 80 + 6400 + 512000  # 518,481 total
-    
+
     The 80×80×80 test should complete in ~6 minutes and verify:
     - No deadlock occurs
     - Memory stays bounded (<800MB)
     - All directories are scanned correctly
     """
-    import time
     import sys
-    
+    import time
+
     print("\n=== Starting deep directory tree test ===", file=sys.stderr, flush=True)
     print(f"Temp dir: {temp_dir}", file=sys.stderr, flush=True)
     start_time = time.time()
-    
+
     # Create deep nested structure (reasonable size for CI)
     # Level 1: 40 dirs
     # Level 2: Each has 40 dirs = 1,600 dirs
@@ -240,7 +238,7 @@ async def test_deep_directory_tree_memory_safety(temp_dir):
     total_dirs = 0
 
     for level in range(3):  # 3 levels deep
-        print(f"  Creating level {level+1}...", file=sys.stderr, flush=True)
+        print(f"  Creating level {level + 1}...", file=sys.stderr, flush=True)
         level_start = time.time()
         next_level = []
         for parent in current_level:
@@ -252,10 +250,17 @@ async def test_deep_directory_tree_memory_safety(temp_dir):
                 total_dirs += 1
         current_level = next_level
         level_time = time.time() - level_start
-        print(f"  Level {level+1} created: {len(next_level)} dirs (took {level_time:.2f}s)", file=sys.stderr, flush=True)
-        print(f"  Level {level+1} created: {len(next_level)} dirs (took {time.time() - structure_start:.2f}s)", file=sys.stderr, flush=True)
-    
-    print(f"Structure creation complete: {total_dirs} dirs in {time.time() - structure_start:.2f}s", file=sys.stderr, flush=True)
+        print(
+            f"  Level {level + 1} created: {len(next_level)} dirs (took {level_time:.2f}s)",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    print(
+        f"Structure creation complete: {total_dirs} dirs in {time.time() - structure_start:.2f}s",
+        file=sys.stderr,
+        flush=True,
+    )
 
     print("Creating purger...", file=sys.stderr, flush=True)
     purger = AsyncEFSPurger(
@@ -266,31 +271,40 @@ async def test_deep_directory_tree_memory_safety(temp_dir):
         memory_limit_mb=400,  # Reasonable limit for CI
         log_level="INFO",
     )
-    print(f"Purger created. max_concurrent_subdirs={purger.max_concurrent_subdirs}", file=sys.stderr, flush=True)
+    print(
+        f"Purger created. max_concurrent_subdirs={purger.max_concurrent_subdirs}",
+        file=sys.stderr,
+        flush=True,
+    )
 
     print("Starting purge...", file=sys.stderr, flush=True)
     purge_start = time.time()
-    
+
     # Simple progress tracking without background task
     original_update = purger.update_stats
-    
+
     async def tracked_update(**kwargs):
         result = await original_update(**kwargs)
         if "dirs_scanned" in kwargs:
-            print(f"  [PROGRESS] dirs_scanned={purger.stats['dirs_scanned']}, files_scanned={purger.stats['files_scanned']}", 
-                  file=sys.stderr, flush=True)
+            print(
+                f"  [PROGRESS] dirs_scanned={purger.stats['dirs_scanned']}, "
+                f"files_scanned={purger.stats['files_scanned']}",
+                file=sys.stderr,
+                flush=True,
+            )
         return result
-    
+
     purger.update_stats = tracked_update
-    
+
     try:
         await purger.purge()
     except Exception as e:
         print(f"ERROR during purge: {e}", file=sys.stderr, flush=True)
         import traceback
+
         traceback.print_exc(file=sys.stderr)
         raise
-    
+
     purge_time = time.time() - purge_start
     total_time = time.time() - start_time
     print(f"Purge complete: took {purge_time:.2f}s (total: {total_time:.2f}s)", file=sys.stderr, flush=True)

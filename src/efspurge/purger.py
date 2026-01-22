@@ -830,42 +830,42 @@ class AsyncEFSPurger:
     async def _process_subdirs_with_constant_concurrency(self, subdirs: list[Path]) -> None:
         """
         Process subdirectories with constant concurrency using a hybrid approach.
-        
+
         This method maintains high concurrency utilization while preventing memory explosion:
         - Uses semaphore to limit concurrent execution (maintains constant concurrency)
         - Creates tasks on-demand as slots become available (prevents memory explosion)
         - As tasks complete, new ones start immediately (high utilization)
-        
+
         Key benefits:
         - Never creates more than max_concurrent_subdirs tasks at once
         - Maintains constant concurrency (no idle slots waiting for slow directories)
         - Prevents recursive memory explosion in deep directory trees
-        
+
         IMPORTANT: Before modifying this method or scan_directory's subdirectory processing,
         test with 80×80×80 directory structure (518,481 dirs) to ensure no deadlock or
         memory issues. See test_deep_directory_tree_memory_safety for details.
-        
+
         Args:
             subdirs: List of subdirectory paths to process
         """
         if not subdirs:
             return
-        
+
         # Use a queue to track remaining subdirectories
         remaining_subdirs = list(subdirs)
         active_tasks: list[asyncio.Task] = []
-        
+
         async def scan_with_semaphore(subdir: Path) -> None:
             """Scan a subdirectory with semaphore control."""
             async with self.subdir_semaphore:
                 await self.scan_directory(subdir)
-        
+
         # Process subdirectories maintaining constant concurrency
         # We create tasks on-demand as slots become available, never exceeding max_concurrent_subdirs
         iterations = 0
         while remaining_subdirs or active_tasks:
             iterations += 1
-            
+
             # Start new tasks up to the concurrency limit
             # The semaphore ensures only max_concurrent_subdirs run concurrently,
             # but we can have a few more tasks waiting (bounded by max_concurrent_subdirs)
@@ -873,15 +873,12 @@ class AsyncEFSPurger:
                 subdir = remaining_subdirs.pop(0)
                 task = asyncio.create_task(scan_with_semaphore(subdir))
                 active_tasks.append(task)
-            
+
             # Wait for at least one task to complete before starting more
             # This ensures we maintain constant concurrency without creating all tasks upfront
             if active_tasks:
-                done, pending = await asyncio.wait(
-                    active_tasks,
-                    return_when=asyncio.FIRST_COMPLETED
-                )
-                
+                done, pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
+
                 # Remove completed tasks and check for exceptions
                 for task in done:
                     active_tasks.remove(task)
@@ -896,7 +893,7 @@ class AsyncEFSPurger:
                             "Unexpected exception in subdirectory scan",
                             {"error": str(e), "error_type": type(e).__name__},
                         )
-            
+
             # Debug: Log if we're stuck in a loop (shouldn't happen, but helps diagnose)
             if iterations > 10000:
                 self.logger.warning(

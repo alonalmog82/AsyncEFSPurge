@@ -358,6 +358,8 @@ class AsyncEFSPurger:
         # Concurrency control - separate semaphores for scanning and deletion
         self.scanning_semaphore = asyncio.Semaphore(max_concurrency_scanning)
         self.deletion_semaphore = asyncio.Semaphore(max_concurrency_deletion)
+        # Semaphore for subdirectory scanning to maintain constant concurrency
+        self.subdir_semaphore = asyncio.Semaphore(max_concurrent_subdirs)
         self.stats_lock = asyncio.Lock()
 
         # Track active tasks for concurrency utilization metrics
@@ -825,6 +827,84 @@ class AsyncEFSPurger:
 
         self.logger.debug(f"Processed batch of {len(file_tasks)} files")
 
+    async def _process_subdirs_with_constant_concurrency(self, subdirs: list[Path]) -> None:
+        """
+        Process subdirectories with constant concurrency using a hybrid approach.
+        
+        This method maintains high concurrency utilization while preventing memory explosion:
+        - Uses semaphore to limit concurrent execution (maintains constant concurrency)
+        - Creates tasks on-demand as slots become available (prevents memory explosion)
+        - As tasks complete, new ones start immediately (high utilization)
+        
+        Key benefits:
+        - Never creates more than max_concurrent_subdirs tasks at once
+        - Maintains constant concurrency (no idle slots waiting for slow directories)
+        - Prevents recursive memory explosion in deep directory trees
+        
+        IMPORTANT: Before modifying this method or scan_directory's subdirectory processing,
+        test with 80×80×80 directory structure (518,481 dirs) to ensure no deadlock or
+        memory issues. See test_deep_directory_tree_memory_safety for details.
+        
+        Args:
+            subdirs: List of subdirectory paths to process
+        """
+        if not subdirs:
+            return
+        
+        # Use a queue to track remaining subdirectories
+        remaining_subdirs = list(subdirs)
+        active_tasks: list[asyncio.Task] = []
+        
+        async def scan_with_semaphore(subdir: Path) -> None:
+            """Scan a subdirectory with semaphore control."""
+            async with self.subdir_semaphore:
+                await self.scan_directory(subdir)
+        
+        # Process subdirectories maintaining constant concurrency
+        # We create tasks on-demand as slots become available, never exceeding max_concurrent_subdirs
+        iterations = 0
+        while remaining_subdirs or active_tasks:
+            iterations += 1
+            
+            # Start new tasks up to the concurrency limit
+            # The semaphore ensures only max_concurrent_subdirs run concurrently,
+            # but we can have a few more tasks waiting (bounded by max_concurrent_subdirs)
+            while len(active_tasks) < self.max_concurrent_subdirs and remaining_subdirs:
+                subdir = remaining_subdirs.pop(0)
+                task = asyncio.create_task(scan_with_semaphore(subdir))
+                active_tasks.append(task)
+            
+            # Wait for at least one task to complete before starting more
+            # This ensures we maintain constant concurrency without creating all tasks upfront
+            if active_tasks:
+                done, pending = await asyncio.wait(
+                    active_tasks,
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                
+                # Remove completed tasks and check for exceptions
+                for task in done:
+                    active_tasks.remove(task)
+                    # Check for exceptions (scan_directory handles its own, but log unexpected ones)
+                    try:
+                        await task
+                    except Exception as e:
+                        # scan_directory should handle all exceptions, but log unexpected ones
+                        log_with_context(
+                            self.logger,
+                            "error",
+                            "Unexpected exception in subdirectory scan",
+                            {"error": str(e), "error_type": type(e).__name__},
+                        )
+            
+            # Debug: Log if we're stuck in a loop (shouldn't happen, but helps diagnose)
+            if iterations > 10000:
+                self.logger.warning(
+                    f"Warning: _process_subdirs_with_constant_concurrency has run {iterations} iterations. "
+                    f"Remaining subdirs: {len(remaining_subdirs)}, Active tasks: {len(active_tasks)}"
+                )
+                break
+
     async def scan_directory(self, directory: Path) -> None:
         """
         Recursively scan a directory and process files using TRUE STREAMING.
@@ -901,14 +981,24 @@ class AsyncEFSPurger:
                 finally:
                     file_task_buffer.clear()  # Always clear, even on exception
 
-            # Process subdirectories concurrently
-            # Limit concurrent subdirs to prevent memory explosion
+            # Process subdirectories using hybrid approach:
+            # - Semaphore maintains constant concurrency (prevents idle slots)
+            # - Tasks created in batches (prevents memory explosion)
+            # - As tasks complete, new ones start immediately (high utilization)
+            # Note: If we're already holding the semaphore (recursive call), process directly
+            # to avoid deadlock. Otherwise use the semaphore-controlled approach.
             if subdirs:
                 await self.check_memory_pressure()
-                for i in range(0, len(subdirs), self.max_concurrent_subdirs):
-                    batch_subdirs = subdirs[i : i + self.max_concurrent_subdirs]
-                    subdir_tasks = [self.scan_directory(subdir) for subdir in batch_subdirs]
-                    await asyncio.gather(*subdir_tasks, return_exceptions=True)
+                # Check if semaphore is available (not held by current task)
+                # If semaphore value equals limit, we're not holding it
+                if self.subdir_semaphore._value == self.max_concurrent_subdirs:
+                    # Not holding semaphore - use controlled concurrency
+                    await self._process_subdirs_with_constant_concurrency(subdirs)
+                else:
+                    # Already holding semaphore (recursive call) - process directly without semaphore
+                    # to avoid deadlock. Process sequentially to avoid creating too many tasks.
+                    for subdir in subdirs:
+                        await self.scan_directory(subdir)
 
             # Check if directory is empty (AFTER all subdirs have been fully processed recursively)
             # This ensures nested empty directories are handled correctly

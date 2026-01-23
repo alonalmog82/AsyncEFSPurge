@@ -1,6 +1,7 @@
 """Async file purger optimized for AWS EFS and network storage."""
 
 import asyncio
+import logging
 import os
 import time
 from collections import deque
@@ -1096,64 +1097,78 @@ class AsyncEFSPurger:
                     (current_active_tasks / max_concurrency_total * 100) if max_concurrency_total > 0 else 0.0
                 )
 
-                # Build progress update with phase-specific info
+                # Check if DEBUG level logging is enabled
+                is_debug = self.logger.isEnabledFor(logging.DEBUG)
+
+                # Build progress update with reordered fields (most important first)
                 progress_data = {
-                    "phase": self.current_phase,
+                    # Core metrics (always shown) - ordered as requested
+                    "elapsed_seconds": round(elapsed, 1),
                     "files_scanned": current_files,
-                    "files_to_purge": self.stats["files_to_purge"],
                     "files_purged": self.stats["files_purged"],
                     "dirs_scanned": current_dirs,
                     "errors": self.stats["errors"],
                     "memory_backpressure_events": self.stats.get("memory_backpressure_events", 0),
-                    "elapsed_seconds": round(elapsed, 1),
-                    # Overall rates (backward compatible)
-                    "files_per_second": round(files_per_second_overall, 1),
+                }
+
+                # Add dirs purged (empty_dirs_deleted) if in that phase or if any were deleted
+                if self.current_phase == "removing_empty_dirs" or self.stats.get("empty_dirs_deleted", 0) > 0:
+                    progress_data["dirs_purged"] = self.stats.get("empty_dirs_deleted", 0)
+
+                # Add files/dirs to purge (only if non-zero or in relevant phase)
+                if self.stats["files_to_purge"] > 0:
+                    progress_data["files_to_purge"] = self.stats["files_to_purge"]
+                if self.current_phase == "removing_empty_dirs":
+                    progress_data["dirs_to_purge"] = self.stats.get("empty_dirs_to_delete", 0)
+
+                # Phase and overall rates (always shown)
+                progress_data["phase"] = self.current_phase
+                progress_data["files_per_second"] = round(files_per_second_overall, 1)
+                progress_data["dirs_per_second"] = round(dirs_per_second_overall, 1)
+
+                # Memory usage (always shown)
+                progress_data["memory_mb"] = round(memory_mb, 1)
+                progress_data["memory_usage_percent"] = round(memory_percent, 1)
+
+                # DEBUG-only detailed metrics
+                if is_debug:
                     # Enhanced rate metrics - overall
-                    "files_per_second_overall": round(files_per_second_overall, 1),
-                    "dirs_per_second_overall": round(dirs_per_second_overall, 1),
-                    # Enhanced rate metrics - time-windowed
-                    "files_per_second_instant": round(files_per_second_instant, 1),
-                    "dirs_per_second_instant": round(dirs_per_second_instant, 1),
-                    "files_per_second_short": round(files_per_second_short, 1),
-                    "dirs_per_second_short": round(dirs_per_second_short, 1),
-                    # Enhanced rate metrics - per-phase
-                    "scanning_files_per_second": round(scanning_files_rate, 1),
-                    "scanning_dirs_per_second": round(scanning_dirs_rate, 1),
-                    "deletion_files_per_second": round(deletion_files_rate, 1),
-                    "empty_dirs_per_second": round(empty_dirs_rate, 1),
+                    progress_data["files_per_second_overall"] = round(files_per_second_overall, 1)
+                    progress_data["dirs_per_second_overall"] = round(dirs_per_second_overall, 1)
+                    # Time-windowed rates
+                    progress_data["files_per_second_instant"] = round(files_per_second_instant, 1)
+                    progress_data["dirs_per_second_instant"] = round(dirs_per_second_instant, 1)
+                    progress_data["files_per_second_short"] = round(files_per_second_short, 1)
+                    progress_data["dirs_per_second_short"] = round(dirs_per_second_short, 1)
+                    # Per-phase rates
+                    progress_data["scanning_files_per_second"] = round(scanning_files_rate, 1)
+                    progress_data["scanning_dirs_per_second"] = round(scanning_dirs_rate, 1)
+                    progress_data["deletion_files_per_second"] = round(deletion_files_rate, 1)
+                    progress_data["empty_dirs_per_second"] = round(empty_dirs_rate, 1)
                     # Peak rates
-                    "peak_files_per_second": round(self.rate_tracker.peak_rates["files_per_second"]["value"], 1),
-                    "peak_dirs_per_second": round(self.rate_tracker.peak_rates["dirs_per_second"]["value"], 1),
-                    "peak_files_deleted_per_second": round(
+                    progress_data["peak_files_per_second"] = round(
+                        self.rate_tracker.peak_rates["files_per_second"]["value"], 1
+                    )
+                    progress_data["peak_dirs_per_second"] = round(
+                        self.rate_tracker.peak_rates["dirs_per_second"]["value"], 1
+                    )
+                    progress_data["peak_files_deleted_per_second"] = round(
                         self.rate_tracker.peak_rates["files_deleted_per_second"]["value"], 1
-                    ),
-                    "peak_empty_dirs_per_second": round(
+                    )
+                    progress_data["peak_empty_dirs_per_second"] = round(
                         self.rate_tracker.peak_rates["empty_dirs_per_second"]["value"], 1
-                    ),
-                    # Concurrency utilization metrics (for tuning concurrency limits)
-                    "active_tasks": current_active_tasks,
-                    "max_active_tasks": peak_active_tasks,
-                    "max_concurrency_scanning": self.max_concurrency_scanning,
-                    "max_concurrency_deletion": self.max_concurrency_deletion,
-                    # For backward compatibility
-                    "max_concurrency": max(self.max_concurrency_scanning, self.max_concurrency_deletion),
-                    "available_concurrency_slots": available_slots,
-                    "concurrency_utilization_percent": round(concurrency_utilization_percent, 1),
-                    # Memory metrics
-                    "memory_mb": round(memory_mb, 1),
-                    "memory_limit_mb": self.memory_limit_mb,
-                    "memory_usage_percent": round(memory_percent, 1),
-                    "memory_mb_per_1k_files": (
+                    )
+                    # Concurrency utilization metrics
+                    progress_data["active_tasks"] = current_active_tasks
+                    progress_data["max_active_tasks"] = peak_active_tasks
+                    progress_data["available_concurrency_slots"] = available_slots
+                    progress_data["concurrency_utilization_percent"] = round(concurrency_utilization_percent, 1)
+                    # Detailed memory metrics
+                    progress_data["memory_mb_per_1k_files"] = (
                         round(memory_mb / (self.stats["files_scanned"] / 1000), 2)
                         if self.stats["files_scanned"] > 0
                         else 0.0
-                    ),
-                }
-
-                # Add empty dir stats if in that phase
-                if self.current_phase == "removing_empty_dirs":
-                    progress_data["empty_dirs_to_delete"] = self.stats.get("empty_dirs_to_delete", 0)
-                    progress_data["empty_dirs_deleted"] = self.stats.get("empty_dirs_deleted", 0)
+                    )
 
                 log_with_context(
                     self.logger,
@@ -1318,20 +1333,37 @@ class AsyncEFSPurger:
                 rate = self.stats["files_scanned"] / elapsed if elapsed > 0 else 0
 
             memory_mb = get_memory_usage_mb()
+            is_debug = self.logger.isEnabledFor(10)  # 10 = DEBUG level
+
+            final_progress_data = {
+                # Core metrics in requested order
+                "elapsed_seconds": round(elapsed, 1),
+                "files_scanned": self.stats["files_scanned"],
+                "files_purged": self.stats["files_purged"],
+                "dirs_scanned": self.stats["dirs_scanned"],
+                "errors": self.stats["errors"],
+                "memory_backpressure_events": self.stats.get("memory_backpressure_events", 0),
+            }
+
+            # Add dirs purged if any were deleted
+            if self.stats.get("empty_dirs_deleted", 0) > 0:
+                final_progress_data["dirs_purged"] = self.stats.get("empty_dirs_deleted", 0)
+
+            # Add files/dirs to purge if non-zero
+            if self.stats["files_to_purge"] > 0:
+                final_progress_data["files_to_purge"] = self.stats["files_to_purge"]
+            if self.stats.get("empty_dirs_to_delete", 0) > 0:
+                final_progress_data["dirs_to_purge"] = self.stats.get("empty_dirs_to_delete", 0)
+
+            # Rates and memory
+            final_progress_data["files_per_second"] = round(rate, 1)
+            final_progress_data["memory_mb"] = round(memory_mb, 1)
+
             log_with_context(
                 self.logger,
                 "info",
                 "Final progress before completion",
-                {
-                    "files_scanned": self.stats["files_scanned"],
-                    "files_to_purge": self.stats["files_to_purge"],
-                    "files_purged": self.stats["files_purged"],
-                    "dirs_scanned": self.stats["dirs_scanned"],
-                    "errors": self.stats["errors"],
-                    "elapsed_seconds": round(elapsed, 1),
-                    "files_per_second": round(rate, 1),
-                    "memory_mb": round(memory_mb, 1),
-                },
+                final_progress_data,
             )
 
         # Calculate final statistics
@@ -1344,14 +1376,44 @@ class AsyncEFSPurger:
             files_per_sec = self.stats["files_scanned"] / duration if duration > 0 else 0
         mb_freed = self.stats["bytes_freed"] / (1024 * 1024)
         memory_mb = get_memory_usage_mb()
+        is_debug = self.logger.isEnabledFor(10)  # 10 = DEBUG level
 
+        # Build final stats with reordered fields (most important first)
         final_stats = {
-            **self.stats,
+            # Core metrics in requested order
             "duration_seconds": round(duration, 2),
-            "files_per_second": round(files_per_sec, 2),
-            "mb_freed": round(mb_freed, 2),
-            "peak_memory_mb": round(memory_mb, 1),
+            "files_scanned": self.stats["files_scanned"],
+            "files_purged": self.stats["files_purged"],
+            "dirs_scanned": self.stats["dirs_scanned"],
+            "errors": self.stats["errors"],
+            "memory_backpressure_events": self.stats.get("memory_backpressure_events", 0),
         }
+
+        # Add dirs purged if any were deleted
+        if self.stats.get("empty_dirs_deleted", 0) > 0:
+            final_stats["dirs_purged"] = self.stats.get("empty_dirs_deleted", 0)
+
+        # Add files/dirs to purge if non-zero
+        if self.stats["files_to_purge"] > 0:
+            final_stats["files_to_purge"] = self.stats["files_to_purge"]
+        if self.stats.get("empty_dirs_to_delete", 0) > 0:
+            final_stats["dirs_to_purge"] = self.stats.get("empty_dirs_to_delete", 0)
+
+        # Rates and memory
+        final_stats["files_per_second"] = round(files_per_sec, 2)
+        final_stats["mb_freed"] = round(mb_freed, 2)
+        final_stats["peak_memory_mb"] = round(memory_mb, 1)
+
+        # DEBUG-only: include all stats for detailed analysis
+        if is_debug:
+            final_stats.update(
+                {
+                    "symlinks_skipped": self.stats.get("symlinks_skipped", 0),
+                    "special_files_skipped": self.stats.get("special_files_skipped", 0),
+                    "bytes_freed": self.stats.get("bytes_freed", 0),
+                    "start_time": self.stats.get("start_time"),
+                }
+            )
 
         log_with_context(
             self.logger,

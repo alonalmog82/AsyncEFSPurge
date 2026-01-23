@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.1] - 2026-01-22
+
+### Fixed
+- **Critical: Subdirectory Concurrency Deadlock**: Fixed stuck detection issue where application would get stuck on large directories with 0% concurrency utilization
+  - Root cause: Batch-based subdirectory processing waited for entire batches to complete, causing idle slots when some directories finished early
+  - Solution: Implemented hybrid approach with semaphore-controlled concurrency and on-demand task creation
+  - Maintains constant concurrency (no idle slots) while preventing memory explosion
+  - Prevents deadlock in deep directory trees by detecting recursive calls and processing sequentially when needed
+  - Verified with stress tests up to 518,481 directories (80×80×80 structure)
+  - See `SUBDIR_CONCURRENCY_FIX.md` for detailed explanation
+
+### Added
+- **New Tests**: Added 7 comprehensive tests for subdirectory concurrency behavior
+  - `test_subdir_concurrency_maintained` - Verifies constant concurrency
+  - `test_slow_directories_dont_block_others` - Verifies no blocking
+  - `test_tasks_created_on_demand` - Verifies memory safety
+  - `test_memory_bounded_with_many_subdirs` - Verifies memory bounds
+  - `test_deep_directory_tree_memory_safety` - Verifies deep trees (40×40×40)
+  - `test_hybrid_approach_maintains_concurrency` - Verifies hybrid approach
+  - `test_subdir_semaphore_limits_concurrency` - Verifies semaphore limits
+
+### Documentation
+- Added `SUBDIR_CONCURRENCY_FIX.md` - Comprehensive documentation of the fix
+- Added `PRODUCTION_READINESS_ASSESSMENT.md` - Production safety assessment
+- Updated code comments with guidance for testing changes with 80×80×80 structure
+
 ## [1.9.0] - 2026-01-XX
 
 ### Breaking Changes

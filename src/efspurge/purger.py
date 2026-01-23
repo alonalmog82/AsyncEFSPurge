@@ -348,6 +348,9 @@ class AsyncEFSPurger:
         # Track current phase for better progress reporting
         self.current_phase = "initializing"  # "scanning", "removing_empty_dirs", "completed"
 
+        # Track scanning phase duration for accurate overall rate calculation
+        self.scanning_end_time: float | None = None
+
         # Rate tracking for enhanced metrics
         self.rate_tracker = RateTracker()
 
@@ -1039,17 +1042,25 @@ class AsyncEFSPurger:
             async with self.stats_lock:
                 current_time = time.time()
                 elapsed = current_time - self.stats.get("start_time", current_time)
-                rate = self.stats["files_scanned"] / elapsed if elapsed > 0 else 0
-                memory_mb = get_memory_usage_mb()
-                memory_percent = (memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
 
                 current_files = self.stats["files_scanned"]
                 current_dirs = self.stats["dirs_scanned"]
 
-                # Calculate enhanced rate metrics
-                # Overall rates (since start)
-                files_per_second_overall = rate
-                dirs_per_second_overall = current_dirs / elapsed if elapsed > 0 else 0.0
+                # Calculate overall rates using scanning duration only (excludes empty dir removal time)
+                # If scanning is complete, use scanning duration; otherwise use elapsed time
+                if self.scanning_end_time is not None:
+                    scanning_duration = self.scanning_end_time - self.stats.get("start_time", current_time)
+                    files_per_second_overall = (
+                        self.stats["files_scanned"] / scanning_duration if scanning_duration > 0 else 0
+                    )
+                    dirs_per_second_overall = current_dirs / scanning_duration if scanning_duration > 0 else 0.0
+                else:
+                    # Still scanning, use elapsed time
+                    files_per_second_overall = self.stats["files_scanned"] / elapsed if elapsed > 0 else 0
+                    dirs_per_second_overall = current_dirs / elapsed if elapsed > 0 else 0.0
+
+                memory_mb = get_memory_usage_mb()
+                memory_percent = (memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
 
                 # Time-windowed rates (instant 10s, short-term 60s)
                 files_per_second_instant = self.rate_tracker.get_rate("scanning", "files", 10.0)
@@ -1281,6 +1292,9 @@ class AsyncEFSPurger:
             self.rate_tracker.set_phase_start("scanning")
             await self.scan_directory(self.root_path)
 
+            # Mark scanning phase as complete (for accurate overall rate calculation)
+            self.scanning_end_time = time.time()
+
             # After all scanning is complete, remove empty directories in post-order
             if self.remove_empty_dirs:
                 await self._remove_empty_directories()
@@ -1296,7 +1310,13 @@ class AsyncEFSPurger:
         elapsed = time.time() - self.stats.get("start_time", time.time())
         if elapsed > self.progress_interval and (time.time() - self.last_progress_log) > 10:
             # Force a final progress update
-            rate = self.stats["files_scanned"] / elapsed if elapsed > 0 else 0
+            # Use scanning duration for rate calculation (excludes empty dir removal time)
+            if self.scanning_end_time is not None:
+                scanning_duration = self.scanning_end_time - self.stats.get("start_time", time.time())
+                rate = self.stats["files_scanned"] / scanning_duration if scanning_duration > 0 else 0
+            else:
+                rate = self.stats["files_scanned"] / elapsed if elapsed > 0 else 0
+
             memory_mb = get_memory_usage_mb()
             log_with_context(
                 self.logger,
@@ -1316,7 +1336,12 @@ class AsyncEFSPurger:
 
         # Calculate final statistics
         duration = time.time() - start_time
-        files_per_sec = self.stats["files_scanned"] / duration if duration > 0 else 0
+        # Use scanning duration for files_per_second (excludes empty dir removal time)
+        if self.scanning_end_time is not None:
+            scanning_duration = self.scanning_end_time - start_time
+            files_per_sec = self.stats["files_scanned"] / scanning_duration if scanning_duration > 0 else 0
+        else:
+            files_per_sec = self.stats["files_scanned"] / duration if duration > 0 else 0
         mb_freed = self.stats["bytes_freed"] / (1024 * 1024)
         memory_mb = get_memory_usage_mb()
 

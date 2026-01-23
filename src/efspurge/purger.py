@@ -712,13 +712,34 @@ class AsyncEFSPurger:
             tasks = [remove_single_directory(directory) for directory in batch]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            # Collect parents that became empty
+            # Collect parents that became empty and log errors
+            exceptions_count = 0
             for result in results:
                 if isinstance(result, Exception):
+                    exceptions_count += 1
+                    self.logger.debug(f"Exception during directory deletion: {result}", exc_info=result)
+                    await self.update_stats(errors=1)
                     continue
                 if result is not None:  # Parent became empty
                     async with new_empty_parents_lock:
                         new_empty_parents.add(result)
+
+            # Log progress periodically during first pass (every 10 batches or every 10k dirs)
+            async with self.stats_lock:
+                deleted_count = self.stats.get("empty_dirs_deleted", 0)
+                total_processed = i
+            if total_processed % 10000 == 0 or (exceptions_count > 0 and self.logger.isEnabledFor(logging.WARNING)):
+                log_with_context(
+                    self.logger,
+                    "info" if exceptions_count == 0 else "warning",
+                    "Empty directory removal batch progress",
+                    {
+                        "processed": total_processed,
+                        "total": len(sorted_dirs),
+                        "deleted": deleted_count,
+                        "exceptions_in_batch": exceptions_count,
+                    },
+                )
 
         # Log progress after first pass
         async with self.stats_lock:
@@ -849,13 +870,34 @@ class AsyncEFSPurger:
                 tasks = [remove_parent_directory(parent) for parent in batch]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                # Collect grandparents that became empty
+                # Collect grandparents that became empty and log errors
+                exceptions_count = 0
                 for result in results:
                     if isinstance(result, Exception):
+                        exceptions_count += 1
+                        self.logger.debug(f"Exception during parent directory deletion: {result}", exc_info=result)
+                        await self.update_stats(errors=1)
                         continue
                     if result is not None:  # Grandparent became empty
                         async with new_empty_parents_lock:
                             new_empty_parents.add(result)
+
+                # Log progress periodically during cascading deletion
+                if exceptions_count > 0 and self.logger.isEnabledFor(logging.WARNING):
+                    async with self.stats_lock:
+                        deleted_count = self.stats.get("empty_dirs_deleted", 0)
+                    log_with_context(
+                        self.logger,
+                        "warning",
+                        "Exceptions during cascading deletion batch",
+                        {
+                            "iteration": iteration,
+                            "batch_processed": j + len(batch),
+                            "total_parents": len(parents_to_process),
+                            "deleted": deleted_count,
+                            "exceptions_in_batch": exceptions_count,
+                        },
+                    )
 
         # Log completion
         async with self.stats_lock:

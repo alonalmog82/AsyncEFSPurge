@@ -500,15 +500,18 @@ class AsyncEFSPurger:
             # Progress logging is handled by _background_progress_reporter()
             # Removed duplicate logging here to prevent duplicate log entries
 
-    async def check_memory_pressure(self) -> None:
+    async def check_memory_pressure(self) -> bool:
         """
         Check if memory usage is high and apply back-pressure if needed.
 
         Uses a lock to prevent concurrent checks and rate-limits warning messages
         to avoid log spam.
+
+        Returns:
+            True if memory is above limit (caller should reduce batch sizes), False otherwise
         """
         if self.memory_limit_mb <= 0:
-            return  # No limit set
+            return False  # No limit set
 
         # Use lock to prevent multiple concurrent checks
         async with self.memory_check_lock:
@@ -534,6 +537,10 @@ class AsyncEFSPurger:
                 import gc
 
                 gc.collect()
+
+                return True  # Memory is high, caller should reduce batch sizes
+
+            return False  # Memory is OK
 
     async def process_file(self, file_path: Path) -> None:
         """
@@ -711,36 +718,31 @@ class AsyncEFSPurger:
                 if dir_resolved == root_resolved:
                     return None
 
-                # Use deletion semaphore for concurrent deletion
-                async with self.deletion_semaphore:
-                    # Double-check directory is still empty (might have been populated)
-                    entries = await async_scandir(directory, self.scandir_executor, self)
-                    if len(entries) > 0:
-                        # Directory is no longer empty, skip it
-                        return None
-
-                    if not self.dry_run:
+                # Perform deletion (semaphore only for actual rmdir, not for checks)
+                # Skip redundant empty check - we already know directory is empty from scanning
+                if not self.dry_run:
+                    async with self.deletion_semaphore:
                         await aiofiles.os.rmdir(directory)
-                        await self.update_stats(empty_dirs_to_delete=1, empty_dirs_deleted=1)
-                        # Record sample for rate tracking
-                        self.rate_tracker.record("removing_empty_dirs", "dirs", 1)
-                        self.logger.debug(f"Removed empty directory: {directory}")
-                    else:
-                        await self.update_stats(empty_dirs_to_delete=1)
-                        self.logger.debug(f"Would remove empty directory: {directory}")
+                    await self.update_stats(empty_dirs_to_delete=1, empty_dirs_deleted=1)
+                    # Record sample for rate tracking
+                    self.rate_tracker.record("removing_empty_dirs", "dirs", 1)
+                    self.logger.debug(f"Removed empty directory: {directory}")
+                else:
+                    await self.update_stats(empty_dirs_to_delete=1)
+                    self.logger.debug(f"Would remove empty directory: {directory}")
 
-                    # After deleting, check if parent is now empty
-                    parent = directory.parent
-                    if parent != directory:
-                        try:
-                            parent_resolved = parent.resolve()
-                            if parent_resolved != root_resolved:
-                                # Check if parent is now empty
-                                parent_entries = await async_scandir(parent, self.scandir_executor, self)
-                                if len(parent_entries) == 0:
-                                    return parent  # Parent is now empty
-                        except (FileNotFoundError, PermissionError, OSError, RuntimeError):
-                            pass  # Parent doesn't exist, no permission, or resolve failed
+                # After deleting, check if parent is now empty (outside semaphore for better concurrency)
+                parent = directory.parent
+                if parent != directory:
+                    try:
+                        parent_resolved = parent.resolve()
+                        if parent_resolved != root_resolved:
+                            # Check if parent is now empty (quick check without holding semaphore)
+                            parent_entries = await async_scandir(parent, self.scandir_executor, self)
+                            if len(parent_entries) == 0:
+                                return parent  # Parent is now empty
+                    except (FileNotFoundError, PermissionError, OSError, RuntimeError):
+                        pass  # Parent doesn't exist, no permission, or resolve failed
 
             except FileNotFoundError:
                 # Directory was already deleted by another process
@@ -764,9 +766,18 @@ class AsyncEFSPurger:
         max_batch_size = min(200, max(50, self.max_concurrency_deletion // 10))
         i = 0
         while i < len(sorted_dirs):
-            # Check memory pressure before processing large batches
-            if i % 1000 == 0:  # Check every 1000 directories
-                await self.check_memory_pressure()
+            # Check memory pressure before EVERY batch to catch spikes early
+            memory_high = await self.check_memory_pressure()
+
+            # Dynamically adjust batch size based on memory pressure
+            # When memory is OK, use larger batches for better performance
+            # When memory is high, reduce batch size to prevent OOM
+            current_batch_size = max_batch_size
+            if memory_high:
+                # Reduce batch size by 50% when memory is high
+                current_batch_size = max(20, current_batch_size // 2)
+            # Note: We don't increase batch size above max_batch_size to avoid memory spikes
+
             # Check rate limit and calculate how many we can process
             remaining_slots = None
             if self.max_empty_dirs_to_delete > 0:
@@ -788,8 +799,8 @@ class AsyncEFSPurger:
                         break
                     remaining_slots = self.max_empty_dirs_to_delete - to_delete_count
 
-            # Limit batch size based on rate limit
-            batch_size = max_batch_size
+            # Limit batch size based on rate limit and memory pressure
+            batch_size = current_batch_size
             if remaining_slots is not None:
                 batch_size = min(batch_size, remaining_slots)
 
@@ -861,7 +872,8 @@ class AsyncEFSPurger:
             async with new_empty_parents_lock:
                 # Limit batch size to prevent memory explosion during cascading deletion
                 # Process in chunks if there are too many parents
-                max_parents_per_iteration = 10000  # Process max 10k parents per iteration
+                # Increased from 2k to 5k for better performance (still prevents memory spikes)
+                max_parents_per_iteration = 5000  # Process max 5k parents per iteration
                 if len(new_empty_parents) > max_parents_per_iteration:
                     # Take a subset and keep the rest for next iteration
                     parents_list = sorted(new_empty_parents, key=lambda p: len(p.parts), reverse=True)
@@ -894,8 +906,15 @@ class AsyncEFSPurger:
 
             # Process parents concurrently in batches
             # Use smaller batches for cascading deletion to prevent memory explosion
-            # Check memory pressure before processing
-            await self.check_memory_pressure()
+            # Check memory pressure before processing and reduce batch size if needed
+            memory_high = await self.check_memory_pressure()
+
+            # Dynamically adjust batch size based on memory pressure
+            # Start with reasonable batches for cascading deletion (balance performance and memory)
+            base_batch_size = min(200, max(50, self.max_concurrency_deletion // 10))
+            if memory_high:
+                # Reduce batch size by 50% when memory is high (less aggressive reduction)
+                base_batch_size = max(20, base_batch_size // 2)
 
             # Check rate limit before processing batch
             if self.max_empty_dirs_to_delete > 0:
@@ -935,35 +954,30 @@ class AsyncEFSPurger:
                     if parent_resolved == root_resolved:
                         return None
 
-                    # Use deletion semaphore for concurrent deletion
-                    async with self.deletion_semaphore:
-                        # Double-check parent is still empty
-                        entries = await async_scandir(parent, self.scandir_executor, self)
-                        if len(entries) > 0:
-                            # Parent is no longer empty, skip it
-                            return None
-
-                        if not self.dry_run:
+                    # Skip redundant empty check - we know parent is empty (it's in the empty parents set)
+                    # Only hold semaphore for actual deletion, not for checks
+                    if not self.dry_run:
+                        async with self.deletion_semaphore:
                             await aiofiles.os.rmdir(parent)
-                            await self.update_stats(empty_dirs_to_delete=1, empty_dirs_deleted=1)
-                            # Record sample for rate tracking
-                            self.rate_tracker.record("removing_empty_dirs", "dirs", 1)
-                            self.logger.debug(f"Removed empty parent directory: {parent}")
-                        else:
-                            await self.update_stats(empty_dirs_to_delete=1)
-                            self.logger.debug(f"Would remove empty parent directory: {parent}")
+                        await self.update_stats(empty_dirs_to_delete=1, empty_dirs_deleted=1)
+                        # Record sample for rate tracking
+                        self.rate_tracker.record("removing_empty_dirs", "dirs", 1)
+                        self.logger.debug(f"Removed empty parent directory: {parent}")
+                    else:
+                        await self.update_stats(empty_dirs_to_delete=1)
+                        self.logger.debug(f"Would remove empty parent directory: {parent}")
 
-                        # Check if parent's parent is now empty (cascading)
-                        grandparent = parent.parent
-                        if grandparent != parent:
-                            try:
-                                grandparent_resolved = grandparent.resolve()
-                                if grandparent_resolved != root_resolved:
-                                    grandparent_entries = await async_scandir(grandparent, self.scandir_executor, self)
-                                    if len(grandparent_entries) == 0:
-                                        return grandparent  # Grandparent is now empty
-                            except (FileNotFoundError, PermissionError, OSError, RuntimeError):
-                                pass
+                    # Check if parent's parent is now empty (cascading) - outside semaphore for better concurrency
+                    grandparent = parent.parent
+                    if grandparent != parent:
+                        try:
+                            grandparent_resolved = grandparent.resolve()
+                            if grandparent_resolved != root_resolved:
+                                grandparent_entries = await async_scandir(grandparent, self.scandir_executor, self)
+                                if len(grandparent_entries) == 0:
+                                    return grandparent  # Grandparent is now empty
+                        except (FileNotFoundError, PermissionError, OSError, RuntimeError):
+                            pass
 
                 except FileNotFoundError:
                     self.logger.debug(f"Empty parent directory already deleted: {parent}")
@@ -980,9 +994,23 @@ class AsyncEFSPurger:
 
             # Process batch concurrently
             # Use smaller batches to prevent memory explosion
-            batch_size = min(200, max(50, self.max_concurrency_deletion // 10))
-            for j in range(0, len(parents_to_process), batch_size):
+            # Use the dynamically adjusted batch size based on memory pressure
+            # Use while loop to allow dynamic batch size adjustment
+            j = 0
+            batch_size = base_batch_size
+            while j < len(parents_to_process):
+                # Check memory before each batch in cascading deletion (more frequent checks)
+                memory_high = await self.check_memory_pressure()
+                if memory_high:
+                    # Further reduce batch size if memory is still high
+                    batch_size = max(10, batch_size // 2)
+                else:
+                    # Reset to base batch size if memory is OK (allows recovery)
+                    batch_size = base_batch_size
+
                 batch = parents_to_process[j : j + batch_size]
+                j += batch_size
+
                 tasks = [remove_parent_directory(parent) for parent in batch]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
 

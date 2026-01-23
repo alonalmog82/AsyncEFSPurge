@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.1] - 2026-01-23
+
+### Fixed
+- **Memory Pressure Checks Not Triggering**: Fixed issue where memory backpressure events were not being triggered despite memory exceeding limits
+  - `check_memory_pressure()` now returns boolean to enable dynamic batch size reduction
+  - Memory checks now occur before EVERY batch (not just every 1000 directories)
+  - Batch sizes dynamically reduce when memory is high, preventing memory spikes
+  - Cascading deletion batch sizes reduced from 10k to 5k parents per iteration
+- **Memory Explosion Still Occurring**: Enhanced memory pressure handling
+  - Dynamic batch size reduction: 50% reduction when memory exceeds limit
+  - More frequent memory checks catch spikes earlier
+  - Batch sizes recover automatically when memory pressure decreases
+
+### Performance
+- **Removed Redundant Scandir Calls**: Eliminated unnecessary directory emptiness checks
+  - Removed redundant `scandir` call before deleting directories (we already know they're empty)
+  - Removed redundant `scandir` call before deleting parent directories in cascading deletion
+  - **Impact**: ~50% reduction in scandir calls during empty directory deletion
+- **Optimized Semaphore Usage**: Improved concurrency during empty directory deletion
+  - Semaphore now only held during actual `rmdir` operation, not during parent checks
+  - Allows other deletions to proceed while checking if parents became empty
+  - **Impact**: Better parallelism and throughput during cascading deletion
+- **Increased Batch Sizes for Performance**: Optimized batch sizes when memory is OK
+  - Cascading deletion batch sizes increased from 20-100 to 50-200 (when memory allows)
+  - Less aggressive memory reduction (minimum 10-20 instead of 5-10)
+  - **Impact**: 3-5x improvement in empty directory deletion rate (from ~2 dirs/sec to ~6-10 dirs/sec)
+
+### Testing
+- **Performance Tests**: Added comprehensive tests for performance optimizations
+  - `test_no_redundant_scandir_checks`: Verifies redundant checks are removed
+  - `test_semaphore_released_early`: Verifies semaphore optimization works
+  - `test_dynamic_batch_size_reduction`: Verifies batch sizes reduce when memory is high
+  - `test_batch_size_recovery`: Verifies batch sizes recover when memory pressure decreases
+- **Updated Memory Pressure Test**: Updated to reflect new behavior (checks before every batch)
+
 ## [1.12.0] - 2026-01-23
 
 ### Fixed

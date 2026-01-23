@@ -31,7 +31,7 @@ def get_memory_usage_mb() -> float:
             return 0.0  # Return 0 if we can't measure
 
 
-async def async_scandir(path: Path, executor: ThreadPoolExecutor | None = None):
+async def async_scandir(path: Path, executor: ThreadPoolExecutor | None = None, purger_instance=None):
     """
     Async wrapper for os.scandir.
 
@@ -39,17 +39,93 @@ async def async_scandir(path: Path, executor: ThreadPoolExecutor | None = None):
         path: Directory path to scan
         executor: Optional ThreadPoolExecutor to use. If None, uses default executor (~32 threads).
                   Use a custom executor with more threads to increase directory scanning throughput.
+        purger_instance: Optional AsyncEFSPurger instance for diagnostics (DEBUG level only)
 
     Returns:
         List of directory entries
     """
     loop = asyncio.get_running_loop()
+    start_time = time.time() if purger_instance else None
 
     def _scandir():
         with os.scandir(path) as entries:
             return list(entries)
 
-    return await loop.run_in_executor(executor, _scandir)
+    result = await loop.run_in_executor(executor, _scandir)
+
+    # Track diagnostics (DEBUG level only)
+    if purger_instance and purger_instance.logger.isEnabledFor(logging.DEBUG):
+        elapsed = time.time() - start_time
+        async with purger_instance.scandir_lock:
+            purger_instance.scandir_call_count += 1
+            purger_instance.scandir_total_time += elapsed
+
+            # Log diagnostics periodically
+            current_time = time.time()
+            if (
+                current_time - purger_instance.last_scandir_diagnostics_log
+                >= purger_instance.scandir_diagnostics_interval
+            ):
+                purger_instance.last_scandir_diagnostics_log = current_time
+                await _log_scandir_diagnostics(purger_instance, executor, current_time)
+
+    return result
+
+
+async def _log_scandir_diagnostics(purger_instance, executor, current_time=None):
+    """Helper function to log scandir executor diagnostics (DEBUG level only)."""
+    if not purger_instance.logger.isEnabledFor(logging.DEBUG):
+        return
+
+    if current_time is None:
+        current_time = time.time()
+
+    # Calculate metrics
+    avg_time = (
+        purger_instance.scandir_total_time / purger_instance.scandir_call_count
+        if purger_instance.scandir_call_count > 0
+        else 0
+    )
+    calls_per_sec = (
+        purger_instance.scandir_call_count / (current_time - (purger_instance.stats.get("start_time", current_time)))
+        if purger_instance.scandir_call_count > 0
+        else 0
+    )
+
+    # Estimate executor thread utilization (approximate)
+    # ThreadPoolExecutor doesn't expose queue size or active thread count directly
+    executor_active_threads = 0
+    executor_total_threads = executor._max_workers if executor else 0
+    if executor is not None:
+        try:
+            # Try to get active thread count (this is approximate)
+            # We check if threads are alive and have a thread ID (meaning they're running)
+            if hasattr(executor, "_threads"):
+                executor_active_threads = sum(1 for t in executor._threads if t.is_alive() and t.ident is not None)
+        except Exception:
+            pass
+
+    log_with_context(
+        purger_instance.logger,
+        "debug",
+        "scandir executor diagnostics",
+        {
+            "total_calls": purger_instance.scandir_call_count,
+            "avg_time_ms": round(avg_time * 1000, 2),
+            "calls_per_sec": round(calls_per_sec, 1),
+            "executor_threads_total": executor_total_threads,
+            "executor_threads_active_estimate": executor_active_threads,
+            "executor_threads_idle_estimate": max(0, executor_total_threads - executor_active_threads),
+            "utilization_percent": round(
+                (executor_active_threads / executor_total_threads * 100) if executor_total_threads > 0 else 0,
+                1,
+            ),
+            "dirs_per_thread_per_sec": round(
+                calls_per_sec / executor_total_threads if executor_total_threads > 0 else 0,
+                2,
+            ),
+        },
+    )
 
 
 class RateTracker:
@@ -390,6 +466,13 @@ class AsyncEFSPurger:
 
         self.scandir_executor = ThreadPoolExecutor(max_workers=scandir_threads, thread_name_prefix="efspurge-scandir")
 
+        # Diagnostics for executor utilization (DEBUG level only)
+        self.scandir_call_count = 0
+        self.scandir_total_time = 0.0
+        self.scandir_lock = asyncio.Lock()
+        self.last_scandir_diagnostics_log = 0.0
+        self.scandir_diagnostics_interval = 10.0  # Log every 10 seconds
+
         # Track active tasks for concurrency utilization metrics
         self.active_tasks = 0
         self.max_active_tasks = 0
@@ -542,7 +625,7 @@ class AsyncEFSPurger:
             # Double-check directory is still empty (might have been populated)
             # This check happens under lock to prevent race conditions
             try:
-                entries = await async_scandir(directory, self.scandir_executor)
+                entries = await async_scandir(directory, self.scandir_executor, self)
                 if len(entries) == 0:
                     # Directory is empty, add to deletion set
                     # Set automatically prevents duplicates from concurrent scans
@@ -631,7 +714,7 @@ class AsyncEFSPurger:
                 # Use deletion semaphore for concurrent deletion
                 async with self.deletion_semaphore:
                     # Double-check directory is still empty (might have been populated)
-                    entries = await async_scandir(directory, self.scandir_executor)
+                    entries = await async_scandir(directory, self.scandir_executor, self)
                     if len(entries) > 0:
                         # Directory is no longer empty, skip it
                         return None
@@ -653,7 +736,7 @@ class AsyncEFSPurger:
                             parent_resolved = parent.resolve()
                             if parent_resolved != root_resolved:
                                 # Check if parent is now empty
-                                parent_entries = await async_scandir(parent, self.scandir_executor)
+                                parent_entries = await async_scandir(parent, self.scandir_executor, self)
                                 if len(parent_entries) == 0:
                                     return parent  # Parent is now empty
                         except (FileNotFoundError, PermissionError, OSError, RuntimeError):
@@ -676,9 +759,14 @@ class AsyncEFSPurger:
 
         # First pass: Delete all initially empty directories concurrently
         # Process in batches to avoid creating too many tasks at once
-        max_batch_size = min(1000, self.max_concurrency_deletion * 2)  # Reasonable batch size
+        # Use smaller batches to prevent memory explosion with large numbers of empty dirs
+        # Batch size scales with concurrency but is capped to prevent OOM
+        max_batch_size = min(200, max(50, self.max_concurrency_deletion // 10))
         i = 0
         while i < len(sorted_dirs):
+            # Check memory pressure before processing large batches
+            if i % 1000 == 0:  # Check every 1000 directories
+                await self.check_memory_pressure()
             # Check rate limit and calculate how many we can process
             remaining_slots = None
             if self.max_empty_dirs_to_delete > 0:
@@ -713,7 +801,9 @@ class AsyncEFSPurger:
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
             # Collect parents that became empty and log errors
+            # Process results immediately and clear references to free memory
             exceptions_count = 0
+            batch_new_parents = []
             for result in results:
                 if isinstance(result, Exception):
                     exceptions_count += 1
@@ -721,8 +811,16 @@ class AsyncEFSPurger:
                     await self.update_stats(errors=1)
                     continue
                 if result is not None:  # Parent became empty
-                    async with new_empty_parents_lock:
-                        new_empty_parents.add(result)
+                    batch_new_parents.append(result)
+
+            # Add new parents to set (single lock acquisition)
+            if batch_new_parents:
+                async with new_empty_parents_lock:
+                    new_empty_parents.update(batch_new_parents)
+
+            # Clear references immediately to help GC
+            del tasks, results, batch_new_parents
+            batch_new_parents = None
 
             # Log progress periodically during first pass (every 10 batches or every 10k dirs)
             async with self.stats_lock:
@@ -751,6 +849,9 @@ class AsyncEFSPurger:
             {"empty_dirs_deleted": deleted_count, "phase": "first_pass"},
         )
 
+        # Free memory: clear sorted_dirs reference after first pass
+        del sorted_dirs
+
         # Second pass: Process parents that became empty (cascading deletion)
         # Continue until no new empty parents are found
         iteration = 0
@@ -758,8 +859,18 @@ class AsyncEFSPurger:
             iteration += 1
             # Get next batch of parents to process
             async with new_empty_parents_lock:
-                parents_to_process = sorted(new_empty_parents, key=lambda p: len(p.parts), reverse=True)
-                new_empty_parents = set()  # Reset for next iteration
+                # Limit batch size to prevent memory explosion during cascading deletion
+                # Process in chunks if there are too many parents
+                max_parents_per_iteration = 10000  # Process max 10k parents per iteration
+                if len(new_empty_parents) > max_parents_per_iteration:
+                    # Take a subset and keep the rest for next iteration
+                    parents_list = sorted(new_empty_parents, key=lambda p: len(p.parts), reverse=True)
+                    parents_to_process = parents_list[:max_parents_per_iteration]
+                    new_empty_parents = set(parents_list[max_parents_per_iteration:])
+                    del parents_list  # Free memory
+                else:
+                    parents_to_process = sorted(new_empty_parents, key=lambda p: len(p.parts), reverse=True)
+                    new_empty_parents = set()  # Reset for next iteration
 
             if not parents_to_process:
                 break
@@ -782,6 +893,10 @@ class AsyncEFSPurger:
                 )
 
             # Process parents concurrently in batches
+            # Use smaller batches for cascading deletion to prevent memory explosion
+            # Check memory pressure before processing
+            await self.check_memory_pressure()
+
             # Check rate limit before processing batch
             if self.max_empty_dirs_to_delete > 0:
                 async with self.stats_lock:
@@ -823,7 +938,7 @@ class AsyncEFSPurger:
                     # Use deletion semaphore for concurrent deletion
                     async with self.deletion_semaphore:
                         # Double-check parent is still empty
-                        entries = await async_scandir(parent, self.scandir_executor)
+                        entries = await async_scandir(parent, self.scandir_executor, self)
                         if len(entries) > 0:
                             # Parent is no longer empty, skip it
                             return None
@@ -844,7 +959,7 @@ class AsyncEFSPurger:
                             try:
                                 grandparent_resolved = grandparent.resolve()
                                 if grandparent_resolved != root_resolved:
-                                    grandparent_entries = await async_scandir(grandparent, self.scandir_executor)
+                                    grandparent_entries = await async_scandir(grandparent, self.scandir_executor, self)
                                     if len(grandparent_entries) == 0:
                                         return grandparent  # Grandparent is now empty
                             except (FileNotFoundError, PermissionError, OSError, RuntimeError):
@@ -864,14 +979,17 @@ class AsyncEFSPurger:
                 return None
 
             # Process batch concurrently
-            batch_size = min(1000, self.max_concurrency_deletion * 2)
+            # Use smaller batches to prevent memory explosion
+            batch_size = min(200, max(50, self.max_concurrency_deletion // 10))
             for j in range(0, len(parents_to_process), batch_size):
                 batch = parents_to_process[j : j + batch_size]
                 tasks = [remove_parent_directory(parent) for parent in batch]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
 
                 # Collect grandparents that became empty and log errors
+                # Process results immediately and clear references
                 exceptions_count = 0
+                batch_new_grandparents = []
                 for result in results:
                     if isinstance(result, Exception):
                         exceptions_count += 1
@@ -879,8 +997,16 @@ class AsyncEFSPurger:
                         await self.update_stats(errors=1)
                         continue
                     if result is not None:  # Grandparent became empty
-                        async with new_empty_parents_lock:
-                            new_empty_parents.add(result)
+                        batch_new_grandparents.append(result)
+
+                # Add new grandparents to set (single lock acquisition)
+                if batch_new_grandparents:
+                    async with new_empty_parents_lock:
+                        new_empty_parents.update(batch_new_grandparents)
+
+                # Clear references immediately to help GC
+                del tasks, results, batch_new_grandparents
+                batch_new_grandparents = None
 
                 # Log progress periodically during cascading deletion
                 if exceptions_count > 0 and self.logger.isEnabledFor(logging.WARNING):
@@ -1041,7 +1167,7 @@ class AsyncEFSPurger:
             self.rate_tracker.record(self.current_phase, "dirs", 1)
 
             # Scan directory entries
-            entries = await async_scandir(directory, self.scandir_executor)
+            entries = await async_scandir(directory, self.scandir_executor, self)
 
             # STREAMING: Use buffer instead of accumulating all tasks
             file_task_buffer = []
@@ -1436,6 +1562,10 @@ class AsyncEFSPurger:
                 await progress_task
             except asyncio.CancelledError:
                 pass  # Expected
+
+            # Log final diagnostics if DEBUG is enabled
+            if self.logger.isEnabledFor(logging.DEBUG) and self.scandir_call_count > 0:
+                await _log_scandir_diagnostics(self, self.scandir_executor)
 
             # Shutdown custom executor for directory scanning
             if hasattr(self, "scandir_executor"):

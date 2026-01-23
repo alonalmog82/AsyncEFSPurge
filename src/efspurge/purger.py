@@ -675,19 +675,19 @@ class AsyncEFSPurger:
                         )
                         break
                     remaining_slots = self.max_empty_dirs_to_delete - to_delete_count
-            
+
             # Limit batch size based on rate limit
             batch_size = max_batch_size
             if remaining_slots is not None:
                 batch_size = min(batch_size, remaining_slots)
-            
+
             batch = sorted_dirs[i : i + batch_size]
             i += batch_size
-            
+
             # Process batch concurrently
             tasks = [remove_single_directory(directory) for directory in batch]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            
+
             # Collect parents that became empty
             for result in results:
                 if isinstance(result, Exception):

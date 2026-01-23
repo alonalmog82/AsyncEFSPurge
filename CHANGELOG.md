@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.0] - 2026-01-23
+
+### Fixed
+- **Overall Rate Calculation**: Fixed bug where overall `files_per_second` and `dirs_per_second` rates incorrectly included empty directory removal time
+  - Now uses scanning duration only (excludes empty dir removal phase)
+  - More accurate representation of actual scanning performance
+  - `scanning_end_time` is tracked and used for rate calculations
+
+### Changed
+- **Progress Output Improvements**:
+  - Reordered fields for better readability (elapsed_seconds, files_scanned, files_purged, dirs_scanned, etc.)
+  - Removed static fields from progress logs (`memory_limit_mb`, `max_concurrency_*`) - these are shown in startup log
+  - Moved detailed metrics to DEBUG level only (time-windowed rates, peak rates, concurrency utilization)
+  - Phase-specific output: scanning phase shows file/dir metrics, removing_empty_dirs phase shows dir removal metrics
+  - Core metrics (rates, memory) remain in INFO level
+
+### Performance
+- **Concurrent Empty Directory Removal**: Empty directories are now deleted concurrently instead of sequentially
+  - Uses `deletion_semaphore` to control concurrency (respects `max_concurrency_deletion`)
+  - Processes directories in batches (up to `max_concurrency_deletion * 2`)
+  - Maintains post-order deletion (deepest first) while processing concurrently
+  - **Performance improvement**: From ~1.1 dirs/sec to hundreds/thousands per second
+  - **Example**: 166,624 empty directories would take ~42 hours sequentially, now completes in minutes
+  - Rate limit checking works correctly with concurrent processing
+
+### Added
+- **Comprehensive Tests**: Added 7 new tests for concurrent empty directory removal
+  - `test_concurrent_empty_dir_deletion` - Verifies concurrent deletion performance
+  - `test_concurrent_deletion_respects_semaphore` - Verifies semaphore limits
+  - `test_concurrent_cascading_deletion` - Cascading deletion with concurrency
+  - `test_concurrent_deletion_no_duplicates` - Race condition prevention
+  - `test_concurrent_deletion_rate_limit` - Rate limits with concurrency
+  - `test_concurrent_deletion_handles_already_deleted` - FileNotFoundError handling
+  - `test_concurrent_deletion_handles_populated_dirs` - Skips populated directories
+- **Tests for Rate Calculation**: Added 3 tests verifying overall rate calculation fix
+- **Tests for Progress Output**: Added 4 tests verifying field ordering and DEBUG-level filtering
+
+### Documentation
+- **Directory Scanning Bottleneck**: Added documentation explaining ThreadPoolExecutor limitation
+  - Explains why `max_concurrent_subdirs` doesn't help beyond ~300 dirs/sec
+  - Documents default thread pool size (~32 threads)
+  - Provides code examples for widening the bottleneck with custom ThreadPoolExecutor
+  - Documents trade-offs of increasing thread pool size
+
 ## [1.9.1] - 2026-01-22
 
 ### Fixed

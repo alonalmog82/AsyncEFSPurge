@@ -1,6 +1,7 @@
 """Async file purger optimized for AWS EFS and network storage."""
 
 import asyncio
+import logging
 import os
 import time
 from collections import deque
@@ -348,6 +349,9 @@ class AsyncEFSPurger:
         # Track current phase for better progress reporting
         self.current_phase = "initializing"  # "scanning", "removing_empty_dirs", "completed"
 
+        # Track scanning phase duration for accurate overall rate calculation
+        self.scanning_end_time: float | None = None
+
         # Rate tracking for enhanced metrics
         self.rate_tracker = RateTracker()
 
@@ -534,9 +538,8 @@ class AsyncEFSPurger:
         This ensures we can delete nested empty directories correctly.
         After deleting a directory, we check if its parent is now empty.
 
-        Uses a two-pass approach to avoid modifying list during iteration:
-        1. First pass: Delete all directories in the initial set
-        2. Second pass: Check parents and delete if they became empty
+        Uses concurrent processing with deletion_semaphore for high throughput.
+        Processes directories in batches to maintain memory efficiency.
         """
         if not self.empty_dirs:
             return
@@ -569,32 +572,26 @@ class AsyncEFSPurger:
         # This ensures children are deleted before parents
         sorted_dirs = sorted(initial_empty_dirs, key=lambda p: len(p.parts), reverse=True)
 
+        # Use a lock to protect shared state during concurrent processing
+        processed_dirs_lock = asyncio.Lock()
         processed_dirs = set()  # Track which dirs we've processed
+        new_empty_parents_lock = asyncio.Lock()
         new_empty_parents = set()  # Track parents that become empty
 
-        # First pass: Delete all initially empty directories
-        for directory in sorted_dirs:
-            if directory in processed_dirs:
-                continue
+        async def remove_single_directory(directory: Path) -> Path | None:
+            """Remove a single empty directory and return its parent if it becomes empty."""
+            # Check if already processed
+            async with processed_dirs_lock:
+                if directory in processed_dirs:
+                    return None
+                processed_dirs.add(directory)
 
-            # Check rate limit (based on directories processed, not just deleted)
+            # Check rate limit atomically (before processing)
             if self.max_empty_dirs_to_delete > 0:
                 async with self.stats_lock:
                     to_delete_count = self.stats.get("empty_dirs_to_delete", 0)
-                if to_delete_count >= self.max_empty_dirs_to_delete:
-                    # Count unprocessed directories in this batch
-                    unprocessed_count = sum(1 for d in sorted_dirs if d not in processed_dirs)
-                    log_with_context(
-                        self.logger,
-                        "info",
-                        "Rate limit reached for empty directory deletion",
-                        {
-                            "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
-                            "empty_dirs_to_delete": to_delete_count,
-                            "unprocessed_dirs_in_batch": unprocessed_count,
-                        },
-                    )
-                    break
+                    if to_delete_count >= self.max_empty_dirs_to_delete:
+                        return None
 
             try:
                 # Normalize directory path for comparison
@@ -605,50 +602,44 @@ class AsyncEFSPurger:
 
                 # Never delete root directory
                 if dir_resolved == root_resolved:
-                    processed_dirs.add(directory)
-                    continue
+                    return None
 
-                # Double-check directory is still empty (might have been populated)
-                entries = await async_scandir(directory)
-                if len(entries) > 0:
-                    # Directory is no longer empty, skip it
-                    processed_dirs.add(directory)
-                    continue
+                # Use deletion semaphore for concurrent deletion
+                async with self.deletion_semaphore:
+                    # Double-check directory is still empty (might have been populated)
+                    entries = await async_scandir(directory)
+                    if len(entries) > 0:
+                        # Directory is no longer empty, skip it
+                        return None
 
-                if not self.dry_run:
-                    await aiofiles.os.rmdir(directory)
-                    await self.update_stats(empty_dirs_to_delete=1, empty_dirs_deleted=1)
-                    # Record sample for rate tracking
-                    self.rate_tracker.record("removing_empty_dirs", "dirs", 1)
-                    self.logger.debug(f"Removed empty directory: {directory}")
-                else:
-                    await self.update_stats(empty_dirs_to_delete=1)
-                    self.logger.debug(f"Would remove empty directory: {directory}")
+                    if not self.dry_run:
+                        await aiofiles.os.rmdir(directory)
+                        await self.update_stats(empty_dirs_to_delete=1, empty_dirs_deleted=1)
+                        # Record sample for rate tracking
+                        self.rate_tracker.record("removing_empty_dirs", "dirs", 1)
+                        self.logger.debug(f"Removed empty directory: {directory}")
+                    else:
+                        await self.update_stats(empty_dirs_to_delete=1)
+                        self.logger.debug(f"Would remove empty directory: {directory}")
 
-                processed_dirs.add(directory)
-
-                # After deleting a directory, check if its parent is now empty
-                parent = directory.parent
-                # Check parent is valid and not root
-                if parent != directory and parent not in processed_dirs:
-                    try:
-                        parent_resolved = parent.resolve()
-                        if parent_resolved != root_resolved:
-                            # Check if parent is now empty
-                            parent_entries = await async_scandir(parent)
-                            if len(parent_entries) == 0:
-                                # Parent is now empty, add to set for second pass
-                                new_empty_parents.add(parent)
-                    except (FileNotFoundError, PermissionError, OSError, RuntimeError):
-                        pass  # Parent doesn't exist, no permission, or resolve failed
+                    # After deleting, check if parent is now empty
+                    parent = directory.parent
+                    if parent != directory:
+                        try:
+                            parent_resolved = parent.resolve()
+                            if parent_resolved != root_resolved:
+                                # Check if parent is now empty
+                                parent_entries = await async_scandir(parent)
+                                if len(parent_entries) == 0:
+                                    return parent  # Parent is now empty
+                        except (FileNotFoundError, PermissionError, OSError, RuntimeError):
+                            pass  # Parent doesn't exist, no permission, or resolve failed
 
             except FileNotFoundError:
                 # Directory was already deleted by another process
-                processed_dirs.add(directory)
                 self.logger.debug(f"Empty directory already deleted: {directory}")
             except OSError as e:
                 # Directory might have been populated or permission denied
-                processed_dirs.add(directory)
                 log_with_context(
                     self.logger,
                     "warning",
@@ -656,6 +647,54 @@ class AsyncEFSPurger:
                     {"directory": str(directory), "error": str(e)},
                 )
                 await self.update_stats(errors=1)
+
+            return None
+
+        # First pass: Delete all initially empty directories concurrently
+        # Process in batches to avoid creating too many tasks at once
+        max_batch_size = min(1000, self.max_concurrency_deletion * 2)  # Reasonable batch size
+        i = 0
+        while i < len(sorted_dirs):
+            # Check rate limit and calculate how many we can process
+            remaining_slots = None
+            if self.max_empty_dirs_to_delete > 0:
+                async with self.stats_lock:
+                    to_delete_count = self.stats.get("empty_dirs_to_delete", 0)
+                    if to_delete_count >= self.max_empty_dirs_to_delete:
+                        # Count unprocessed directories
+                        unprocessed_count = len(sorted_dirs) - i
+                        log_with_context(
+                            self.logger,
+                            "info",
+                            "Rate limit reached for empty directory deletion",
+                            {
+                                "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
+                                "empty_dirs_to_delete": to_delete_count,
+                                "unprocessed_dirs_in_batch": unprocessed_count,
+                            },
+                        )
+                        break
+                    remaining_slots = self.max_empty_dirs_to_delete - to_delete_count
+
+            # Limit batch size based on rate limit
+            batch_size = max_batch_size
+            if remaining_slots is not None:
+                batch_size = min(batch_size, remaining_slots)
+
+            batch = sorted_dirs[i : i + batch_size]
+            i += batch_size
+
+            # Process batch concurrently
+            tasks = [remove_single_directory(directory) for directory in batch]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Collect parents that became empty
+            for result in results:
+                if isinstance(result, Exception):
+                    continue
+                if result is not None:  # Parent became empty
+                    async with new_empty_parents_lock:
+                        new_empty_parents.add(result)
 
         # Log progress after first pass
         async with self.stats_lock:
@@ -667,26 +706,21 @@ class AsyncEFSPurger:
             {"empty_dirs_deleted": deleted_count, "phase": "first_pass"},
         )
 
-        # Log before second pass
-        if new_empty_parents:
-            log_with_context(
-                self.logger,
-                "info",
-                "Starting cascading empty directory removal",
-                {"parents_to_check": len(new_empty_parents)},
-            )
-
         # Second pass: Process parents that became empty (cascading deletion)
         # Continue until no new empty parents are found
         iteration = 0
         while new_empty_parents:
             iteration += 1
             # Get next batch of parents to process
-            parents_to_process = sorted(new_empty_parents, key=lambda p: len(p.parts), reverse=True)
-            new_empty_parents = set()  # Reset for next iteration
+            async with new_empty_parents_lock:
+                parents_to_process = sorted(new_empty_parents, key=lambda p: len(p.parts), reverse=True)
+                new_empty_parents = set()  # Reset for next iteration
 
-            # Log progress every 100 iterations or every 1000 directories processed
-            if iteration % 100 == 0 or len(parents_to_process) > 1000:
+            if not parents_to_process:
+                break
+
+            # Log progress periodically
+            if iteration % 10 == 0 or len(parents_to_process) > 1000:
                 async with self.stats_lock:
                     to_delete_count = self.stats.get("empty_dirs_to_delete", 0)
                     deleted_count = self.stats.get("empty_dirs_deleted", 0)
@@ -702,17 +736,14 @@ class AsyncEFSPurger:
                     },
                 )
 
-            for parent in parents_to_process:
-                if parent in processed_dirs:
-                    continue
-
-                # Check rate limit (based on directories processed, not just deleted)
-                if self.max_empty_dirs_to_delete > 0:
-                    async with self.stats_lock:
-                        to_delete_count = self.stats.get("empty_dirs_to_delete", 0)
+            # Process parents concurrently in batches
+            # Check rate limit before processing batch
+            if self.max_empty_dirs_to_delete > 0:
+                async with self.stats_lock:
+                    to_delete_count = self.stats.get("empty_dirs_to_delete", 0)
                     if to_delete_count >= self.max_empty_dirs_to_delete:
-                        # Count unprocessed parents in current batch
-                        unprocessed_count = sum(1 for p in parents_to_process if p not in processed_dirs)
+                        # Count unprocessed parents
+                        unprocessed_count = len(parents_to_process)
                         log_with_context(
                             self.logger,
                             "info",
@@ -723,9 +754,15 @@ class AsyncEFSPurger:
                                 "unprocessed_parents_in_batch": unprocessed_count,
                             },
                         )
-                        # Exit both loops
-                        new_empty_parents = set()
                         break
+
+            async def remove_parent_directory(parent: Path) -> Path | None:
+                """Remove a single empty parent directory and return grandparent if it becomes empty."""
+                # Check if already processed
+                async with processed_dirs_lock:
+                    if parent in processed_dirs:
+                        return None
+                    processed_dirs.add(parent)
 
                 try:
                     # Normalize parent path
@@ -736,45 +773,41 @@ class AsyncEFSPurger:
 
                     # Never delete root directory
                     if parent_resolved == root_resolved:
-                        processed_dirs.add(parent)
-                        continue
+                        return None
 
-                    # Double-check parent is still empty
-                    entries = await async_scandir(parent)
-                    if len(entries) > 0:
-                        # Parent is no longer empty, skip it
-                        processed_dirs.add(parent)
-                        continue
+                    # Use deletion semaphore for concurrent deletion
+                    async with self.deletion_semaphore:
+                        # Double-check parent is still empty
+                        entries = await async_scandir(parent)
+                        if len(entries) > 0:
+                            # Parent is no longer empty, skip it
+                            return None
 
-                    if not self.dry_run:
-                        await aiofiles.os.rmdir(parent)
-                        await self.update_stats(empty_dirs_to_delete=1, empty_dirs_deleted=1)
-                        # Record sample for rate tracking
-                        self.rate_tracker.record("removing_empty_dirs", "dirs", 1)
-                        self.logger.debug(f"Removed empty parent directory: {parent}")
-                    else:
-                        await self.update_stats(empty_dirs_to_delete=1)
-                        self.logger.debug(f"Would remove empty parent directory: {parent}")
+                        if not self.dry_run:
+                            await aiofiles.os.rmdir(parent)
+                            await self.update_stats(empty_dirs_to_delete=1, empty_dirs_deleted=1)
+                            # Record sample for rate tracking
+                            self.rate_tracker.record("removing_empty_dirs", "dirs", 1)
+                            self.logger.debug(f"Removed empty parent directory: {parent}")
+                        else:
+                            await self.update_stats(empty_dirs_to_delete=1)
+                            self.logger.debug(f"Would remove empty parent directory: {parent}")
 
-                    processed_dirs.add(parent)
-
-                    # Check if parent's parent is now empty (cascading)
-                    grandparent = parent.parent
-                    if grandparent != parent and grandparent not in processed_dirs:
-                        try:
-                            grandparent_resolved = grandparent.resolve()
-                            if grandparent_resolved != root_resolved:
-                                grandparent_entries = await async_scandir(grandparent)
-                                if len(grandparent_entries) == 0:
-                                    new_empty_parents.add(grandparent)
-                        except (FileNotFoundError, PermissionError, OSError, RuntimeError):
-                            pass
+                        # Check if parent's parent is now empty (cascading)
+                        grandparent = parent.parent
+                        if grandparent != parent:
+                            try:
+                                grandparent_resolved = grandparent.resolve()
+                                if grandparent_resolved != root_resolved:
+                                    grandparent_entries = await async_scandir(grandparent)
+                                    if len(grandparent_entries) == 0:
+                                        return grandparent  # Grandparent is now empty
+                            except (FileNotFoundError, PermissionError, OSError, RuntimeError):
+                                pass
 
                 except FileNotFoundError:
-                    processed_dirs.add(parent)
                     self.logger.debug(f"Empty parent directory already deleted: {parent}")
                 except OSError as e:
-                    processed_dirs.add(parent)
                     log_with_context(
                         self.logger,
                         "warning",
@@ -782,6 +815,23 @@ class AsyncEFSPurger:
                         {"directory": str(parent), "error": str(e)},
                     )
                     await self.update_stats(errors=1)
+
+                return None
+
+            # Process batch concurrently
+            batch_size = min(1000, self.max_concurrency_deletion * 2)
+            for j in range(0, len(parents_to_process), batch_size):
+                batch = parents_to_process[j : j + batch_size]
+                tasks = [remove_parent_directory(parent) for parent in batch]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Collect grandparents that became empty
+                for result in results:
+                    if isinstance(result, Exception):
+                        continue
+                    if result is not None:  # Grandparent became empty
+                        async with new_empty_parents_lock:
+                            new_empty_parents.add(result)
 
         # Log completion
         async with self.stats_lock:
@@ -1039,17 +1089,25 @@ class AsyncEFSPurger:
             async with self.stats_lock:
                 current_time = time.time()
                 elapsed = current_time - self.stats.get("start_time", current_time)
-                rate = self.stats["files_scanned"] / elapsed if elapsed > 0 else 0
-                memory_mb = get_memory_usage_mb()
-                memory_percent = (memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
 
                 current_files = self.stats["files_scanned"]
                 current_dirs = self.stats["dirs_scanned"]
 
-                # Calculate enhanced rate metrics
-                # Overall rates (since start)
-                files_per_second_overall = rate
-                dirs_per_second_overall = current_dirs / elapsed if elapsed > 0 else 0.0
+                # Calculate overall rates using scanning duration only (excludes empty dir removal time)
+                # If scanning is complete, use scanning duration; otherwise use elapsed time
+                if self.scanning_end_time is not None:
+                    scanning_duration = self.scanning_end_time - self.stats.get("start_time", current_time)
+                    files_per_second_overall = (
+                        self.stats["files_scanned"] / scanning_duration if scanning_duration > 0 else 0
+                    )
+                    dirs_per_second_overall = current_dirs / scanning_duration if scanning_duration > 0 else 0.0
+                else:
+                    # Still scanning, use elapsed time
+                    files_per_second_overall = self.stats["files_scanned"] / elapsed if elapsed > 0 else 0
+                    dirs_per_second_overall = current_dirs / elapsed if elapsed > 0 else 0.0
+
+                memory_mb = get_memory_usage_mb()
+                memory_percent = (memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
 
                 # Time-windowed rates (instant 10s, short-term 60s)
                 files_per_second_instant = self.rate_tracker.get_rate("scanning", "files", 10.0)
@@ -1085,64 +1143,81 @@ class AsyncEFSPurger:
                     (current_active_tasks / max_concurrency_total * 100) if max_concurrency_total > 0 else 0.0
                 )
 
-                # Build progress update with phase-specific info
+                # Check if DEBUG level logging is enabled
+                is_debug = self.logger.isEnabledFor(logging.DEBUG)
+
+                # Build progress update with phase-specific metrics
                 progress_data = {
+                    # Always shown
+                    "elapsed_seconds": round(elapsed, 1),
                     "phase": self.current_phase,
-                    "files_scanned": current_files,
-                    "files_to_purge": self.stats["files_to_purge"],
-                    "files_purged": self.stats["files_purged"],
-                    "dirs_scanned": current_dirs,
                     "errors": self.stats["errors"],
                     "memory_backpressure_events": self.stats.get("memory_backpressure_events", 0),
-                    "elapsed_seconds": round(elapsed, 1),
-                    # Overall rates (backward compatible)
-                    "files_per_second": round(files_per_second_overall, 1),
+                }
+
+                # Phase-specific metrics
+                if self.current_phase == "removing_empty_dirs":
+                    # During empty dir removal: show dir removal metrics
+                    progress_data["dirs_purged"] = self.stats.get("empty_dirs_deleted", 0)
+                    progress_data["dirs_to_purge"] = self.stats.get("empty_dirs_to_delete", 0)
+                    # Show overall rates (from scanning phase)
+                    progress_data["files_per_second"] = round(files_per_second_overall, 1)
+                    progress_data["dirs_per_second"] = round(dirs_per_second_overall, 1)
+                else:
+                    # During scanning: show file/dir scanning metrics
+                    progress_data["files_scanned"] = current_files
+                    progress_data["files_purged"] = self.stats["files_purged"]
+                    progress_data["dirs_scanned"] = current_dirs
+                    # Add files/dirs to purge if non-zero
+                    if self.stats["files_to_purge"] > 0:
+                        progress_data["files_to_purge"] = self.stats["files_to_purge"]
+                    # Show overall rates
+                    progress_data["files_per_second"] = round(files_per_second_overall, 1)
+                    progress_data["dirs_per_second"] = round(dirs_per_second_overall, 1)
+
+                # Memory usage (always shown)
+                progress_data["memory_mb"] = round(memory_mb, 1)
+                progress_data["memory_usage_percent"] = round(memory_percent, 1)
+
+                # DEBUG-only detailed metrics
+                if is_debug:
                     # Enhanced rate metrics - overall
-                    "files_per_second_overall": round(files_per_second_overall, 1),
-                    "dirs_per_second_overall": round(dirs_per_second_overall, 1),
-                    # Enhanced rate metrics - time-windowed
-                    "files_per_second_instant": round(files_per_second_instant, 1),
-                    "dirs_per_second_instant": round(dirs_per_second_instant, 1),
-                    "files_per_second_short": round(files_per_second_short, 1),
-                    "dirs_per_second_short": round(dirs_per_second_short, 1),
-                    # Enhanced rate metrics - per-phase
-                    "scanning_files_per_second": round(scanning_files_rate, 1),
-                    "scanning_dirs_per_second": round(scanning_dirs_rate, 1),
-                    "deletion_files_per_second": round(deletion_files_rate, 1),
-                    "empty_dirs_per_second": round(empty_dirs_rate, 1),
+                    progress_data["files_per_second_overall"] = round(files_per_second_overall, 1)
+                    progress_data["dirs_per_second_overall"] = round(dirs_per_second_overall, 1)
+                    # Time-windowed rates
+                    progress_data["files_per_second_instant"] = round(files_per_second_instant, 1)
+                    progress_data["dirs_per_second_instant"] = round(dirs_per_second_instant, 1)
+                    progress_data["files_per_second_short"] = round(files_per_second_short, 1)
+                    progress_data["dirs_per_second_short"] = round(dirs_per_second_short, 1)
+                    # Per-phase rates
+                    progress_data["scanning_files_per_second"] = round(scanning_files_rate, 1)
+                    progress_data["scanning_dirs_per_second"] = round(scanning_dirs_rate, 1)
+                    progress_data["deletion_files_per_second"] = round(deletion_files_rate, 1)
+                    progress_data["empty_dirs_per_second"] = round(empty_dirs_rate, 1)
                     # Peak rates
-                    "peak_files_per_second": round(self.rate_tracker.peak_rates["files_per_second"]["value"], 1),
-                    "peak_dirs_per_second": round(self.rate_tracker.peak_rates["dirs_per_second"]["value"], 1),
-                    "peak_files_deleted_per_second": round(
+                    progress_data["peak_files_per_second"] = round(
+                        self.rate_tracker.peak_rates["files_per_second"]["value"], 1
+                    )
+                    progress_data["peak_dirs_per_second"] = round(
+                        self.rate_tracker.peak_rates["dirs_per_second"]["value"], 1
+                    )
+                    progress_data["peak_files_deleted_per_second"] = round(
                         self.rate_tracker.peak_rates["files_deleted_per_second"]["value"], 1
-                    ),
-                    "peak_empty_dirs_per_second": round(
+                    )
+                    progress_data["peak_empty_dirs_per_second"] = round(
                         self.rate_tracker.peak_rates["empty_dirs_per_second"]["value"], 1
-                    ),
-                    # Concurrency utilization metrics (for tuning concurrency limits)
-                    "active_tasks": current_active_tasks,
-                    "max_active_tasks": peak_active_tasks,
-                    "max_concurrency_scanning": self.max_concurrency_scanning,
-                    "max_concurrency_deletion": self.max_concurrency_deletion,
-                    # For backward compatibility
-                    "max_concurrency": max(self.max_concurrency_scanning, self.max_concurrency_deletion),
-                    "available_concurrency_slots": available_slots,
-                    "concurrency_utilization_percent": round(concurrency_utilization_percent, 1),
-                    # Memory metrics
-                    "memory_mb": round(memory_mb, 1),
-                    "memory_limit_mb": self.memory_limit_mb,
-                    "memory_usage_percent": round(memory_percent, 1),
-                    "memory_mb_per_1k_files": (
+                    )
+                    # Concurrency utilization metrics
+                    progress_data["active_tasks"] = current_active_tasks
+                    progress_data["max_active_tasks"] = peak_active_tasks
+                    progress_data["available_concurrency_slots"] = available_slots
+                    progress_data["concurrency_utilization_percent"] = round(concurrency_utilization_percent, 1)
+                    # Detailed memory metrics
+                    progress_data["memory_mb_per_1k_files"] = (
                         round(memory_mb / (self.stats["files_scanned"] / 1000), 2)
                         if self.stats["files_scanned"] > 0
                         else 0.0
-                    ),
-                }
-
-                # Add empty dir stats if in that phase
-                if self.current_phase == "removing_empty_dirs":
-                    progress_data["empty_dirs_to_delete"] = self.stats.get("empty_dirs_to_delete", 0)
-                    progress_data["empty_dirs_deleted"] = self.stats.get("empty_dirs_deleted", 0)
+                    )
 
                 log_with_context(
                     self.logger,
@@ -1281,6 +1356,9 @@ class AsyncEFSPurger:
             self.rate_tracker.set_phase_start("scanning")
             await self.scan_directory(self.root_path)
 
+            # Mark scanning phase as complete (for accurate overall rate calculation)
+            self.scanning_end_time = time.time()
+
             # After all scanning is complete, remove empty directories in post-order
             if self.remove_empty_dirs:
                 await self._remove_empty_directories()
@@ -1296,37 +1374,95 @@ class AsyncEFSPurger:
         elapsed = time.time() - self.stats.get("start_time", time.time())
         if elapsed > self.progress_interval and (time.time() - self.last_progress_log) > 10:
             # Force a final progress update
-            rate = self.stats["files_scanned"] / elapsed if elapsed > 0 else 0
+            # Use scanning duration for rate calculation (excludes empty dir removal time)
+            if self.scanning_end_time is not None:
+                scanning_duration = self.scanning_end_time - self.stats.get("start_time", time.time())
+                rate = self.stats["files_scanned"] / scanning_duration if scanning_duration > 0 else 0
+            else:
+                rate = self.stats["files_scanned"] / elapsed if elapsed > 0 else 0
+
             memory_mb = get_memory_usage_mb()
+            is_debug = self.logger.isEnabledFor(10)  # 10 = DEBUG level
+
+            final_progress_data = {
+                # Core metrics in requested order
+                "elapsed_seconds": round(elapsed, 1),
+                "files_scanned": self.stats["files_scanned"],
+                "files_purged": self.stats["files_purged"],
+                "dirs_scanned": self.stats["dirs_scanned"],
+                "errors": self.stats["errors"],
+                "memory_backpressure_events": self.stats.get("memory_backpressure_events", 0),
+            }
+
+            # Add dirs purged if any were deleted
+            if self.stats.get("empty_dirs_deleted", 0) > 0:
+                final_progress_data["dirs_purged"] = self.stats.get("empty_dirs_deleted", 0)
+
+            # Add files/dirs to purge if non-zero
+            if self.stats["files_to_purge"] > 0:
+                final_progress_data["files_to_purge"] = self.stats["files_to_purge"]
+            if self.stats.get("empty_dirs_to_delete", 0) > 0:
+                final_progress_data["dirs_to_purge"] = self.stats.get("empty_dirs_to_delete", 0)
+
+            # Rates and memory
+            final_progress_data["files_per_second"] = round(rate, 1)
+            final_progress_data["memory_mb"] = round(memory_mb, 1)
+
             log_with_context(
                 self.logger,
                 "info",
                 "Final progress before completion",
-                {
-                    "files_scanned": self.stats["files_scanned"],
-                    "files_to_purge": self.stats["files_to_purge"],
-                    "files_purged": self.stats["files_purged"],
-                    "dirs_scanned": self.stats["dirs_scanned"],
-                    "errors": self.stats["errors"],
-                    "elapsed_seconds": round(elapsed, 1),
-                    "files_per_second": round(rate, 1),
-                    "memory_mb": round(memory_mb, 1),
-                },
+                final_progress_data,
             )
 
         # Calculate final statistics
         duration = time.time() - start_time
-        files_per_sec = self.stats["files_scanned"] / duration if duration > 0 else 0
+        # Use scanning duration for files_per_second (excludes empty dir removal time)
+        if self.scanning_end_time is not None:
+            scanning_duration = self.scanning_end_time - start_time
+            files_per_sec = self.stats["files_scanned"] / scanning_duration if scanning_duration > 0 else 0
+        else:
+            files_per_sec = self.stats["files_scanned"] / duration if duration > 0 else 0
         mb_freed = self.stats["bytes_freed"] / (1024 * 1024)
         memory_mb = get_memory_usage_mb()
+        is_debug = self.logger.isEnabledFor(10)  # 10 = DEBUG level
 
+        # Build final stats with reordered fields (most important first)
         final_stats = {
-            **self.stats,
+            # Core metrics in requested order
             "duration_seconds": round(duration, 2),
-            "files_per_second": round(files_per_sec, 2),
-            "mb_freed": round(mb_freed, 2),
-            "peak_memory_mb": round(memory_mb, 1),
+            "files_scanned": self.stats["files_scanned"],
+            "files_purged": self.stats["files_purged"],
+            "dirs_scanned": self.stats["dirs_scanned"],
+            "errors": self.stats["errors"],
+            "memory_backpressure_events": self.stats.get("memory_backpressure_events", 0),
         }
+
+        # Add dirs purged if any were deleted
+        if self.stats.get("empty_dirs_deleted", 0) > 0:
+            final_stats["dirs_purged"] = self.stats.get("empty_dirs_deleted", 0)
+
+        # Add files/dirs to purge if non-zero
+        if self.stats["files_to_purge"] > 0:
+            final_stats["files_to_purge"] = self.stats["files_to_purge"]
+        if self.stats.get("empty_dirs_to_delete", 0) > 0:
+            final_stats["dirs_to_purge"] = self.stats.get("empty_dirs_to_delete", 0)
+
+        # Rates and memory
+        final_stats["files_per_second"] = round(files_per_sec, 2)
+        final_stats["mb_freed"] = round(mb_freed, 2)
+        final_stats["peak_memory_mb"] = round(memory_mb, 1)
+
+        # DEBUG-only: include all stats for detailed analysis
+        if is_debug:
+            final_stats.update(
+                {
+                    "symlinks_skipped": self.stats.get("symlinks_skipped", 0),
+                    "special_files_skipped": self.stats.get("special_files_skipped", 0),
+                    "bytes_freed": self.stats.get("bytes_freed", 0),
+                    "start_time": self.stats.get("start_time"),
+                }
+            )
 
         log_with_context(
             self.logger,

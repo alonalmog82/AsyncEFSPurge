@@ -34,12 +34,12 @@ def get_memory_usage_mb() -> float:
 async def async_scandir(path: Path, executor: ThreadPoolExecutor | None = None):
     """
     Async wrapper for os.scandir.
-    
+
     Args:
         path: Directory path to scan
         executor: Optional ThreadPoolExecutor to use. If None, uses default executor (~32 threads).
                   Use a custom executor with more threads to increase directory scanning throughput.
-    
+
     Returns:
         List of directory entries
     """
@@ -387,10 +387,8 @@ class AsyncEFSPurger:
             scandir_threads = min(300, max(150, max_concurrent_subdirs // 8))
         else:
             scandir_threads = min(200, max(100, max_concurrent_subdirs // 5))
-        
-        self.scandir_executor = ThreadPoolExecutor(
-            max_workers=scandir_threads, thread_name_prefix="efspurge-scandir"
-        )
+
+        self.scandir_executor = ThreadPoolExecutor(max_workers=scandir_threads, thread_name_prefix="efspurge-scandir")
 
         # Track active tasks for concurrency utilization metrics
         self.active_tasks = 0
@@ -1396,9 +1394,9 @@ class AsyncEFSPurger:
                 await progress_task
             except asyncio.CancelledError:
                 pass  # Expected
-            
+
             # Shutdown custom executor for directory scanning
-            if hasattr(self, 'scandir_executor'):
+            if hasattr(self, "scandir_executor"):
                 self.scandir_executor.shutdown(wait=False)
 
         # Log one final progress update if we haven't logged recently

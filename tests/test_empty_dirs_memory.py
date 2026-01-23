@@ -177,11 +177,11 @@ async def test_empty_dir_deletion_batch_sizes(temp_dir):
 async def test_empty_dir_deletion_memory_pressure_checks(temp_dir):
     """Test that memory pressure checks are triggered during empty directory deletion.
 
-    Memory checks are called every 1000 directories, so with 5000 directories,
-    check_memory_pressure() should be called at least 5 times.
+    Memory checks are now called before EVERY batch (not every 1000 directories).
+    With batch sizes of 50-200, 5000 dirs should trigger many more checks.
     """
     # Create many empty directories - enough to trigger multiple memory checks
-    # Memory checks happen every 1000 directories, so 5000 dirs = 5 checks
+    # With batch sizes of 50-200, 5000 dirs = 25-100 batches = 25-100 checks
     num_dirs = 5000
     for i in range(num_dirs):
         (temp_dir / f"empty_{i:04d}").mkdir()
@@ -200,13 +200,16 @@ async def test_empty_dir_deletion_memory_pressure_checks(temp_dir):
 
     await purger.scan_directory(temp_dir)
 
-    # Mock check_memory_pressure to track calls
+    # Mock check_memory_pressure to track calls and return values
     check_calls = []
+    check_results = []
     original_check = purger.check_memory_pressure
 
     async def tracked_check():
+        result = await original_check()
         check_calls.append(time.time())
-        return await original_check()
+        check_results.append(result)
+        return result
 
     purger.check_memory_pressure = tracked_check
 
@@ -215,12 +218,18 @@ async def test_empty_dir_deletion_memory_pressure_checks(temp_dir):
     # Verify deletion completed successfully
     assert purger.stats["empty_dirs_deleted"] == num_dirs
 
-    # Memory checks should have been called at least once per 1000 directories
-    # With 5000 dirs, we expect at least 5 calls (every 1000 dirs)
-    expected_min_calls = num_dirs // 1000
+    # Memory checks should be called before EVERY batch
+    # With batch sizes of 50-200, 5000 dirs should trigger at least 25 checks (5000/200)
+    # But likely more due to smaller batches when memory is high
+    expected_min_calls = num_dirs // 200  # Conservative estimate
     assert len(check_calls) >= expected_min_calls, (
         f"Memory checks should be called at least {expected_min_calls} times "
-        f"(once per 1000 directories), but was called {len(check_calls)} times"
+        f"(before every batch), but was called {len(check_calls)} times"
+    )
+
+    # Verify check_memory_pressure returns boolean
+    assert all(isinstance(result, bool) for result in check_results), (
+        "check_memory_pressure should return boolean values"
     )
 
 

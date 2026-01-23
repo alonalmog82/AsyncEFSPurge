@@ -1100,31 +1100,34 @@ class AsyncEFSPurger:
                 # Check if DEBUG level logging is enabled
                 is_debug = self.logger.isEnabledFor(logging.DEBUG)
 
-                # Build progress update with reordered fields (most important first)
+                # Build progress update with phase-specific metrics
                 progress_data = {
-                    # Core metrics (always shown) - ordered as requested
+                    # Always shown
                     "elapsed_seconds": round(elapsed, 1),
-                    "files_scanned": current_files,
-                    "files_purged": self.stats["files_purged"],
-                    "dirs_scanned": current_dirs,
+                    "phase": self.current_phase,
                     "errors": self.stats["errors"],
                     "memory_backpressure_events": self.stats.get("memory_backpressure_events", 0),
                 }
 
-                # Add dirs purged (empty_dirs_deleted) if in that phase or if any were deleted
-                if self.current_phase == "removing_empty_dirs" or self.stats.get("empty_dirs_deleted", 0) > 0:
-                    progress_data["dirs_purged"] = self.stats.get("empty_dirs_deleted", 0)
-
-                # Add files/dirs to purge (only if non-zero or in relevant phase)
-                if self.stats["files_to_purge"] > 0:
-                    progress_data["files_to_purge"] = self.stats["files_to_purge"]
+                # Phase-specific metrics
                 if self.current_phase == "removing_empty_dirs":
+                    # During empty dir removal: show dir removal metrics
+                    progress_data["dirs_purged"] = self.stats.get("empty_dirs_deleted", 0)
                     progress_data["dirs_to_purge"] = self.stats.get("empty_dirs_to_delete", 0)
-
-                # Phase and overall rates (always shown)
-                progress_data["phase"] = self.current_phase
-                progress_data["files_per_second"] = round(files_per_second_overall, 1)
-                progress_data["dirs_per_second"] = round(dirs_per_second_overall, 1)
+                    # Show overall rates (from scanning phase)
+                    progress_data["files_per_second"] = round(files_per_second_overall, 1)
+                    progress_data["dirs_per_second"] = round(dirs_per_second_overall, 1)
+                else:
+                    # During scanning: show file/dir scanning metrics
+                    progress_data["files_scanned"] = current_files
+                    progress_data["files_purged"] = self.stats["files_purged"]
+                    progress_data["dirs_scanned"] = current_dirs
+                    # Add files/dirs to purge if non-zero
+                    if self.stats["files_to_purge"] > 0:
+                        progress_data["files_to_purge"] = self.stats["files_to_purge"]
+                    # Show overall rates
+                    progress_data["files_per_second"] = round(files_per_second_overall, 1)
+                    progress_data["dirs_per_second"] = round(dirs_per_second_overall, 1)
 
                 # Memory usage (always shown)
                 progress_data["memory_mb"] = round(memory_mb, 1)

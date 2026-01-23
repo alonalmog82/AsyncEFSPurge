@@ -201,15 +201,12 @@ async def test_core_fields_always_present(temp_dir, caplog):
         first_log = progress_logs[0]
         extra_fields = getattr(first_log, "extra_fields", {})
 
-        # Core fields that should always be present
+        # Core fields that should always be present (regardless of phase)
         core_fields = [
             "elapsed_seconds",
-            "files_scanned",
-            "files_purged",
-            "dirs_scanned",
+            "phase",
             "errors",
             "memory_backpressure_events",
-            "phase",
             "files_per_second",
             "memory_mb",
         ]
@@ -218,4 +215,54 @@ async def test_core_fields_always_present(temp_dir, caplog):
             assert field in extra_fields, (
                 f"Core field {field} should always be present in progress logs, "
                 f"but was missing. Found fields: {list(extra_fields.keys())}"
+            )
+
+
+@pytest.mark.asyncio
+async def test_phase_specific_fields(temp_dir, caplog):
+    """Test that phase-specific fields are shown based on current phase."""
+    # Create files and empty dirs
+    for i in range(50):
+        (temp_dir / f"file_{i}.txt").write_text("test")
+
+    # Create nested empty directories
+    for i in range(5):
+        (temp_dir / f"empty_{i}").mkdir()
+
+    purger = AsyncEFSPurger(
+        root_path=str(temp_dir),
+        max_age_days=30,
+        remove_empty_dirs=True,
+        dry_run=False,
+        log_level="INFO",
+    )
+
+    purger.progress_interval = 0.1  # Very short to catch both phases
+
+    await purger.purge()
+
+    progress_logs = [r for r in caplog.records if "Progress update" in r.message]
+
+    if len(progress_logs) >= 2:
+        # Find logs from different phases
+        scanning_logs = [r for r in progress_logs if getattr(r, "extra_fields", {}).get("phase") == "scanning"]
+        removing_logs = [r for r in progress_logs if getattr(r, "extra_fields", {}).get("phase") == "removing_empty_dirs"]
+
+        # During scanning phase: should show file/dir scanning metrics
+        if scanning_logs:
+            scanning_fields = getattr(scanning_logs[0], "extra_fields", {})
+            assert "files_scanned" in scanning_fields, "Scanning phase should show files_scanned"
+            assert "dirs_scanned" in scanning_fields, "Scanning phase should show dirs_scanned"
+
+        # During removing_empty_dirs phase: should show dir removal metrics
+        if removing_logs:
+            removing_fields = getattr(removing_logs[0], "extra_fields", {})
+            assert "dirs_purged" in removing_fields, "Removing empty dirs phase should show dirs_purged"
+            assert "dirs_to_purge" in removing_fields, "Removing empty dirs phase should show dirs_to_purge"
+            # Should NOT show file scanning metrics (they don't change)
+            assert "files_scanned" not in removing_fields, (
+                "Removing empty dirs phase should NOT show files_scanned (doesn't change)"
+            )
+            assert "dirs_scanned" not in removing_fields, (
+                "Removing empty dirs phase should NOT show dirs_scanned (doesn't change)"
             )

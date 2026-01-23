@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.0] - 2026-01-23
+
+### Fixed
+- **Memory Explosion During Empty Directory Deletion**: Fixed severe memory spike when deleting large numbers of empty directories (10k+)
+  - Reduced batch sizes from `max_concurrency_deletion * 2` to `min(200, max(50, max_concurrency_deletion // 10))`
+  - Added memory pressure checks every 1000 directories during deletion
+  - Improved incremental result processing to avoid accumulating large lists
+  - Limited cascading deletion to process max 10,000 parents per iteration
+  - **Before**: Memory could grow from ~250MB to 1500MB+ with 100k+ empty directories
+  - **After**: Memory increase stays bounded (< 300MB even with 10k+ directories)
+
+### Added
+- **Scandir Executor Diagnostics**: Added DEBUG-level diagnostics for directory scanning executor
+  - Tracks total scandir calls, average time per call, calls per second
+  - Monitors thread pool utilization (active/total/idle threads)
+  - Calculates directories per thread per second
+  - Logs diagnostics periodically during scanning and at completion
+  - Only enabled when logging level is DEBUG
+
+### Testing
+- **Memory Safety Tests**: Added comprehensive tests for memory boundedness during empty directory deletion
+  - `test_large_scale_empty_dir_deletion_memory_bounded`: Verifies memory stays bounded with 10k+ directories
+  - `test_empty_dir_deletion_batch_sizes`: Verifies batch size limits prevent memory explosion
+  - `test_empty_dir_deletion_memory_pressure_checks`: Verifies memory pressure checks are called
+  - `test_cascading_deletion_memory_bounded`: Verifies cascading deletion doesn't cause memory explosion
+- **Scandir Diagnostics Tests**: Added tests for executor diagnostics
+  - Verifies diagnostics are only logged at DEBUG level
+  - Verifies metrics accumulate correctly
+  - Verifies diagnostics don't interfere with normal operation
+- **Test Configuration**: Added `conftest.py` to ensure pytest uses local source code during testing
+
 ## [1.11.0] - 2026-01-23
 
 ### Performance

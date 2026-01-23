@@ -152,6 +152,5 @@ async def test_final_stats_use_scanning_duration(temp_dir):
         # The actual rate (using scanning duration) should be >= rate using total duration
         # (or very close if empty dir removal was very fast)
         assert actual_rate >= rate_using_total * 0.9, (
-            f"Rate using scanning duration ({actual_rate}) should be >= "
-            f"rate using total duration ({rate_using_total})"
+            f"Rate using scanning duration ({actual_rate}) should be >= rate using total duration ({rate_using_total})"
         )

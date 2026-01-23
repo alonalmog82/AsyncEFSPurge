@@ -1,6 +1,5 @@
 """Tests for progress output formatting and DEBUG-level filtering."""
 
-import json
 import tempfile
 from pathlib import Path
 
@@ -37,10 +36,7 @@ async def test_progress_output_field_order(temp_dir, caplog):
 
     # Find progress update logs from scanning phase
     progress_logs = [record for record in caplog.records if "Progress update" in record.message]
-    scanning_logs = [
-        r for r in progress_logs
-        if getattr(r, "extra_fields", {}).get("phase") == "scanning"
-    ]
+    scanning_logs = [r for r in progress_logs if getattr(r, "extra_fields", {}).get("phase") == "scanning"]
 
     if scanning_logs:
         # Get the first scanning phase log's extra_fields
@@ -104,9 +100,7 @@ async def test_debug_metrics_only_in_debug_mode(temp_dir, caplog):
         ]
 
         for field in debug_only_fields:
-            assert field not in extra_fields_info, (
-                f"{field} should not appear in INFO level logs, but was found"
-            )
+            assert field not in extra_fields_info, f"{field} should not appear in INFO level logs, but was found"
 
     # Test with DEBUG level (should show debug metrics)
     caplog.clear()
@@ -136,8 +130,7 @@ async def test_debug_metrics_only_in_debug_mode(temp_dir, caplog):
         # At least some debug fields should be present
         found_debug_fields = [f for f in debug_fields if f in extra_fields_debug]
         assert len(found_debug_fields) > 0, (
-            f"Expected at least one debug field in DEBUG mode logs. "
-            f"Found: {list(extra_fields_debug.keys())}"
+            f"Expected at least one debug field in DEBUG mode logs. Found: {list(extra_fields_debug.keys())}"
         )
 
 
@@ -250,7 +243,9 @@ async def test_phase_specific_fields(temp_dir, caplog):
     if len(progress_logs) >= 2:
         # Find logs from different phases
         scanning_logs = [r for r in progress_logs if getattr(r, "extra_fields", {}).get("phase") == "scanning"]
-        removing_logs = [r for r in progress_logs if getattr(r, "extra_fields", {}).get("phase") == "removing_empty_dirs"]
+        removing_logs = [
+            r for r in progress_logs if getattr(r, "extra_fields", {}).get("phase") == "removing_empty_dirs"
+        ]
 
         # During scanning phase: should show file/dir scanning metrics
         if scanning_logs:

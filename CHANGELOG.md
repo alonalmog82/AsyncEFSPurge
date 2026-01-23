@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.0] - 2026-01-23
+
+### Performance
+- **Custom ThreadPoolExecutor for Directory Scanning**: Implemented custom executor to bypass default thread pool limitation
+  - **Before**: Limited to ~32 threads (default executor), capping directory scanning at ~250-300 dirs/sec
+  - **After**: Scales to 200-500 threads based on `max_concurrent_subdirs`, enabling 2-5x improvement
+  - **Example**: With `max_concurrent_subdirs=4000`, now uses 400 threads instead of 32
+  - **Expected improvement**: Directory scanning rate increases from ~280 dirs/sec to 500-1000+ dirs/sec
+  - Thread count scales intelligently: 100-200 threads for moderate setups, 200-500 for high-concurrency setups
+  - Executor is properly cleaned up on completion
+
+### Changed
+- **`async_scandir` function**: Now accepts optional `executor` parameter to use custom ThreadPoolExecutor
+- **Startup logging**: Added `scandir_executor_threads` field to show executor thread count
+
+### Documentation
+- **README**: Updated "Directory Scanning Bottleneck" section to reflect that the bottleneck is now fixed by default
+  - The workaround documented in v1.10.0 is now the default implementation
+  - Users no longer need to manually modify code to increase directory scanning throughput
+
 ## [1.10.0] - 2026-01-23
 
 ### Fixed

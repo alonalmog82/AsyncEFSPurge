@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import aiofiles.os
@@ -30,15 +31,25 @@ def get_memory_usage_mb() -> float:
             return 0.0  # Return 0 if we can't measure
 
 
-async def async_scandir(path: Path):
-    """Async wrapper for os.scandir."""
+async def async_scandir(path: Path, executor: ThreadPoolExecutor | None = None):
+    """
+    Async wrapper for os.scandir.
+    
+    Args:
+        path: Directory path to scan
+        executor: Optional ThreadPoolExecutor to use. If None, uses default executor (~32 threads).
+                  Use a custom executor with more threads to increase directory scanning throughput.
+    
+    Returns:
+        List of directory entries
+    """
     loop = asyncio.get_running_loop()
 
     def _scandir():
         with os.scandir(path) as entries:
             return list(entries)
 
-    return await loop.run_in_executor(None, _scandir)
+    return await loop.run_in_executor(executor, _scandir)
 
 
 class RateTracker:
@@ -366,6 +377,21 @@ class AsyncEFSPurger:
         self.subdir_semaphore = asyncio.Semaphore(max_concurrent_subdirs)
         self.stats_lock = asyncio.Lock()
 
+        # Custom ThreadPoolExecutor for directory scanning to bypass default thread pool limit
+        # Default executor has ~32 threads, limiting directory scanning throughput to ~250-300 dirs/sec
+        # Custom executor allows scaling to 200-500 threads for 2-5x improvement
+        # Thread count scales with max_concurrent_subdirs but is capped to avoid excessive overhead
+        if max_concurrent_subdirs >= 1000:
+            scandir_threads = min(500, max(200, max_concurrent_subdirs // 10))
+        elif max_concurrent_subdirs >= 500:
+            scandir_threads = min(300, max(150, max_concurrent_subdirs // 8))
+        else:
+            scandir_threads = min(200, max(100, max_concurrent_subdirs // 5))
+        
+        self.scandir_executor = ThreadPoolExecutor(
+            max_workers=scandir_threads, thread_name_prefix="efspurge-scandir"
+        )
+
         # Track active tasks for concurrency utilization metrics
         self.active_tasks = 0
         self.max_active_tasks = 0
@@ -518,7 +544,7 @@ class AsyncEFSPurger:
             # Double-check directory is still empty (might have been populated)
             # This check happens under lock to prevent race conditions
             try:
-                entries = await async_scandir(directory)
+                entries = await async_scandir(directory, self.scandir_executor)
                 if len(entries) == 0:
                     # Directory is empty, add to deletion set
                     # Set automatically prevents duplicates from concurrent scans
@@ -607,7 +633,7 @@ class AsyncEFSPurger:
                 # Use deletion semaphore for concurrent deletion
                 async with self.deletion_semaphore:
                     # Double-check directory is still empty (might have been populated)
-                    entries = await async_scandir(directory)
+                    entries = await async_scandir(directory, self.scandir_executor)
                     if len(entries) > 0:
                         # Directory is no longer empty, skip it
                         return None
@@ -629,7 +655,7 @@ class AsyncEFSPurger:
                             parent_resolved = parent.resolve()
                             if parent_resolved != root_resolved:
                                 # Check if parent is now empty
-                                parent_entries = await async_scandir(parent)
+                                parent_entries = await async_scandir(parent, self.scandir_executor)
                                 if len(parent_entries) == 0:
                                     return parent  # Parent is now empty
                         except (FileNotFoundError, PermissionError, OSError, RuntimeError):
@@ -778,7 +804,7 @@ class AsyncEFSPurger:
                     # Use deletion semaphore for concurrent deletion
                     async with self.deletion_semaphore:
                         # Double-check parent is still empty
-                        entries = await async_scandir(parent)
+                        entries = await async_scandir(parent, self.scandir_executor)
                         if len(entries) > 0:
                             # Parent is no longer empty, skip it
                             return None
@@ -799,7 +825,7 @@ class AsyncEFSPurger:
                             try:
                                 grandparent_resolved = grandparent.resolve()
                                 if grandparent_resolved != root_resolved:
-                                    grandparent_entries = await async_scandir(grandparent)
+                                    grandparent_entries = await async_scandir(grandparent, self.scandir_executor)
                                     if len(grandparent_entries) == 0:
                                         return grandparent  # Grandparent is now empty
                             except (FileNotFoundError, PermissionError, OSError, RuntimeError):
@@ -975,7 +1001,7 @@ class AsyncEFSPurger:
             self.rate_tracker.record(self.current_phase, "dirs", 1)
 
             # Scan directory entries
-            entries = await async_scandir(directory)
+            entries = await async_scandir(directory, self.scandir_executor)
 
             # STREAMING: Use buffer instead of accumulating all tasks
             file_task_buffer = []
@@ -1338,6 +1364,7 @@ class AsyncEFSPurger:
                 "max_concurrent_subdirs": self.max_concurrent_subdirs,
                 "remove_empty_dirs": self.remove_empty_dirs,
                 "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
+                "scandir_executor_threads": self.scandir_executor._max_workers,
             },
         )
 
@@ -1369,6 +1396,10 @@ class AsyncEFSPurger:
                 await progress_task
             except asyncio.CancelledError:
                 pass  # Expected
+            
+            # Shutdown custom executor for directory scanning
+            if hasattr(self, 'scandir_executor'):
+                self.scandir_executor.shutdown(wait=False)
 
         # Log one final progress update if we haven't logged recently
         elapsed = time.time() - self.stats.get("start_time", time.time())

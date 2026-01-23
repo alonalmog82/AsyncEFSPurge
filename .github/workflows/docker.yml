@@ -16,7 +16,7 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
       security-events: write  # Required for uploading SARIF results
       actions: read  # Required for Trivy telemetry

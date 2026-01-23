@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.2] - 2026-01-23
+
+### Fixed
+- **Critical: Memory Check Timing Bug**: Fixed critical bug where memory checks happened BEFORE batches, missing spikes that occurred DURING batch processing
+  - **Root Cause**: Memory spikes occur during `asyncio.gather()` when many concurrent tasks run, but checks happened before batches started
+  - **Impact**: Memory exceeded 168% of limit (3444 MB vs 2048 MB limit) with 0 backpressure events triggered
+  - **Fix**: Memory checks now happen AFTER batch completion to catch spikes
+  - `check_memory_pressure()` now returns `(bool, float)` tuple to enable proactive batch size reduction
+  - Proactive batch size reduction based on memory percentage:
+    - >100%: 75% reduction (aggressive)
+    - >80%: 50% reduction (proactive)
+    - >60%: 25% reduction (moderate)
+  - Batch sizes dynamically adjust based on memory trends
+  - **Expected Impact**: Memory spikes will now be detected and prevented, backpressure events will trigger correctly
+
+### Testing
+- **New Test**: Added `test_memory_checks_happen_after_batches` to verify timing fix
+  - Verifies checks happen AFTER batches (not just before)
+  - Ensures spikes during `asyncio.gather()` are caught
+  - Would have failed with old code, passes with fix
+
 ## [1.12.1] - 2026-01-23
 
 ### Fixed

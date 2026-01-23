@@ -35,15 +35,19 @@ async def test_progress_output_field_order(temp_dir, caplog):
 
     await purger.purge()
 
-    # Find progress update logs
+    # Find progress update logs from scanning phase
     progress_logs = [record for record in caplog.records if "Progress update" in record.message]
+    scanning_logs = [
+        r for r in progress_logs
+        if getattr(r, "extra_fields", {}).get("phase") == "scanning"
+    ]
 
-    if progress_logs:
-        # Get the first progress log's extra_fields
-        first_log = progress_logs[0]
+    if scanning_logs:
+        # Get the first scanning phase log's extra_fields
+        first_log = scanning_logs[0]
         extra_fields = getattr(first_log, "extra_fields", {})
 
-        # Check that core fields exist and are in correct order
+        # Check that core fields exist and are in correct order (for scanning phase)
         # Note: JSON dict order is preserved in Python 3.7+
         expected_order = [
             "elapsed_seconds",

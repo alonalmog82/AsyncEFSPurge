@@ -272,13 +272,14 @@ async def test_memory_checks_happen_after_batches(temp_dir):
 
     async def tracked_gather(*args, **kwargs):
         gather_call_count[0] += 1
-        operation_sequence.append(('gather_start', gather_call_count[0]))
+        operation_sequence.append(("gather_start", gather_call_count[0]))
         result = await original_gather(*args, **kwargs)
-        operation_sequence.append(('gather_end', gather_call_count[0]))
+        operation_sequence.append(("gather_end", gather_call_count[0]))
         return result
 
     # Mock asyncio.gather in the purger module
     import efspurge.purger
+
     original_purger_gather = efspurge.purger.asyncio.gather
     efspurge.purger.asyncio.gather = tracked_gather
 
@@ -289,8 +290,8 @@ async def test_memory_checks_happen_after_batches(temp_dir):
     async def tracked_check():
         check_count[0] += 1
         # Determine if this is before or after a batch by checking recent operations
-        is_after_batch = len(operation_sequence) > 0 and operation_sequence[-1][0] == 'gather_end'
-        operation_sequence.append(('check_after' if is_after_batch else 'check_before', check_count[0]))
+        is_after_batch = len(operation_sequence) > 0 and operation_sequence[-1][0] == "gather_end"
+        operation_sequence.append(("check_after" if is_after_batch else "check_before", check_count[0]))
         return await original_check()
 
     purger.check_memory_pressure = tracked_check
@@ -314,9 +315,9 @@ async def test_memory_checks_happen_after_batches(temp_dir):
     # Look for patterns: gather_end followed by check_after
     checks_after_batches = 0
     for i in range(len(operation_sequence) - 1):
-        if operation_sequence[i][0] == 'gather_end':
+        if operation_sequence[i][0] == "gather_end":
             # Next operation should be a check_after
-            if i + 1 < len(operation_sequence) and operation_sequence[i + 1][0] == 'check_after':
+            if i + 1 < len(operation_sequence) and operation_sequence[i + 1][0] == "check_after":
                 checks_after_batches += 1
 
     assert checks_after_batches > 0, (
@@ -374,6 +375,5 @@ async def test_cascading_deletion_memory_bounded(temp_dir):
 
     # Memory increase should be bounded even with cascading deletion
     assert memory_increase < 300, (
-        f"Cascading deletion caused memory increase of {memory_increase:.1f}MB, "
-        f"which exceeds expected bound of 300MB"
+        f"Cascading deletion caused memory increase of {memory_increase:.1f}MB, which exceeds expected bound of 300MB"
     )

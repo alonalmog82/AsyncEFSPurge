@@ -1,8 +1,4 @@
-"""Tests for memory safety during large-scale empty directory deletion.
-
-These tests verify that empty directory deletion doesn't cause memory explosions
-even with very large numbers of empty directories (100k+).
-"""
+"""Tests for memory safety during empty directory deletion."""
 
 import asyncio
 import os
@@ -18,14 +14,14 @@ from efspurge.purger import AsyncEFSPurger
 
 @pytest.fixture
 def temp_dir():
-    """Create a temporary directory for tests."""
     with tempfile.TemporaryDirectory() as tmpdir:
         yield Path(tmpdir)
 
 
 @pytest.mark.asyncio
 async def test_large_scale_empty_dir_deletion_memory_bounded(temp_dir):
-    """Test that deleting many empty directories doesn't cause memory explosion.
+    """
+    Test that memory stays bounded when deleting large numbers of empty directories.
 
     This test verifies the fix for memory explosion when deleting 100k+ empty directories.
     Before the fix, memory could grow from ~250MB to 1500MB+.
@@ -70,6 +66,7 @@ async def test_large_scale_empty_dir_deletion_memory_bounded(temp_dir):
 
     # Delete empty directories and monitor memory
     deletion_start = time.time()
+
     peak_memory = memory_after_scan
     memory_samples = []
 
@@ -122,7 +119,8 @@ async def test_large_scale_empty_dir_deletion_memory_bounded(temp_dir):
 
 @pytest.mark.asyncio
 async def test_empty_dir_deletion_batch_sizes(temp_dir):
-    """Test that batch sizes are properly limited during empty directory deletion.
+    """
+    Test that batch sizes are properly limited during deletion.
 
     This test verifies that with high concurrency (4000), batch sizes are capped
     to prevent memory explosion. We verify this by checking memory stays bounded
@@ -169,7 +167,6 @@ async def test_empty_dir_deletion_batch_sizes(temp_dir):
         f"Expected small increase with proper batch size limits."
     )
 
-    # Should complete in reasonable time
     assert deletion_time < 30, f"Deletion should complete in reasonable time, took {deletion_time:.2f}s"
 
 
@@ -227,9 +224,106 @@ async def test_empty_dir_deletion_memory_pressure_checks(temp_dir):
         f"(before every batch), but was called {len(check_calls)} times"
     )
 
-    # Verify check_memory_pressure returns boolean
-    assert all(isinstance(result, bool) for result in check_results), (
-        "check_memory_pressure should return boolean values"
+    # Verify check_memory_pressure returns tuple (bool, float)
+    assert all(isinstance(result, tuple) and len(result) == 2 for result in check_results), (
+        "check_memory_pressure should return tuple (bool, float)"
+    )
+    assert all(isinstance(result[0], bool) and isinstance(result[1], (int, float)) for result in check_results), (
+        "check_memory_pressure should return tuple (bool, float)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_memory_checks_happen_after_batches(temp_dir):
+    """
+    Test that memory checks happen AFTER batch completion to catch spikes.
+
+    This test verifies the fix for the bug where memory checks happened BEFORE batches,
+    missing spikes that occurred DURING asyncio.gather().
+
+    We verify this by tracking the order of operations:
+    1. Memory check before batch
+    2. Batch processing (asyncio.gather)
+    3. Memory check after batch (THIS IS THE FIX)
+    """
+    # Create enough directories to require multiple batches
+    num_dirs = 2000
+    for i in range(num_dirs):
+        (temp_dir / f"empty_{i:04d}").mkdir()
+
+    purger = AsyncEFSPurger(
+        root_path=str(temp_dir),
+        max_age_days=30,
+        remove_empty_dirs=True,
+        max_concurrency_deletion=1000,
+        memory_limit_mb=500,
+        max_empty_dirs_to_delete=0,
+        dry_run=False,
+    )
+
+    await purger.scan_directory(temp_dir)
+
+    # Track the sequence of operations
+    operation_sequence = []  # List of ('check_before', 'gather_start', 'gather_end', 'check_after')
+
+    # Track asyncio.gather calls
+    original_gather = asyncio.gather
+    gather_call_count = [0]
+
+    async def tracked_gather(*args, **kwargs):
+        gather_call_count[0] += 1
+        operation_sequence.append(("gather_start", gather_call_count[0]))
+        result = await original_gather(*args, **kwargs)
+        operation_sequence.append(("gather_end", gather_call_count[0]))
+        return result
+
+    # Mock asyncio.gather in the purger module
+    import efspurge.purger
+
+    original_purger_gather = efspurge.purger.asyncio.gather
+    efspurge.purger.asyncio.gather = tracked_gather
+
+    # Track memory check calls
+    check_count = [0]
+    original_check = purger.check_memory_pressure
+
+    async def tracked_check():
+        check_count[0] += 1
+        # Determine if this is before or after a batch by checking recent operations
+        is_after_batch = len(operation_sequence) > 0 and operation_sequence[-1][0] == "gather_end"
+        operation_sequence.append(("check_after" if is_after_batch else "check_before", check_count[0]))
+        return await original_check()
+
+    purger.check_memory_pressure = tracked_check
+
+    try:
+        await purger._remove_empty_directories()
+    finally:
+        # Restore original gather
+        efspurge.purger.asyncio.gather = original_purger_gather
+
+    # Verify deletion completed
+    assert purger.stats["empty_dirs_deleted"] == num_dirs
+
+    # Verify we had multiple batches
+    assert gather_call_count[0] > 0, "Should have processed multiple batches"
+
+    # Verify memory checks happened
+    assert check_count[0] > 0, "Memory checks should have been called"
+
+    # CRITICAL: Verify that checks happen AFTER batches
+    # Look for patterns: gather_end followed by check_after
+    checks_after_batches = 0
+    for i in range(len(operation_sequence) - 1):
+        if operation_sequence[i][0] == "gather_end":
+            # Next operation should be a check_after
+            if i + 1 < len(operation_sequence) and operation_sequence[i + 1][0] == "check_after":
+                checks_after_batches += 1
+
+    assert checks_after_batches > 0, (
+        f"Memory checks should happen AFTER batches to catch spikes. "
+        f"Found {checks_after_batches} checks after batches. "
+        f"Operation sequence sample: {operation_sequence[:20]}"
     )
 
 
@@ -237,20 +331,23 @@ async def test_empty_dir_deletion_memory_pressure_checks(temp_dir):
 async def test_cascading_deletion_memory_bounded(temp_dir):
     """Test that cascading deletion doesn't cause memory explosion."""
     # Create deeply nested empty directory structure
-    # This creates many parents that need cascading deletion
-    depth = 10
-    num_branches = 100  # 100 branches at each level
+    # This tests cascading deletion which can cause memory spikes
+    depth = 5
+    width = 10  # 10^5 = 100k directories (but we'll create less for CI)
 
-    print(f"\nCreating nested structure: {depth} levels, {num_branches} branches...")
-    for branch in range(num_branches):
-        current_path = temp_dir
-        for level in range(depth):
-            current_path = current_path / f"branch_{branch:03d}" / f"level_{level:02d}"
-            current_path.mkdir(parents=True)
+    def create_nested(base, current_depth):
+        if current_depth >= depth:
+            return
+        for i in range(width):
+            subdir = base / f"dir_{i}"
+            subdir.mkdir()
+            create_nested(subdir, current_depth + 1)
 
-    # Count actual directories created (including all parent directories)
-    created = sum(1 for _ in temp_dir.rglob("*") if _.is_dir())
-    print(f"Created {created} directories")
+    create_nested(temp_dir, 0)
+
+    # Count total directories
+    total_dirs = sum(1 for _ in temp_dir.rglob("*") if _.is_dir())
+    print(f"Created {total_dirs} nested directories")
 
     purger = AsyncEFSPurger(
         root_path=str(temp_dir),
@@ -258,37 +355,25 @@ async def test_cascading_deletion_memory_bounded(temp_dir):
         remove_empty_dirs=True,
         max_concurrency_deletion=1000,
         memory_limit_mb=800,
-        max_empty_dirs_to_delete=0,  # Unlimited for this test
+        max_empty_dirs_to_delete=0,
         dry_run=False,
     )
 
-    process = psutil.Process(os.getpid())
-    initial_memory = process.memory_info().rss / 1024 / 1024
-
     await purger.scan_directory(temp_dir)
-    memory_after_scan = process.memory_info().rss / 1024 / 1024
 
-    # Delete empty directories
+    # Monitor memory during cascading deletion
+    process = psutil.Process(os.getpid())
+    memory_before = process.memory_info().rss / 1024 / 1024
+
     await purger._remove_empty_directories()
 
-    final_memory = process.memory_info().rss / 1024 / 1024
-    peak_memory = max(initial_memory, memory_after_scan, final_memory)
-
-    print(
-        f"Memory: Initial={initial_memory:.1f}MB, After scan={memory_after_scan:.1f}MB, "
-        f"Final={final_memory:.1f}MB, Peak={peak_memory:.1f}MB"
-    )
+    memory_after = process.memory_info().rss / 1024 / 1024
+    memory_increase = memory_after - memory_before
 
     # Verify all directories were deleted
-    assert purger.stats["empty_dirs_deleted"] == created, (
-        f"Expected {created} directories deleted, got {purger.stats['empty_dirs_deleted']}"
-    )
+    assert purger.stats["empty_dirs_deleted"] == total_dirs
 
-    # Memory should stay bounded during cascading deletion
-    # Cascading deletion processes parents in batches of max 10k per iteration
-    # Memory increase should be reasonable even with deeply nested structures
-    memory_increase = peak_memory - initial_memory
+    # Memory increase should be bounded even with cascading deletion
     assert memory_increase < 300, (
-        f"Memory increase ({memory_increase:.1f}MB) should be bounded during cascading deletion. "
-        f"Peak: {peak_memory:.1f}MB, Initial: {initial_memory:.1f}MB"
+        f"Cascading deletion caused memory increase of {memory_increase:.1f}MB, which exceeds expected bound of 300MB"
     )

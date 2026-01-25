@@ -500,7 +500,7 @@ class AsyncEFSPurger:
             # Progress logging is handled by _background_progress_reporter()
             # Removed duplicate logging here to prevent duplicate log entries
 
-    async def check_memory_pressure(self) -> bool:
+    async def check_memory_pressure(self) -> tuple[bool, float]:
         """
         Check if memory usage is high and apply back-pressure if needed.
 
@@ -508,10 +508,12 @@ class AsyncEFSPurger:
         to avoid log spam.
 
         Returns:
-            True if memory is above limit (caller should reduce batch sizes), False otherwise
+            Tuple of (is_high: bool, memory_mb: float)
+            - is_high: True if memory is above limit (caller should reduce batch sizes)
+            - memory_mb: Current memory usage in MB (for proactive batch size reduction)
         """
         if self.memory_limit_mb <= 0:
-            return False  # No limit set
+            return False, 0.0  # No limit set
 
         # Use lock to prevent multiple concurrent checks
         async with self.memory_check_lock:
@@ -538,9 +540,9 @@ class AsyncEFSPurger:
 
                 gc.collect()
 
-                return True  # Memory is high, caller should reduce batch sizes
+                return True, memory_mb  # Memory is high, caller should reduce batch sizes
 
-            return False  # Memory is OK
+            return False, memory_mb  # Memory is OK, but return value for proactive reduction
 
     async def process_file(self, file_path: Path) -> None:
         """
@@ -767,15 +769,23 @@ class AsyncEFSPurger:
         i = 0
         while i < len(sorted_dirs):
             # Check memory pressure before EVERY batch to catch spikes early
-            memory_high = await self.check_memory_pressure()
+            memory_high, current_memory_mb = await self.check_memory_pressure()
 
             # Dynamically adjust batch size based on memory pressure
-            # When memory is OK, use larger batches for better performance
-            # When memory is high, reduce batch size to prevent OOM
+            # Use current memory percentage to proactively reduce batch sizes
+            # This prevents spikes even before memory exceeds limit
+            memory_percent = (current_memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
             current_batch_size = max_batch_size
+
             if memory_high:
-                # Reduce batch size by 50% when memory is high
-                current_batch_size = max(20, current_batch_size // 2)
+                # Memory exceeds limit - reduce aggressively
+                current_batch_size = max(10, current_batch_size // 4)  # 75% reduction
+            elif memory_percent > 80:
+                # Memory is high (>80% of limit) - reduce proactively
+                current_batch_size = max(20, current_batch_size // 2)  # 50% reduction
+            elif memory_percent > 60:
+                # Memory is moderate (>60% of limit) - reduce slightly
+                current_batch_size = max(30, int(current_batch_size * 0.75))  # 25% reduction
             # Note: We don't increase batch size above max_batch_size to avoid memory spikes
 
             # Check rate limit and calculate how many we can process
@@ -810,6 +820,16 @@ class AsyncEFSPurger:
             # Process batch concurrently
             tasks = [remove_single_directory(directory) for directory in batch]
             results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Check memory AFTER batch completion to catch spikes that occurred during processing
+            # This is critical because memory spikes happen during asyncio.gather()
+            memory_high_after, memory_after_mb = await self.check_memory_pressure()
+
+            # If memory spiked during batch processing, reduce batch size for next iteration
+            if memory_high_after or (memory_after_mb > self.memory_limit_mb * 0.8):
+                # Reduce batch size for next iteration
+                current_batch_size = max(10, current_batch_size // 2)
+                max_batch_size = min(max_batch_size, current_batch_size)  # Cap max_batch_size too
 
             # Collect parents that became empty and log errors
             # Process results immediately and clear references to free memory
@@ -907,14 +927,22 @@ class AsyncEFSPurger:
             # Process parents concurrently in batches
             # Use smaller batches for cascading deletion to prevent memory explosion
             # Check memory pressure before processing and reduce batch size if needed
-            memory_high = await self.check_memory_pressure()
+            memory_high, current_memory_mb = await self.check_memory_pressure()
 
             # Dynamically adjust batch size based on memory pressure
-            # Start with reasonable batches for cascading deletion (balance performance and memory)
+            # Use current memory percentage to proactively reduce batch sizes
+            memory_percent = (current_memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
             base_batch_size = min(200, max(50, self.max_concurrency_deletion // 10))
+
             if memory_high:
-                # Reduce batch size by 50% when memory is high (less aggressive reduction)
-                base_batch_size = max(20, base_batch_size // 2)
+                # Memory exceeds limit - reduce aggressively
+                base_batch_size = max(10, base_batch_size // 4)  # 75% reduction
+            elif memory_percent > 80:
+                # Memory is high (>80% of limit) - reduce proactively
+                base_batch_size = max(20, base_batch_size // 2)  # 50% reduction
+            elif memory_percent > 60:
+                # Memory is moderate (>60% of limit) - reduce slightly
+                base_batch_size = max(30, int(base_batch_size * 0.75))  # 25% reduction
 
             # Check rate limit before processing batch
             if self.max_empty_dirs_to_delete > 0:
@@ -1000,19 +1028,34 @@ class AsyncEFSPurger:
             batch_size = base_batch_size
             while j < len(parents_to_process):
                 # Check memory before each batch in cascading deletion (more frequent checks)
-                memory_high = await self.check_memory_pressure()
+                memory_high, current_memory_mb = await self.check_memory_pressure()
+                memory_percent = (current_memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
+
                 if memory_high:
                     # Further reduce batch size if memory is still high
+                    batch_size = max(5, batch_size // 2)
+                elif memory_percent > 80:
+                    # Memory is high - reduce batch size
                     batch_size = max(10, batch_size // 2)
-                else:
-                    # Reset to base batch size if memory is OK (allows recovery)
+                elif memory_percent < 50:
+                    # Memory is low - allow recovery to base batch size
                     batch_size = base_batch_size
+                # Otherwise keep current batch_size
 
                 batch = parents_to_process[j : j + batch_size]
                 j += batch_size
 
                 tasks = [remove_parent_directory(parent) for parent in batch]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Check memory AFTER batch completion to catch spikes that occurred during processing
+                memory_high_after, memory_after_mb = await self.check_memory_pressure()
+
+                # If memory spiked during batch processing, reduce batch size for next iteration
+                if memory_high_after or (memory_after_mb > self.memory_limit_mb * 0.8):
+                    # Reduce batch size for next iteration
+                    batch_size = max(5, batch_size // 2)
+                    base_batch_size = min(base_batch_size, batch_size)  # Cap base_batch_size too
 
                 # Collect grandparents that became empty and log errors
                 # Process results immediately and clear references
@@ -1079,7 +1122,7 @@ class AsyncEFSPurger:
             return
 
         # Check memory before processing
-        await self.check_memory_pressure()
+        await self.check_memory_pressure()  # Ignore return value for file batch processing
 
         # Process batch - return_exceptions=True prevents one failure from canceling others
         results = await asyncio.gather(*file_tasks, return_exceptions=True)
@@ -1255,7 +1298,7 @@ class AsyncEFSPurger:
             # Note: If we're already holding the semaphore (recursive call), process directly
             # to avoid deadlock. Otherwise use the semaphore-controlled approach.
             if subdirs:
-                await self.check_memory_pressure()
+                await self.check_memory_pressure()  # Ignore return value for subdir processing
                 # Check if semaphore is available (not held by current task)
                 # If semaphore value equals limit, we're not holding it
                 if self.subdir_semaphore._value == self.max_concurrent_subdirs:

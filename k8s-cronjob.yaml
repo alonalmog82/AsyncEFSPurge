@@ -32,7 +32,7 @@ spec:
           
           containers:
           - name: efspurge
-            image: ghcr.io/alonalmog82/asyncefspurge:1.9.0
+            image: ghcr.io/alonalmog82/asyncefspurge:1.12.1
             imagePullPolicy: IfNotPresent
             
             args:

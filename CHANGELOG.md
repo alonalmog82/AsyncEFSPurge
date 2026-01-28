@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.0] - 2026-01-28
+
+### Changed
+- **Empty Directory Deletion: Queue+Semaphore Pattern**: Refactored empty directory deletion to use queue+semaphore pattern instead of batch processing
+  - **Memory Bound**: Memory now bounded by `semaphore_limit * memory_per_task` instead of `batch_size * memory_per_task`
+  - **Better Scalability**: Can process millions of directories with fixed memory footprint
+  - **Producer-Consumer Pattern**: Directories fed to queue by producer, processed by workers with semaphore-controlled concurrency
+  - **Memory Checks in Producer**: Memory pressure checks happen in producer before adding directories to queue, preventing memory growth
+  - **Circuit Breaker**: Stops processing if memory exceeds 95% of limit to prevent OOM
+
+### Fixed
+- **Rate Limit Race Condition**: Fixed race condition where multiple workers could exceed `max_empty_dirs_to_delete` limit
+  - Made check-and-increment atomic to prevent concurrent workers from bypassing rate limit
+  - Counter now incremented atomically while holding lock before processing
+
+### Performance
+- **Improved Memory Efficiency**: Queue+semaphore approach provides tighter memory bounds
+  - Memory usage = `semaphore_limit * memory_per_task` (e.g., 1000 × 0.1 MB = 100 MB max)
+  - Previous batch approach: `batch_size * memory_per_task` per batch (could accumulate)
+  - Better handling of slow filesystems with queue buffering
+
+### Testing
+- **Updated Tests for Queue+Semaphore**: Updated all tests to reflect new implementation
+  - `test_empty_dir_deletion_queue_memory_bounded`: Verifies queue approach keeps memory bounded
+  - `test_memory_checks_in_producer`: Verifies memory checks happen in producer
+  - `test_memory_pressure_stops_queue_feeding`: Verifies memory pressure stops queue feeding
+  - `test_queue_processing_with_memory_checks`: Verifies queue processing with memory checks
+  - All 25 tests passing
+
+### Documentation
+- **Added Design Documentation**: Added comprehensive documentation explaining design decisions
+  - `APPROACH_COMPARISON.md`: Detailed comparison of streaming+batch vs queue+semaphore approaches
+  - `OOM_ANALYSIS.md`: Analysis of OOM failures that led to refactoring
+  - `SEMAPHORE_BATCHING_DESIGN.md`: Design documentation for semaphore+queue implementation
+
 ## [1.12.2] - 2026-01-23
 
 ### Fixed

@@ -407,6 +407,21 @@ class AsyncEFSPurger:
         self.max_empty_dirs_to_delete = max_empty_dirs_to_delete
         self.max_concurrent_subdirs = max_concurrent_subdirs
 
+        # Warn if unlimited empty directory deletion is enabled (can cause OOM)
+        if self.remove_empty_dirs and self.max_empty_dirs_to_delete == 0:
+            # Estimate safe limit based on memory: ~0.1 MB per directory in memory
+            # Use 70% of memory limit for safety margin
+            estimated_safe_limit = int((self.memory_limit_mb * 0.7) / 0.1) if self.memory_limit_mb > 0 else 50000
+            import warnings
+
+            warnings.warn(
+                f"max_empty_dirs_to_delete=0 (unlimited) can cause OOM with large numbers of empty directories. "
+                f"With memory_limit_mb={self.memory_limit_mb}, consider setting max_empty_dirs_to_delete "
+                f"to a reasonable limit (e.g., {estimated_safe_limit} or less) to prevent unbounded memory growth.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         # Statistics
         self.stats = {
             "files_scanned": 0,
@@ -518,13 +533,22 @@ class AsyncEFSPurger:
         # Use lock to prevent multiple concurrent checks
         async with self.memory_check_lock:
             memory_mb = get_memory_usage_mb()
-            if memory_mb > self.memory_limit_mb:
+
+            # CRITICAL FIX: Trigger back-pressure at 85% threshold to prevent OOM
+            # Memory spikes during asyncio.gather() can push usage from 85% to OOM
+            # before checks can detect it. Triggering at 85% provides safety margin.
+            BACKPRESSURE_THRESHOLD = 0.85  # Trigger at 85% of limit
+            backpressure_threshold_mb = self.memory_limit_mb * BACKPRESSURE_THRESHOLD
+
+            if memory_mb > backpressure_threshold_mb:
                 current_time = time.time()
 
                 # Only log warning once per interval to avoid spam
                 if current_time - self.last_memory_warning >= self.memory_warning_interval:
+                    memory_percent = (memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
                     self.logger.warning(
-                        f"Memory usage ({memory_mb:.1f} MB) exceeds limit ({self.memory_limit_mb} MB), "
+                        f"Memory usage ({memory_mb:.1f} MB, {memory_percent:.1f}%) exceeds back-pressure threshold "
+                        f"({backpressure_threshold_mb:.1f} MB, {BACKPRESSURE_THRESHOLD * 100:.0f}%), "
                         f"applying back-pressure (logged once per {self.memory_warning_interval}s to avoid spam)..."
                     )
                     self.last_memory_warning = current_time
@@ -702,12 +726,15 @@ class AsyncEFSPurger:
                     return None
                 processed_dirs.add(directory)
 
-            # Check rate limit atomically (before processing)
+            # Check rate limit atomically and increment if under limit (atomic check-and-increment)
+            # This prevents race conditions where multiple workers pass the check before any increment
             if self.max_empty_dirs_to_delete > 0:
                 async with self.stats_lock:
                     to_delete_count = self.stats.get("empty_dirs_to_delete", 0)
                     if to_delete_count >= self.max_empty_dirs_to_delete:
                         return None
+                    # Atomically increment counter while holding lock to prevent race condition
+                    self.stats["empty_dirs_to_delete"] = to_delete_count + 1
 
             try:
                 # Normalize directory path for comparison
@@ -718,6 +745,10 @@ class AsyncEFSPurger:
 
                 # Never delete root directory
                 if dir_resolved == root_resolved:
+                    # Decrement counter if we're not processing (root protection)
+                    if self.max_empty_dirs_to_delete > 0:
+                        async with self.stats_lock:
+                            self.stats["empty_dirs_to_delete"] = max(0, self.stats.get("empty_dirs_to_delete", 0) - 1)
                     return None
 
                 # Perform deletion (semaphore only for actual rmdir, not for checks)
@@ -725,12 +756,13 @@ class AsyncEFSPurger:
                 if not self.dry_run:
                     async with self.deletion_semaphore:
                         await aiofiles.os.rmdir(directory)
-                    await self.update_stats(empty_dirs_to_delete=1, empty_dirs_deleted=1)
+                    # Counter already incremented above, just update deleted count
+                    await self.update_stats(empty_dirs_deleted=1)
                     # Record sample for rate tracking
                     self.rate_tracker.record("removing_empty_dirs", "dirs", 1)
                     self.logger.debug(f"Removed empty directory: {directory}")
                 else:
-                    await self.update_stats(empty_dirs_to_delete=1)
+                    # Dry run: counter already incremented above, just log
                     self.logger.debug(f"Would remove empty directory: {directory}")
 
                 # After deleting, check if parent is now empty (outside semaphore for better concurrency)
@@ -748,9 +780,17 @@ class AsyncEFSPurger:
 
             except FileNotFoundError:
                 # Directory was already deleted by another process
+                # Decrement counter since we didn't actually delete it
+                if self.max_empty_dirs_to_delete > 0:
+                    async with self.stats_lock:
+                        self.stats["empty_dirs_to_delete"] = max(0, self.stats.get("empty_dirs_to_delete", 0) - 1)
                 self.logger.debug(f"Empty directory already deleted: {directory}")
             except OSError as e:
                 # Directory might have been populated or permission denied
+                # Decrement counter since we didn't actually delete it
+                if self.max_empty_dirs_to_delete > 0:
+                    async with self.stats_lock:
+                        self.stats["empty_dirs_to_delete"] = max(0, self.stats.get("empty_dirs_to_delete", 0) - 1)
                 log_with_context(
                     self.logger,
                     "warning",
@@ -762,113 +802,159 @@ class AsyncEFSPurger:
             return None
 
         # First pass: Delete all initially empty directories concurrently
-        # Process in batches to avoid creating too many tasks at once
-        # Use smaller batches to prevent memory explosion with large numbers of empty dirs
-        # Batch size scales with concurrency but is capped to prevent OOM
-        max_batch_size = min(200, max(50, self.max_concurrency_deletion // 10))
-        i = 0
-        while i < len(sorted_dirs):
-            # Check memory pressure before EVERY batch to catch spikes early
-            memory_high, current_memory_mb = await self.check_memory_pressure()
+        # DESIGN: Use semaphore + queue pattern to ensure memory is bounded by semaphore limit
+        # - Semaphore limits concurrent I/O operations (prevents filesystem overload)
+        # - Queue holds directories to process (bounded by semaphore limit + small buffer)
+        # - Tasks created on-demand as semaphore slots become available
+        # - Memory usage = semaphore_limit * memory_per_task (not batch_size * memory_per_task)
 
-            # Dynamically adjust batch size based on memory pressure
-            # Use current memory percentage to proactively reduce batch sizes
-            # This prevents spikes even before memory exceeds limit
-            memory_percent = (current_memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
-            current_batch_size = max_batch_size
+        # Circuit breaker: Stop processing if memory exceeds critical threshold
+        CRITICAL_MEMORY_THRESHOLD = 0.95  # 95% of limit - stop processing to prevent OOM
 
-            if memory_high:
-                # Memory exceeds limit - reduce aggressively
-                current_batch_size = max(10, current_batch_size // 4)  # 75% reduction
-            elif memory_percent > 80:
-                # Memory is high (>80% of limit) - reduce proactively
-                current_batch_size = max(20, current_batch_size // 2)  # 50% reduction
-            elif memory_percent > 60:
-                # Memory is moderate (>60% of limit) - reduce slightly
-                current_batch_size = max(30, int(current_batch_size * 0.75))  # 25% reduction
-            # Note: We don't increase batch size above max_batch_size to avoid memory spikes
+        # Use queue to feed directories to workers
+        # Queue size limited to semaphore limit + small buffer to prevent memory growth
+        # This ensures memory is bounded by semaphore, not by total directories
+        queue_maxsize = self.max_concurrency_deletion + 100  # Small buffer for queue
+        directory_queue = asyncio.Queue(maxsize=queue_maxsize)
+        results_queue = asyncio.Queue()
+        stop_event = asyncio.Event()
+        processed_count = 0
+        exceptions_count = 0
 
-            # Check rate limit and calculate how many we can process
-            remaining_slots = None
-            if self.max_empty_dirs_to_delete > 0:
-                async with self.stats_lock:
-                    to_delete_count = self.stats.get("empty_dirs_to_delete", 0)
-                    if to_delete_count >= self.max_empty_dirs_to_delete:
-                        # Count unprocessed directories
-                        unprocessed_count = len(sorted_dirs) - i
-                        log_with_context(
-                            self.logger,
-                            "info",
-                            "Rate limit reached for empty directory deletion",
-                            {
-                                "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
-                                "empty_dirs_to_delete": to_delete_count,
-                                "unprocessed_dirs_in_batch": unprocessed_count,
-                            },
-                        )
-                        break
-                    remaining_slots = self.max_empty_dirs_to_delete - to_delete_count
+        async def worker():
+            """Worker that processes directories from queue, respecting semaphore limit."""
+            nonlocal processed_count, exceptions_count
+            while not stop_event.is_set():
+                try:
+                    # Get directory from queue with timeout to check stop_event
+                    directory = await asyncio.wait_for(directory_queue.get(), timeout=1.0)
 
-            # Limit batch size based on rate limit and memory pressure
-            batch_size = current_batch_size
-            if remaining_slots is not None:
-                batch_size = min(batch_size, remaining_slots)
+                    # Process directory (semaphore limits concurrent operations)
+                    result = await remove_single_directory(directory)
 
-            batch = sorted_dirs[i : i + batch_size]
-            i += batch_size
+                    # Put result in results queue
+                    await results_queue.put(result)
+                    directory_queue.task_done()
+                    processed_count += 1
 
-            # Process batch concurrently
-            tasks = [remove_single_directory(directory) for directory in batch]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+                except asyncio.TimeoutError:
+                    # Timeout allows checking stop_event
+                    continue
+                except Exception as e:
+                    exceptions_count += 1
+                    self.logger.debug(f"Exception in worker: {e}", exc_info=e)
+                    await self.update_stats(errors=1)
+                    directory_queue.task_done()
 
-            # Check memory AFTER batch completion to catch spikes that occurred during processing
-            # This is critical because memory spikes happen during asyncio.gather()
-            memory_high_after, memory_after_mb = await self.check_memory_pressure()
+        # Start workers (number limited by semaphore - workers wait for semaphore slots)
+        # Number of workers = semaphore limit ensures we use all available concurrency
+        # Memory bounded by: num_workers * memory_per_task = semaphore_limit * memory_per_task
+        num_workers = self.max_concurrency_deletion
+        workers = [asyncio.create_task(worker()) for _ in range(num_workers)]
 
-            # If memory spiked during batch processing, reduce batch size for next iteration
-            if memory_high_after or (memory_after_mb > self.memory_limit_mb * 0.8):
-                # Reduce batch size for next iteration
-                current_batch_size = max(10, current_batch_size // 2)
-                max_batch_size = min(max_batch_size, current_batch_size)  # Cap max_batch_size too
+        # Producer: Feed directories to queue in batches, checking memory/rate limits
+        async def producer():
+            """Producer that feeds directories to queue, respecting memory and rate limits."""
+            i = 0
+            while i < len(sorted_dirs):  # noqa: F821
+                # Check memory pressure before adding more to queue
+                memory_high, current_memory_mb = await self.check_memory_pressure()
 
-            # Collect parents that became empty and log errors
-            # Process results immediately and clear references to free memory
-            exceptions_count = 0
-            batch_new_parents = []
-            for result in results:
+                # Circuit breaker: Stop if memory is critical
+                memory_percent = (current_memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
+                if memory_percent > CRITICAL_MEMORY_THRESHOLD * 100:
+                    async with self.stats_lock:
+                        deleted_count = self.stats.get("empty_dirs_deleted", 0)
+                    self.logger.error(
+                        f"CRITICAL: Memory usage ({memory_percent:.1f}%, {current_memory_mb:.1f} MB) exceeds "
+                        f"critical threshold ({CRITICAL_MEMORY_THRESHOLD * 100:.0f}%). "
+                        f"Stopping empty directory deletion to prevent OOM. "
+                        f"Processed {i} directories, deleted {deleted_count} before stopping."
+                    )
+                    stop_event.set()
+                    break
+
+                # Check rate limit
+                if self.max_empty_dirs_to_delete > 0:
+                    async with self.stats_lock:
+                        to_delete_count = self.stats.get("empty_dirs_to_delete", 0)
+                        if to_delete_count >= self.max_empty_dirs_to_delete:
+                            unprocessed_count = len(sorted_dirs) - i  # noqa: F821
+                            log_with_context(
+                                self.logger,
+                                "info",
+                                "Rate limit reached for empty directory deletion",
+                                {
+                                    "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
+                                    "empty_dirs_to_delete": to_delete_count,
+                                    "unprocessed_dirs_in_batch": unprocessed_count,
+                                },
+                            )
+                            stop_event.set()
+                            break
+
+                # Add directory to queue (will block if queue is full, preventing memory growth)
+                # Queue size is bounded, so memory is controlled
+                try:
+                    await directory_queue.put(sorted_dirs[i])  # noqa: F821
+                    i += 1
+                except Exception:
+                    # Queue closed or error
+                    break
+
+        # Start producer
+        producer_task = asyncio.create_task(producer())
+
+        # Collect results as they complete
+        new_parents_collected = 0
+        while True:
+            # Check if we're done (producer finished and queue empty)
+            if producer_task.done() and directory_queue.empty() and results_queue.empty():
+                # Wait a bit for any remaining work
+                await asyncio.sleep(0.1)
+                if directory_queue.empty() and results_queue.empty():
+                    break
+
+            # Get result from queue (with timeout to check completion)
+            try:
+                result = await asyncio.wait_for(results_queue.get(), timeout=1.0)
+
                 if isinstance(result, Exception):
                     exceptions_count += 1
                     self.logger.debug(f"Exception during directory deletion: {result}", exc_info=result)
                     await self.update_stats(errors=1)
-                    continue
-                if result is not None:  # Parent became empty
-                    batch_new_parents.append(result)
+                elif result is not None:  # Parent became empty
+                    async with new_empty_parents_lock:
+                        new_empty_parents.add(result)
+                    new_parents_collected += 1
 
-            # Add new parents to set (single lock acquisition)
-            if batch_new_parents:
-                async with new_empty_parents_lock:
-                    new_empty_parents.update(batch_new_parents)
+                results_queue.task_done()
 
-            # Clear references immediately to help GC
-            del tasks, results, batch_new_parents
-            batch_new_parents = None
+            except asyncio.TimeoutError:
+                # Check if producer is done and queue is empty
+                if producer_task.done() and directory_queue.empty():
+                    # Wait a bit more for workers to finish
+                    await asyncio.sleep(0.5)
+                    if results_queue.empty():
+                        break
+                continue
 
-            # Log progress periodically during first pass (every 10 batches or every 10k dirs)
-            async with self.stats_lock:
-                deleted_count = self.stats.get("empty_dirs_deleted", 0)
-                total_processed = i
-            if total_processed % 10000 == 0 or (exceptions_count > 0 and self.logger.isEnabledFor(logging.WARNING)):
-                log_with_context(
-                    self.logger,
-                    "info" if exceptions_count == 0 else "warning",
-                    "Empty directory removal batch progress",
-                    {
-                        "processed": total_processed,
-                        "total": len(sorted_dirs),
-                        "deleted": deleted_count,
-                        "exceptions_in_batch": exceptions_count,
-                    },
-                )
+        # Wait for producer to complete
+        try:
+            await producer_task
+        except Exception as e:
+            self.logger.debug(f"Producer exception: {e}", exc_info=e)
+
+        # Signal workers to stop
+        stop_event.set()
+
+        # Wait for workers to finish current work
+        await directory_queue.join()  # Wait for all tasks to be processed
+
+        # Cancel workers
+        for worker_task in workers:
+            worker_task.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
 
         # Log progress after first pass
         async with self.stats_lock:
@@ -877,7 +963,14 @@ class AsyncEFSPurger:
             self.logger,
             "info",
             "Empty directory removal progress",
-            {"empty_dirs_deleted": deleted_count, "phase": "first_pass"},
+            {
+                "processed": processed_count,
+                "total": len(sorted_dirs),
+                "deleted": deleted_count,
+                "exceptions": exceptions_count,
+                "new_parents_found": new_parents_collected,
+                "phase": "first_pass",
+            },
         )
 
         # Free memory: clear sorted_dirs reference after first pass
@@ -924,32 +1017,26 @@ class AsyncEFSPurger:
                     },
                 )
 
-            # Process parents concurrently in batches
-            # Use smaller batches for cascading deletion to prevent memory explosion
-            # Check memory pressure before processing and reduce batch size if needed
+            # Check memory pressure and rate limit before processing
             memory_high, current_memory_mb = await self.check_memory_pressure()
-
-            # Dynamically adjust batch size based on memory pressure
-            # Use current memory percentage to proactively reduce batch sizes
             memory_percent = (current_memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
-            base_batch_size = min(200, max(50, self.max_concurrency_deletion // 10))
 
-            if memory_high:
-                # Memory exceeds limit - reduce aggressively
-                base_batch_size = max(10, base_batch_size // 4)  # 75% reduction
-            elif memory_percent > 80:
-                # Memory is high (>80% of limit) - reduce proactively
-                base_batch_size = max(20, base_batch_size // 2)  # 50% reduction
-            elif memory_percent > 60:
-                # Memory is moderate (>60% of limit) - reduce slightly
-                base_batch_size = max(30, int(base_batch_size * 0.75))  # 25% reduction
+            # Circuit breaker: Stop if memory is critical
+            if memory_percent > CRITICAL_MEMORY_THRESHOLD * 100:
+                async with self.stats_lock:
+                    deleted_count = self.stats.get("empty_dirs_deleted", 0)
+                self.logger.error(
+                    f"CRITICAL: Memory usage ({memory_percent:.1f}%, {current_memory_mb:.1f} MB) exceeds "
+                    f"critical threshold ({CRITICAL_MEMORY_THRESHOLD * 100:.0f}%) during cascading deletion. "
+                    f"Stopping to prevent OOM. Deleted {deleted_count} directories before stopping."
+                )
+                break  # Stop processing to prevent OOM
 
-            # Check rate limit before processing batch
+            # Check rate limit before processing
             if self.max_empty_dirs_to_delete > 0:
                 async with self.stats_lock:
                     to_delete_count = self.stats.get("empty_dirs_to_delete", 0)
                     if to_delete_count >= self.max_empty_dirs_to_delete:
-                        # Count unprocessed parents
                         unprocessed_count = len(parents_to_process)
                         log_with_context(
                             self.logger,
@@ -1020,81 +1107,106 @@ class AsyncEFSPurger:
 
                 return None
 
-            # Process batch concurrently
-            # Use smaller batches to prevent memory explosion
-            # Use the dynamically adjusted batch size based on memory pressure
-            # Use while loop to allow dynamic batch size adjustment
-            j = 0
-            batch_size = base_batch_size
-            while j < len(parents_to_process):
-                # Check memory before each batch in cascading deletion (more frequent checks)
-                memory_high, current_memory_mb = await self.check_memory_pressure()
-                memory_percent = (current_memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
+            # Use semaphore+queue pattern for cascading deletion (same as first pass)
+            # Memory bounded by semaphore limit, not batch size
+            queue_maxsize = self.max_concurrency_deletion + 100
+            parent_queue = asyncio.Queue(maxsize=queue_maxsize)
+            results_queue = asyncio.Queue()
+            stop_event = asyncio.Event()
+            processed_count = 0
+            exceptions_count = 0
 
-                if memory_high:
-                    # Further reduce batch size if memory is still high
-                    batch_size = max(5, batch_size // 2)
-                elif memory_percent > 80:
-                    # Memory is high - reduce batch size
-                    batch_size = max(10, batch_size // 2)
-                elif memory_percent < 50:
-                    # Memory is low - allow recovery to base batch size
-                    batch_size = base_batch_size
-                # Otherwise keep current batch_size
+            async def parent_worker():
+                """Worker that processes parent directories from queue, respecting semaphore limit."""
+                nonlocal processed_count, exceptions_count
+                while not stop_event.is_set():
+                    try:
+                        parent = await asyncio.wait_for(parent_queue.get(), timeout=1.0)
+                        result = await remove_parent_directory(parent)
+                        await results_queue.put(result)
+                        parent_queue.task_done()
+                        processed_count += 1
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception as e:
+                        exceptions_count += 1
+                        self.logger.debug(f"Exception in parent worker: {e}", exc_info=e)
+                        await self.update_stats(errors=1)
+                        parent_queue.task_done()
 
-                batch = parents_to_process[j : j + batch_size]
-                j += batch_size
+            # Start workers (number limited by semaphore)
+            num_workers = self.max_concurrency_deletion
+            workers = [asyncio.create_task(parent_worker()) for _ in range(num_workers)]
 
-                tasks = [remove_parent_directory(parent) for parent in batch]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Producer: Feed parents to queue
+            async def parent_producer():
+                """Producer that feeds parent directories to queue."""
+                for parent in parents_to_process:
+                    if stop_event.is_set():
+                        break
+                    try:
+                        await parent_queue.put(parent)
+                    except Exception:
+                        break
 
-                # Check memory AFTER batch completion to catch spikes that occurred during processing
-                memory_high_after, memory_after_mb = await self.check_memory_pressure()
+            producer_task = asyncio.create_task(parent_producer())
 
-                # If memory spiked during batch processing, reduce batch size for next iteration
-                if memory_high_after or (memory_after_mb > self.memory_limit_mb * 0.8):
-                    # Reduce batch size for next iteration
-                    batch_size = max(5, batch_size // 2)
-                    base_batch_size = min(base_batch_size, batch_size)  # Cap base_batch_size too
+            # Collect results as they complete
+            new_grandparents_collected = 0
+            while True:
+                if producer_task.done() and parent_queue.empty() and results_queue.empty():
+                    await asyncio.sleep(0.1)
+                    if parent_queue.empty() and results_queue.empty():
+                        break
 
-                # Collect grandparents that became empty and log errors
-                # Process results immediately and clear references
-                exceptions_count = 0
-                batch_new_grandparents = []
-                for result in results:
+                try:
+                    result = await asyncio.wait_for(results_queue.get(), timeout=1.0)
                     if isinstance(result, Exception):
                         exceptions_count += 1
-                        self.logger.debug(f"Exception during parent directory deletion: {result}", exc_info=result)
+                        self.logger.debug(f"Exception during parent deletion: {result}", exc_info=result)
                         await self.update_stats(errors=1)
-                        continue
-                    if result is not None:  # Grandparent became empty
-                        batch_new_grandparents.append(result)
+                    elif result is not None:  # Grandparent became empty
+                        async with new_empty_parents_lock:
+                            new_empty_parents.add(result)
+                        new_grandparents_collected += 1
+                    results_queue.task_done()
+                except asyncio.TimeoutError:
+                    if producer_task.done() and parent_queue.empty():
+                        await asyncio.sleep(0.5)
+                        if results_queue.empty():
+                            break
+                    continue
 
-                # Add new grandparents to set (single lock acquisition)
-                if batch_new_grandparents:
-                    async with new_empty_parents_lock:
-                        new_empty_parents.update(batch_new_grandparents)
+            # Wait for producer and workers
+            try:
+                await producer_task
+            except Exception as e:
+                self.logger.debug(f"Parent producer exception: {e}", exc_info=e)
 
-                # Clear references immediately to help GC
-                del tasks, results, batch_new_grandparents
-                batch_new_grandparents = None
+            stop_event.set()
+            await parent_queue.join()
 
-                # Log progress periodically during cascading deletion
-                if exceptions_count > 0 and self.logger.isEnabledFor(logging.WARNING):
-                    async with self.stats_lock:
-                        deleted_count = self.stats.get("empty_dirs_deleted", 0)
-                    log_with_context(
-                        self.logger,
-                        "warning",
-                        "Exceptions during cascading deletion batch",
-                        {
-                            "iteration": iteration,
-                            "batch_processed": j + len(batch),
-                            "total_parents": len(parents_to_process),
-                            "deleted": deleted_count,
-                            "exceptions_in_batch": exceptions_count,
-                        },
-                    )
+            for worker_task in workers:
+                worker_task.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+
+            # Log progress for this iteration
+            if exceptions_count > 0 or new_grandparents_collected > 0:
+                async with self.stats_lock:
+                    deleted_count = self.stats.get("empty_dirs_deleted", 0)
+                log_with_context(
+                    self.logger,
+                    "info" if exceptions_count == 0 else "warning",
+                    "Cascading deletion iteration progress",
+                    {
+                        "iteration": iteration,
+                        "processed": processed_count,
+                        "total_parents": len(parents_to_process),
+                        "deleted": deleted_count,
+                        "exceptions": exceptions_count,
+                        "new_grandparents_found": new_grandparents_collected,
+                    },
+                )
 
         # Log completion
         async with self.stats_lock:

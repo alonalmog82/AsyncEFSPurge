@@ -146,7 +146,7 @@ async def test_per_phase_rate_tracking(temp_dir):
 
     purger = AsyncEFSPurger(
         root_path=str(temp_dir),
-        max_age_days=0,  # All files are old
+        max_age_days=30,  # Use non-zero to ensure files are scanned
         dry_run=True,
         log_level="DEBUG",
     )
@@ -173,7 +173,7 @@ async def test_peak_rate_tracking(temp_dir):
 
     purger = AsyncEFSPurger(
         root_path=str(temp_dir),
-        max_age_days=0,
+        max_age_days=30,
         dry_run=True,
         max_concurrency_scanning=1000,
         max_concurrency_deletion=1000,
@@ -204,7 +204,7 @@ async def test_time_windowed_rates(temp_dir):
 
     purger = AsyncEFSPurger(
         root_path=str(temp_dir),
-        max_age_days=0,
+        max_age_days=30,
         dry_run=True,
         max_concurrency_scanning=10,  # Lower concurrency to make it slower
         max_concurrency_deletion=10,
@@ -231,7 +231,7 @@ async def test_progress_logs_include_rate_metrics(temp_dir, caplog):
 
     purger = AsyncEFSPurger(
         root_path=str(temp_dir),
-        max_age_days=0,
+        max_age_days=30,
         dry_run=True,
         max_concurrency_scanning=100,
         max_concurrency_deletion=100,
@@ -285,7 +285,7 @@ async def test_deletion_rate_tracking(temp_dir):
 
     purger = AsyncEFSPurger(
         root_path=str(temp_dir),
-        max_age_days=0,  # All files are old
+        max_age_days=30,  # All files are old
         dry_run=False,  # Actually delete
     )
 
@@ -308,7 +308,7 @@ async def test_concurrency_metrics_tracking(temp_dir):
 
     purger = AsyncEFSPurger(
         root_path=str(temp_dir),
-        max_age_days=0,
+        max_age_days=30,
         dry_run=True,
         max_concurrency_scanning=50,  # Lower concurrency to see utilization
         max_concurrency_deletion=50,
@@ -336,7 +336,7 @@ async def test_concurrency_metrics_in_progress_logs(temp_dir, caplog):
 
     purger = AsyncEFSPurger(
         root_path=str(temp_dir),
-        max_age_days=0,
+        max_age_days=30,
         dry_run=True,
         max_concurrency_scanning=100,
         max_concurrency_deletion=100,
@@ -365,7 +365,7 @@ async def test_concurrency_utilization_calculation(temp_dir):
 
     purger = AsyncEFSPurger(
         root_path=str(temp_dir),
-        max_age_days=0,
+        max_age_days=30,
         dry_run=True,
         max_concurrency_scanning=20,  # Low concurrency to see utilization
         max_concurrency_deletion=20,
@@ -391,7 +391,7 @@ async def test_active_tasks_counter(temp_dir):
     """Test that active_tasks counter increments and decrements correctly."""
     purger = AsyncEFSPurger(
         root_path=str(temp_dir),
-        max_age_days=0,
+        max_age_days=30,
         dry_run=True,
         max_concurrency_scanning=10,
         max_concurrency_deletion=10,

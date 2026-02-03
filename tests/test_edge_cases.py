@@ -257,7 +257,7 @@ async def test_max_age_days_zero_skips_file_processing(temp_dir):
     # Create some files
     for i in range(10):
         (temp_dir / f"file{i}.txt").write_text(f"content{i}")
-    
+
     # Create empty directory
     empty_dir = temp_dir / "empty_dir"
     empty_dir.mkdir()
@@ -274,10 +274,10 @@ async def test_max_age_days_zero_skips_file_processing(temp_dir):
     # Files should NOT be scanned (no os.stat calls)
     assert purger.stats["files_scanned"] == 0
     assert purger.stats["files_purged"] == 0
-    
+
     # But directories should still be scanned
     assert purger.stats["dirs_scanned"] >= 1
-    
+
     # Empty directory should be found and marked for deletion
     assert len(purger.empty_dirs) >= 1
 

@@ -279,9 +279,15 @@ async def test_empty_dir_rate_tracking(temp_dir):
 @pytest.mark.asyncio
 async def test_deletion_rate_tracking(temp_dir):
     """Test that file deletion rates are tracked."""
+    import os
+    import time
+
     # Create old files
+    old_time = time.time() - (31 * 86400)  # 31 days ago
     for i in range(20):
-        (temp_dir / f"old_file_{i}.txt").write_text("test")
+        file_path = temp_dir / f"old_file_{i}.txt"
+        file_path.write_text("test")
+        os.utime(file_path, (old_time, old_time))
 
     purger = AsyncEFSPurger(
         root_path=str(temp_dir),

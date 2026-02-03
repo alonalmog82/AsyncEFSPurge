@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.13.1] - 2026-01-28
+
+### Performance
+- **Skip File Processing When max-age-days=0**: Optimized empty directory deletion mode to skip file processing entirely
+  - When `--max-age-days=0`, files are no longer scanned (no `os.stat()` calls)
+  - Significantly improves performance when only deleting empty directories
+  - Reduces I/O operations and memory usage for empty directory cleanup operations
+  - Use case: Run `efspurge /path --max-age-days 0 --remove-empty-dirs` to delete empty directories without processing files
+
 ## [1.13.0] - 2026-01-28
 
 ### Changed

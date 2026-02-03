@@ -25,7 +25,10 @@ def parse_args() -> argparse.Namespace:
         "--max-age-days",
         type=float,
         default=float(os.getenv("EFSPURGE_MAX_AGE_DAYS", "30.0")),
-        help="Files older than this (in days) will be purged",
+        help=(
+            "Files older than this (in days) will be purged. "
+            "Use 0 to skip file processing entirely (useful for empty directory deletion only)"
+        ),
     )
 
     # Backward compatibility: if EFSPURGE_MAX_CONCURRENCY is set, use it for both

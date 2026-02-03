@@ -1369,14 +1369,18 @@ class AsyncEFSPurger:
 
                     # Handle files with streaming buffer
                     if entry.is_file(follow_symlinks=False):
-                        file_task_buffer.append(self.process_file(entry_path))
+                        # Skip file processing entirely when max_age_days=0 (empty dir deletion only)
+                        # This avoids expensive os.stat() calls when we only want to delete empty directories
+                        if self.max_age_days > 0:
+                            file_task_buffer.append(self.process_file(entry_path))
 
-                        # STREAMING: Process and clear buffer when it reaches batch size
-                        if len(file_task_buffer) >= self.task_batch_size:
-                            try:
-                                await self._process_file_batch(file_task_buffer)
-                            finally:
-                                file_task_buffer.clear()  # Always clear, even on exception
+                            # STREAMING: Process and clear buffer when it reaches batch size
+                            if len(file_task_buffer) >= self.task_batch_size:
+                                try:
+                                    await self._process_file_batch(file_task_buffer)
+                                finally:
+                                    file_task_buffer.clear()  # Always clear, even on exception
+                        # else: max_age_days == 0, skip file processing (no os.stat calls)
 
                     elif entry.is_dir(follow_symlinks=False):
                         subdirs.append(entry_path)

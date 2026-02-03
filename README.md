@@ -85,7 +85,7 @@ positional arguments:
   path                  Root path to scan and purge
 
 options:
-  --max-age-days DAYS       Files older than this (in days) will be purged (default: 30.0)
+  --max-age-days DAYS       Files older than this (in days) will be purged (default: 30.0). Use 0 to skip file processing entirely (useful for empty directory deletion only)
   --max-concurrency N       [DEPRECATED] Maximum concurrent async operations (use --max-concurrency-scanning/deletion)
   --max-concurrency-scanning N  Maximum concurrent file scanning (stat) operations (default: 1000)
   --max-concurrency-deletion N  Maximum concurrent file deletion (remove) operations (default: 1000)
@@ -137,6 +137,13 @@ efspurge /mnt/efs --max-age-days 30 --remove-empty-dirs --max-empty-dirs-to-dele
 
 # Custom rate limit: 100 directories per run for very gradual cleanup
 efspurge /mnt/efs --max-age-days 30 --remove-empty-dirs --max-empty-dirs-to-delete 100
+```
+
+**Empty directory deletion only (skip file processing):**
+```bash
+# Use max-age-days=0 to skip file processing entirely - only delete empty directories
+# This avoids expensive os.stat() calls on files and is much faster for deep directory structures
+efspurge /mnt/efs --max-age-days 0 --remove-empty-dirs --max-concurrent-subdirs 20
 ```
 
 ## Deployment

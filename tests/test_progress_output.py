@@ -24,7 +24,7 @@ async def test_progress_output_field_order(temp_dir, caplog):
 
     purger = AsyncEFSPurger(
         root_path=str(temp_dir),
-        max_age_days=0,
+        max_age_days=30,
         dry_run=True,
         log_level="INFO",
     )
@@ -74,7 +74,7 @@ async def test_debug_metrics_only_in_debug_mode(temp_dir, caplog):
     # Test with INFO level (should NOT show debug metrics)
     purger_info = AsyncEFSPurger(
         root_path=str(temp_dir),
-        max_age_days=0,
+        max_age_days=30,
         dry_run=True,
         log_level="INFO",
     )
@@ -106,7 +106,7 @@ async def test_debug_metrics_only_in_debug_mode(temp_dir, caplog):
     caplog.clear()
     purger_debug = AsyncEFSPurger(
         root_path=str(temp_dir),
-        max_age_days=0,
+        max_age_days=30,
         dry_run=True,
         log_level="DEBUG",
     )
@@ -143,7 +143,7 @@ async def test_static_fields_not_in_progress_logs(temp_dir, caplog):
 
     purger = AsyncEFSPurger(
         root_path=str(temp_dir),
-        max_age_days=0,
+        max_age_days=30,
         dry_run=True,
         log_level="INFO",
         memory_limit_mb=800,
@@ -183,7 +183,7 @@ async def test_core_fields_always_present(temp_dir, caplog):
 
     purger = AsyncEFSPurger(
         root_path=str(temp_dir),
-        max_age_days=0,
+        max_age_days=30,
         dry_run=True,
         log_level="INFO",
     )

@@ -178,6 +178,9 @@ async def test_empty_dir_deletion_memory_pressure_checks(temp_dir):
     With queue+semaphore approach, memory checks happen in the producer before adding
     directories to the queue. This prevents memory growth by stopping queue feeding
     when memory is high.
+
+    With incremental processing, directories may be deleted during scanning, so the
+    final pass may have fewer directories to process.
     """
     # Create many empty directories - enough to trigger multiple memory checks
     # Producer checks memory before adding each directory to queue
@@ -196,6 +199,9 @@ async def test_empty_dir_deletion_memory_pressure_checks(temp_dir):
         max_empty_dirs_to_delete=0,  # Unlimited for this test
         dry_run=False,
     )
+
+    # Disable incremental processing to test final pass behavior
+    purger.empty_dirs_count_threshold = float("inf")  # Never trigger incremental processing
 
     await purger.scan_directory(temp_dir)
 
@@ -296,7 +302,11 @@ async def test_memory_checks_in_producer(temp_dir):
 
 @pytest.mark.asyncio
 async def test_cascading_deletion_memory_bounded(temp_dir):
-    """Test that cascading deletion doesn't cause memory explosion."""
+    """Test that cascading deletion doesn't cause memory explosion.
+
+    With incremental processing, some directories may be deleted during scanning,
+    so we check total deleted count across both incremental and final passes.
+    """
     # Create deeply nested empty directory structure
     # This tests cascading deletion which can cause memory spikes
     depth = 5
@@ -326,19 +336,32 @@ async def test_cascading_deletion_memory_bounded(temp_dir):
         dry_run=False,
     )
 
+    # Disable incremental processing to test the full cascading deletion behavior
+    purger.empty_dirs_count_threshold = float("inf")  # Never trigger incremental processing
+
     await purger.scan_directory(temp_dir)
 
     # Monitor memory during cascading deletion
     process = psutil.Process(os.getpid())
     memory_before = process.memory_info().rss / 1024 / 1024
 
+    # Track incremental processing
+    incremental_deleted = purger.stats.get("empty_dirs_deleted", 0)
+    print(f"Deleted during incremental processing: {incremental_deleted}")
+
     await purger._remove_empty_directories()
 
     memory_after = process.memory_info().rss / 1024 / 1024
     memory_increase = memory_after - memory_before
 
-    # Verify all directories were deleted
-    assert purger.stats["empty_dirs_deleted"] == total_dirs
+    # Total deleted includes both incremental and final pass
+    total_deleted = purger.stats["empty_dirs_deleted"]
+    print(f"Total deleted (incremental + final): {total_deleted}")
+
+    # Verify all directories were deleted (allowing for incremental processing)
+    assert total_deleted == total_dirs, (
+        f"Expected {total_dirs} directories to be deleted, but {total_deleted} were deleted"
+    )
 
     # Memory increase should be bounded even with cascading deletion
     assert memory_increase < 300, (

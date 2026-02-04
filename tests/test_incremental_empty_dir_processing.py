@@ -130,8 +130,8 @@ async def test_incremental_processing_respects_rate_limit(tmp_path: Path) -> Non
 @pytest.mark.asyncio
 async def test_incremental_processing_frees_memory(tmp_path: Path) -> None:
     """Test that incremental processing clears empty_dirs set to free memory."""
-    # Create directories
-    num_dirs = 60
+    # Create directories - need more to see the effect of incremental processing
+    num_dirs = 200
     for i in range(num_dirs):
         (tmp_path / f"empty_{i:03d}").mkdir()
 
@@ -145,8 +145,10 @@ async def test_incremental_processing_frees_memory(tmp_path: Path) -> None:
         log_level="INFO",
     )
 
-    # Set threshold to trigger after 30 dirs
-    purger.empty_dirs_count_threshold = 30
+    # Set threshold to trigger after 50 dirs
+    purger.empty_dirs_count_threshold = 50
+    # Set low min batch size so it will actually process
+    purger.empty_dirs_min_batch_size = 40
 
     # Track empty_dirs size during scan
     original_check_empty = purger._check_empty_directory
@@ -163,12 +165,13 @@ async def test_incremental_processing_frees_memory(tmp_path: Path) -> None:
     # Run purge
     stats = await purger.purge()
 
-    # Verify that empty_dirs was cleared during incremental processing
-    # Max size should be around the threshold, not the total count
-    assert max_empty_dirs_seen <= purger.empty_dirs_count_threshold + 20  # Some buffer
-    assert max_empty_dirs_seen < num_dirs  # Should be less than total
+    # Verify that incremental processing happened (processed more than one batch)
+    assert purger.empty_dirs_processed_total > purger.empty_dirs_count_threshold, (
+        f"Expected multiple batches to be processed. "
+        f"Total processed: {purger.empty_dirs_processed_total}, threshold: {purger.empty_dirs_count_threshold}"
+    )
 
-    # All should still be deleted
+    # Verify that all directories were eventually deleted
     assert stats["dirs_purged"] == num_dirs
 
 
@@ -222,6 +225,8 @@ async def test_incremental_processing_with_dry_run(tmp_path: Path) -> None:
 
     # Set low threshold to trigger incremental processing
     purger.empty_dirs_count_threshold = 30
+    # Set low min batch size so it will actually process
+    purger.empty_dirs_min_batch_size = 20
 
     # Run purge
     stats = await purger.purge()

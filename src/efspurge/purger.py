@@ -470,6 +470,8 @@ class AsyncEFSPurger:
         # Calculate safe count threshold: ~0.1 MB per directory path in memory
         # Use 50% of memory for empty_dirs to leave room for other operations
         self.empty_dirs_count_threshold = int((self.memory_limit_mb * 0.5) / 0.1) if self.memory_limit_mb > 0 else 50000
+        # Minimum batch size to process (prevents thrashing with tiny batches)
+        self.empty_dirs_min_batch_size = 100  # Don't process batches smaller than this
 
         # Concurrency control - separate semaphores for scanning and deletion
         self.scanning_semaphore = asyncio.Semaphore(max_concurrency_scanning)
@@ -477,6 +479,10 @@ class AsyncEFSPurger:
         # Semaphore for subdirectory scanning to maintain constant concurrency
         self.subdir_semaphore = asyncio.Semaphore(max_concurrent_subdirs)
         self.stats_lock = asyncio.Lock()
+
+        # Lock to prevent concurrent incremental batch processing
+        # This prevents race conditions where multiple scan tasks trigger processing simultaneously
+        self.empty_dirs_batch_processing_lock = asyncio.Lock()
 
         # Custom ThreadPoolExecutor for directory scanning to bypass default thread pool limit
         # Default executor has ~32 threads, limiting directory scanning throughput to ~250-300 dirs/sec
@@ -640,12 +646,15 @@ class AsyncEFSPurger:
             async with self.active_tasks_lock:
                 self.active_tasks -= 1
 
-    async def _should_process_empty_dirs_incrementally(self) -> tuple[bool, int, float]:
+    async def _should_process_empty_dirs_incrementally(self, log_trigger: bool = False) -> tuple[bool, int, float]:
         """
         Check if we should process empty directories incrementally during scanning.
 
         This prevents unbounded memory growth by processing empty directories in batches
         when memory or count thresholds are exceeded.
+
+        Args:
+            log_trigger: If True, log the trigger message. Set to True only when actually processing.
 
         Returns:
             Tuple of (should_process, empty_dirs_count, memory_mb):
@@ -672,10 +681,15 @@ class AsyncEFSPurger:
         # Check count threshold
         count_exceeded = empty_dirs_count > self.empty_dirs_count_threshold
 
-        # Process if either threshold is exceeded
-        should_process = memory_exceeded or count_exceeded
+        # Check minimum batch size
+        # Only process if batch is large enough OR memory is critical
+        batch_size_ok = empty_dirs_count >= self.empty_dirs_min_batch_size or memory_exceeded
 
-        if should_process:
+        # Process if either threshold is exceeded AND batch size is sufficient
+        should_process = (memory_exceeded or count_exceeded) and batch_size_ok
+
+        # Only log if explicitly requested (to avoid log spam from multiple concurrent checks)
+        if should_process and log_trigger:
             memory_percent = (memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
             log_with_context(
                 self.logger,
@@ -690,6 +704,7 @@ class AsyncEFSPurger:
                     if memory_threshold_mb != float("inf")
                     else None,
                     "count_threshold": self.empty_dirs_count_threshold,
+                    "min_batch_size": self.empty_dirs_min_batch_size,
                 },
             )
 
@@ -741,10 +756,30 @@ class AsyncEFSPurger:
 
         # Check if we should process empty directories incrementally
         # This happens after adding the directory to prevent missing it
-        should_process, count, memory_mb = await self._should_process_empty_dirs_incrementally()
+        # Use try_acquire on the lock to avoid blocking multiple tasks waiting to process
+        # Only one task will acquire the lock and process; others will skip and continue scanning
+        if self.empty_dirs_batch_processing_lock.locked():
+            # Another task is already processing, skip this check to avoid queue buildup
+            return
+
+        should_process, count, memory_mb = await self._should_process_empty_dirs_incrementally(log_trigger=False)
         if should_process:
-            # Process accumulated empty directories in a batch
-            await self._process_empty_dirs_batch()
+            # Try to acquire the lock without blocking
+            # If we can't acquire immediately, another task is processing, so skip
+            if not self.empty_dirs_batch_processing_lock.locked():
+                try:
+                    # Try to acquire with a very short timeout by checking if locked
+                    async with self.empty_dirs_batch_processing_lock:
+                        # Double-check threshold after acquiring lock (may have been processed)
+                        should_process, count, memory_mb = await self._should_process_empty_dirs_incrementally(
+                            log_trigger=True
+                        )
+                        if should_process:
+                            # Process accumulated empty directories in a batch
+                            await self._process_empty_dirs_batch()
+                except asyncio.TimeoutError:
+                    # Lock is held, skip processing
+                    pass
 
     async def _process_empty_dirs_batch(self) -> None:
         """
@@ -756,6 +791,9 @@ class AsyncEFSPurger:
 
         This maintains post-order deletion within each batch while preventing
         unbounded memory growth.
+
+        NOTE: This method should only be called while holding empty_dirs_batch_processing_lock
+        to prevent concurrent batch processing.
         """
         # Get the current batch of empty directories under lock
         async with self.stats_lock:
@@ -785,10 +823,16 @@ class AsyncEFSPurger:
         except (OSError, RuntimeError):
             root_resolved = self.root_path
 
+        # Track deletions in THIS batch (not cumulative)
+        batch_deleted_count = 0
+        batch_deleted_lock = asyncio.Lock()
+
         # Process directories using the same logic as _remove_empty_directories
         # but without the cascading parent deletion (that happens in final pass)
         async def remove_directory(directory: Path) -> None:
             """Remove a single empty directory from the batch."""
+            nonlocal batch_deleted_count
+
             # Check rate limit
             if self.max_empty_dirs_to_delete > 0:
                 async with self.stats_lock:
@@ -818,9 +862,13 @@ class AsyncEFSPurger:
                     async with self.deletion_semaphore:
                         await aiofiles.os.rmdir(directory)
                     await self.update_stats(empty_dirs_deleted=1)
+                    async with batch_deleted_lock:
+                        batch_deleted_count += 1
                     self.logger.debug(f"Removed empty directory (incremental): {directory}")
                 else:
                     # In dry-run, we already incremented empty_dirs_to_delete above in rate limit check
+                    async with batch_deleted_lock:
+                        batch_deleted_count += 1
                     self.logger.debug(f"Would remove empty directory (incremental): {directory}")
 
             except FileNotFoundError:
@@ -860,15 +908,13 @@ class AsyncEFSPurger:
 
         gc.collect()
 
-        async with self.stats_lock:
-            deleted_count = self.stats.get("empty_dirs_deleted", 0)
         log_with_context(
             self.logger,
             "info",
             "Empty directory batch processed",
             {
                 "batch_size": batch_size,
-                "deleted_in_batch": deleted_count,
+                "deleted_in_batch": batch_deleted_count,  # Fixed: now reports batch-specific count
                 "total_processed": self.empty_dirs_processed_total,
             },
         )

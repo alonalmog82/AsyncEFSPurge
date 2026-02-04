@@ -181,9 +181,7 @@ async def test_memory_pressure_stops_queue_feeding(temp_dir):
 
     # Memory checks should be called even if processing doesn't happen
     # At minimum we check once before starting
-    assert len(memory_check_results) >= 0, (
-        f"Memory checks tracking was set up. Got {len(memory_check_results)} calls."
-    )
+    assert len(memory_check_results) >= 0, f"Memory checks tracking was set up. Got {len(memory_check_results)} calls."
 
     # This test now verifies that the system gracefully handles memory pressure
     # Whether deletion happens or not depends on memory state

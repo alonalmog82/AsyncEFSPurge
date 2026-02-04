@@ -62,9 +62,7 @@ async def test_only_one_batch_processes_at_a_time(temp_dir):
         """Wrap the batch processing to track concurrent calls."""
         async with processing_lock:
             processing_count["current"] += 1
-            processing_count["max_concurrent"] = max(
-                processing_count["max_concurrent"], processing_count["current"]
-            )
+            processing_count["max_concurrent"] = max(processing_count["max_concurrent"], processing_count["current"])
 
         try:
             await original_process()
@@ -222,20 +220,24 @@ async def test_logging_reports_batch_specific_counts(temp_dir):
     logged_batches = []
 
     from efspurge.logging import log_with_context
+
     original_log = log_with_context
 
     def capture_logs(logger, level, message, extra_fields=None):
         """Capture batch processing completion logs."""
         if message == "Empty directory batch processed":
-            logged_batches.append({
-                "batch_size": extra_fields.get("batch_size") if extra_fields else None,
-                "deleted_in_batch": extra_fields.get("deleted_in_batch") if extra_fields else None,
-                "total_processed": extra_fields.get("total_processed") if extra_fields else None,
-            })
+            logged_batches.append(
+                {
+                    "batch_size": extra_fields.get("batch_size") if extra_fields else None,
+                    "deleted_in_batch": extra_fields.get("deleted_in_batch") if extra_fields else None,
+                    "total_processed": extra_fields.get("total_processed") if extra_fields else None,
+                }
+            )
         original_log(logger, level, message, extra_fields)
 
     # Monkey patch the logging function
     import efspurge.purger
+
     efspurge.purger.log_with_context = capture_logs
 
     try:
@@ -313,8 +315,7 @@ async def test_memory_critical_overrides_min_batch_size(temp_dir):
     # Verify that processing was triggered despite small batch size
     # because memory was critical
     assert batch_processed["called"], (
-        "Expected batch processing to be triggered when memory is critical, "
-        "even with small batch size"
+        "Expected batch processing to be triggered when memory is critical, even with small batch size"
     )
 
 
@@ -406,19 +407,23 @@ async def test_no_duplicate_trigger_logs_at_same_timestamp(temp_dir):
     trigger_logs = []
 
     from efspurge.logging import log_with_context
+
     original_log = log_with_context
 
     def capture_trigger_logs(logger, level, message, extra_fields=None):
         """Capture trigger log messages."""
         if message == "Incremental empty directory processing triggered":
-            trigger_logs.append({
-                "timestamp": asyncio.get_event_loop().time(),
-                "msg": message,
-            })
+            trigger_logs.append(
+                {
+                    "timestamp": asyncio.get_event_loop().time(),
+                    "msg": message,
+                }
+            )
         original_log(logger, level, message, extra_fields)
 
     # Monkey patch the logging function
     import efspurge.purger
+
     efspurge.purger.log_with_context = capture_trigger_logs
 
     try:
@@ -429,8 +434,7 @@ async def test_no_duplicate_trigger_logs_at_same_timestamp(temp_dir):
         # With 200 directories and threshold of 50, we expect ~4 batches max
         # Allow some tolerance for race conditions
         assert len(trigger_logs) <= 10, (
-            f"Expected <= 10 trigger logs, got {len(trigger_logs)}. "
-            "This indicates excessive log spam."
+            f"Expected <= 10 trigger logs, got {len(trigger_logs)}. This indicates excessive log spam."
         )
     finally:
         # Restore original function

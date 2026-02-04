@@ -161,6 +161,7 @@ async def test_memory_pressure_stops_queue_feeding(temp_dir):
 
     # Disable incremental processing to test final pass behavior
     purger.empty_dirs_count_threshold = float("inf")  # Never trigger incremental processing
+    purger.empty_dirs_memory_threshold = 1.0  # Never trigger on memory (100% threshold)
 
     await purger.scan_directory(temp_dir)
 

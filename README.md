@@ -276,6 +276,7 @@ Optimized for network filesystems with high latency:
 - **Concurrent Directory Scanning**: Subdirectories processed in parallel (5-10x faster on deep hierarchies)
 - **Batched Task Creation**: Prevents OOM on large directories
 - **Memory Back-Pressure**: Automatic throttling when memory usage is high
+- **Incremental Empty Directory Processing**: Automatically processes empty directories in batches during scanning to prevent unbounded memory growth (70% memory threshold)
 - **Controlled Concurrency**: Prevents filesystem overload
 - **Efficient I/O**: Async operations overlap network latency
 
@@ -449,6 +450,10 @@ ruff format .
 
 - `PYTHONUNBUFFERED=1` - Recommended for real-time logging in containers
 - `PYTHONDONTWRITEBYTECODE=1` - Prevents `.pyc` file creation
+- `EFSPURGE_MAX_AGE_DAYS=N` - Files older than N days will be purged (default: 30.0)
+- `EFSPURGE_LOG_LEVEL=LEVEL` - Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL (default: INFO)
+- `EFSPURGE_MEMORY_LIMIT_MB=N` - Soft memory limit in MB, triggers back-pressure (default: 800)
+- `EFSPURGE_TASK_BATCH_SIZE=N` - Maximum tasks to create at once, prevents OOM (default: 5000)
 - `EFSPURGE_REMOVE_EMPTY_DIRS=1` - Enable empty directory removal (same as `--remove-empty-dirs` flag)
 - `EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE=N` - Maximum empty directories to delete per run (0 = unlimited, default: 500)
 - `EFSPURGE_MAX_CONCURRENT_SUBDIRS=N` - Maximum subdirectories to scan concurrently (default: 100, lower for deep trees)

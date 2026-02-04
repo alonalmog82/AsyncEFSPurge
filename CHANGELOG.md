@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.0] - 2026-02-04
+
+### Added
+- **Incremental Empty Directory Processing**: Prevents OOM on filesystems with millions of empty directories
+  - Automatically processes empty directories in batches during scanning when memory/count thresholds are exceeded
+  - Memory threshold: 70% of `memory_limit_mb` (default: 560 MB for 800 MB limit)
+  - Count threshold: Calculated based on memory limit (~4000 directories for 800 MB limit)
+  - Maintains post-order deletion (deepest first) within each batch
+  - Frees memory after each batch (clears `empty_dirs` set and triggers garbage collection)
+  - Continues scanning after processing batch, repeating as needed
+  - No configuration required - works automatically to prevent unbounded memory growth
+
+### Performance
+- **Memory Bounded**: Prevents OOM on very large filesystems with millions of empty directories
+  - Previously: `empty_dirs` set could grow unbounded, causing OOM
+  - Now: Automatically processes and clears directories when thresholds exceeded
+  - Safe for filesystems with unlimited empty directories
+- **Transparent Operation**: Incremental processing happens automatically during scanning
+  - Users benefit without configuration changes
+  - Batch tracking: `empty_dirs_processed_total` counter tracks batches
+
+### Testing
+- **Comprehensive Test Suite**: 6 new tests for incremental processing
+  - `test_incremental_processing_triggers_on_count_threshold`: Verifies triggering on count threshold
+  - `test_incremental_processing_maintains_post_order`: Verifies post-order deletion maintained
+  - `test_incremental_processing_respects_rate_limit`: Verifies rate limiting works with incremental processing
+  - `test_incremental_processing_frees_memory`: Verifies memory freed after batch
+  - `test_no_incremental_processing_when_disabled`: Verifies no processing when feature disabled
+  - `test_incremental_processing_with_dry_run`: Verifies dry-run mode works correctly
+- **Updated Existing Tests**: Fixed 3 tests to account for incremental processing behavior
+  - Tests can disable incremental processing with `purger.empty_dirs_count_threshold = float('inf')`
+
+### Documentation
+- **Updated README**: Added incremental processing to performance features
+- **Environment Variables**: Completed documentation of all environment variables
+  - Added `EFSPURGE_MAX_AGE_DAYS`, `EFSPURGE_LOG_LEVEL`, `EFSPURGE_MEMORY_LIMIT_MB`, `EFSPURGE_TASK_BATCH_SIZE`
+
 ## [1.13.1] - 2026-01-28
 
 ### Performance

@@ -369,3 +369,83 @@ async def test_cascading_deletion_memory_bounded(temp_dir):
     assert memory_increase < 300, (
         f"Cascading deletion caused memory increase of {memory_increase:.1f}MB, which exceeds expected bound of 300MB"
     )
+
+
+@pytest.mark.asyncio
+async def test_critical_memory_threshold_allows_small_batches(temp_dir):
+    """
+    Test that small batches are allowed only when memory reaches critical level (90%).
+
+    This ensures the fix correctly allows bypassing min_batch_size only at 90%+ memory,
+    not at the 70% memory threshold.
+    """
+    import efspurge.purger
+
+    # Create some empty directories
+    num_dirs = 50
+    for i in range(num_dirs):
+        (temp_dir / f"empty_{i:03d}").mkdir()
+
+    # Set very low memory limit to easily hit 90%
+    purger = AsyncEFSPurger(
+        root_path=str(temp_dir),
+        max_age_days=0,
+        dry_run=False,
+        remove_empty_dirs=True,
+        max_empty_dirs_to_delete=0,
+        memory_limit_mb=100,  # Very low to easily hit thresholds
+        log_level="INFO",
+    )
+
+    # Configure thresholds
+    purger.empty_dirs_memory_threshold = 0.70  # 70 MB
+    purger.empty_dirs_min_batch_size = 100  # Higher than total dirs
+    purger.empty_dirs_count_threshold = 1000  # Won't trigger
+
+    # Test the logic directly
+    # At 60 MB (60% of 100 MB limit) - below memory threshold
+    # Should NOT process with only 30 dirs (below min_batch_size)
+    async with purger.stats_lock:
+        for i in range(30):
+            purger.empty_dirs.add(temp_dir / f"test_{i}")
+
+    # Mock memory to be at 60 MB (below 70% threshold)
+    original_get_memory = efspurge.purger.get_memory_usage_mb
+
+    def mock_memory_60mb():
+        return 60.0
+
+    efspurge.purger.get_memory_usage_mb = mock_memory_60mb
+
+    try:
+        should_process, count, mem = await purger._should_process_empty_dirs_incrementally()
+        assert not should_process, "Should NOT process at 60% memory with only 30 dirs (below min_batch_size)"
+
+        # At 75 MB (75% of 100 MB limit) - above 70% memory threshold but below 90% critical
+        # Should NOT process with only 30 dirs (below min_batch_size)
+        def mock_memory_75mb():
+            return 75.0
+
+        efspurge.purger.get_memory_usage_mb = mock_memory_75mb
+
+        should_process, count, mem = await purger._should_process_empty_dirs_incrementally()
+        assert not should_process, (
+            "Should NOT process at 75% memory with only 30 dirs (below min_batch_size). "
+            "Only critical memory (90%+) should bypass min_batch_size."
+        )
+
+        # At 91 MB (91% of 100 MB limit) - above 90% critical threshold
+        # Should process even with only 30 dirs (critical memory bypasses min_batch_size)
+        def mock_memory_91mb():
+            return 91.0
+
+        efspurge.purger.get_memory_usage_mb = mock_memory_91mb
+
+        should_process, count, mem = await purger._should_process_empty_dirs_incrementally()
+        assert should_process, (
+            "SHOULD process at 91% memory even with only 30 dirs. "
+            "Critical memory (90%+) should bypass min_batch_size to prevent OOM."
+        )
+    finally:
+        # Restore original
+        efspurge.purger.get_memory_usage_mb = original_get_memory

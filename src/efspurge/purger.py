@@ -407,20 +407,9 @@ class AsyncEFSPurger:
         self.max_empty_dirs_to_delete = max_empty_dirs_to_delete
         self.max_concurrent_subdirs = max_concurrent_subdirs
 
-        # Warn if unlimited empty directory deletion is enabled (can cause OOM)
-        if self.remove_empty_dirs and self.max_empty_dirs_to_delete == 0:
-            # Estimate safe limit based on memory: ~0.1 MB per directory in memory
-            # Use 70% of memory limit for safety margin
-            estimated_safe_limit = int((self.memory_limit_mb * 0.7) / 0.1) if self.memory_limit_mb > 0 else 50000
-            import warnings
-
-            warnings.warn(
-                f"max_empty_dirs_to_delete=0 (unlimited) can cause OOM with large numbers of empty directories. "
-                f"With memory_limit_mb={self.memory_limit_mb}, consider setting max_empty_dirs_to_delete "
-                f"to a reasonable limit (e.g., {estimated_safe_limit} or less) to prevent unbounded memory growth.",
-                UserWarning,
-                stacklevel=2,
-            )
+        # Note: max_empty_dirs_to_delete=0 (unlimited) is safe with incremental processing
+        # Incremental processing automatically manages memory by processing batches at 70% memory threshold
+        # No warning needed - this is now a rate limit feature, not a memory safety concern
 
         # Statistics
         self.stats = {
@@ -682,8 +671,13 @@ class AsyncEFSPurger:
         count_exceeded = empty_dirs_count > self.empty_dirs_count_threshold
 
         # Check minimum batch size
-        # Only process if batch is large enough OR memory is critical
-        batch_size_ok = empty_dirs_count >= self.empty_dirs_min_batch_size or memory_exceeded
+        # Always enforce min_batch_size to prevent rapid-fire tiny batches
+        # Exception: Allow smaller batches only if memory is critically high (90%+)
+        memory_critical_threshold = 0.90  # 90% of memory limit
+        memory_critical = (
+            memory_mb > (self.memory_limit_mb * memory_critical_threshold) if self.memory_limit_mb > 0 else False
+        )
+        batch_size_ok = empty_dirs_count >= self.empty_dirs_min_batch_size or memory_critical
 
         # Process if either threshold is exceeded AND batch size is sufficient
         should_process = (memory_exceeded or count_exceeded) and batch_size_ok

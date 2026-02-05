@@ -12,9 +12,29 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
+      # Limit parallelism to reduce chance of jobs running on same physical host
+      # Tests are I/O intensive (directory scanning with 100-500 threads)
+      # Running all 4 versions in parallel can cause severe contention when co-located
+      max-parallel: 2
     
     steps:
     - uses: actions/checkout@v6
+    
+    - name: Check runner resources
+      run: |
+        echo "=== Runner Resources ==="
+        echo "CPU cores: $(nproc)"
+        echo "CPU info:"
+        lscpu | grep -E "Model name|CPU\(s\)|Thread\(s\) per core|Core\(s\) per socket"
+        echo ""
+        echo "Memory:"
+        free -h
+        echo ""
+        echo "Disk space:"
+        df -h /tmp
+        echo ""
+        echo "Load average:"
+        uptime
     
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v6

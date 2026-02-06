@@ -885,14 +885,11 @@ class AsyncEFSPurger:
                 await self.update_stats(errors=1)
 
         # Process batch with concurrency control
-        # Use deletion_semaphore to limit concurrent operations
+        # Process all directories concurrently - the deletion_semaphore naturally limits
+        # active concurrent operations to max_concurrency_deletion, so we can safely
+        # process the entire batch at once without sequential sub-batching
         tasks = [remove_directory(d) for d in sorted_batch]
-
-        # Process in smaller sub-batches to avoid memory spike
-        sub_batch_size = min(1000, self.max_concurrency_deletion * 2)
-        for i in range(0, len(tasks), sub_batch_size):
-            sub_batch = tasks[i : i + sub_batch_size]
-            await asyncio.gather(*sub_batch, return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
         # Update total processed counter
         self.empty_dirs_processed_total += batch_size

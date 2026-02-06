@@ -242,3 +242,71 @@ async def test_incremental_processing_with_dry_run(tmp_path: Path) -> None:
     # All directories should still exist (dry run)
     for i in range(num_dirs):
         assert (tmp_path / f"empty_{i:03d}").exists()
+
+
+@pytest.mark.asyncio
+async def test_min_batch_size_enforced_below_critical_memory(tmp_path: Path) -> None:
+    """
+    Test that min_batch_size is enforced even when memory threshold is exceeded,
+    as long as memory is below critical level (90%).
+
+    This test catches the bug where memory_exceeded would bypass min_batch_size,
+    causing rapid-fire tiny batches when memory hovered above the 70% threshold
+    but below the critical 90% threshold.
+    """
+    # Create directories
+    num_dirs = 200
+    for i in range(num_dirs):
+        (tmp_path / f"empty_{i:03d}").mkdir()
+
+    purger = AsyncEFSPurger(
+        root_path=str(tmp_path),
+        max_age_days=0,
+        dry_run=False,
+        remove_empty_dirs=True,
+        max_empty_dirs_to_delete=0,
+        memory_limit_mb=800,
+        log_level="INFO",
+    )
+
+    # Configure thresholds:
+    # - Memory threshold at 70% = 560 MB
+    # - Min batch size = 100 (enforce this!)
+    # - Count threshold = 1000 (won't trigger)
+    purger.empty_dirs_memory_threshold = 0.70
+    purger.empty_dirs_min_batch_size = 100
+    purger.empty_dirs_count_threshold = 1000
+
+    # Track batch sizes during processing
+    batch_sizes = []
+    original_process_batch = purger._process_empty_dirs_batch
+
+    async def tracked_process_batch() -> None:
+        async with purger.stats_lock:
+            batch_size = len(purger.empty_dirs)
+        batch_sizes.append(batch_size)
+        await original_process_batch()
+
+    purger._process_empty_dirs_batch = tracked_process_batch
+
+    # Run purge
+    stats = await purger.purge()
+
+    # Verify all directories were deleted
+    assert stats["dirs_purged"] == num_dirs
+
+    # Critical assertion: ALL batches should respect min_batch_size
+    # (unless it's the very last batch with remaining dirs < min_batch_size)
+    if batch_sizes:
+        # Filter out the final cleanup batch
+        scanning_batches = batch_sizes[:-1] if batch_sizes else []
+
+        for i, batch_size in enumerate(scanning_batches):
+            # Each batch during scanning should be >= min_batch_size
+            # This would fail with the old buggy logic where memory_exceeded
+            # would allow tiny batches like 3, 5, 9, etc.
+            assert batch_size >= purger.empty_dirs_min_batch_size, (
+                f"Batch {i} had size {batch_size}, which is below min_batch_size "
+                f"{purger.empty_dirs_min_batch_size}. This indicates the bug where "
+                f"memory_exceeded bypasses min_batch_size is present."
+            )

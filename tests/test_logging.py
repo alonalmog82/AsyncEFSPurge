@@ -86,15 +86,15 @@ async def test_empty_dir_removal_logs_when_enabled(temp_dir):
     await purger.purge()
 
     # Check that empty directory removal logs were called
+    # Phase 1 (standalone purge) handles empty dirs before file scanning
     messages = [str(call) for call in log_calls]
-    assert any("Starting empty directory removal" in str(call) for call in log_calls), (
-        f"Should log start of empty directory removal. Got: {messages}"
+    assert any("Starting standalone empty directory purge" in str(call) for call in log_calls), (
+        f"Should log start of standalone empty directory purge. Got: {messages}"
     )
-    # Completion log only appears if there are cascading deletions
-    # Progress log should appear after first pass
-    assert any("Empty directory removal progress" in str(call) for call in log_calls), (
-        f"Should log progress of empty directory removal. Got: {messages}"
-    )
+    # Progress log should appear during Phase 1
+    assert any(
+        "Empty directory purge progress" in str(call) or "Phase 1 complete" in str(call) for call in log_calls
+    ), f"Should log progress of empty directory purge. Got: {messages}"
 
 
 @pytest.mark.asyncio

@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import time
-from collections import deque
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -407,9 +407,8 @@ class AsyncEFSPurger:
         self.max_empty_dirs_to_delete = max_empty_dirs_to_delete
         self.max_concurrent_subdirs = max_concurrent_subdirs
 
-        # Note: max_empty_dirs_to_delete=0 (unlimited) is safe with incremental processing
-        # Incremental processing automatically manages memory by processing batches at 70% memory threshold
-        # No warning needed - this is now a rate limit feature, not a memory safety concern
+        # Note: max_empty_dirs_to_delete=0 (unlimited) is safe with the standalone two-pass approach
+        # Phase 1 uses bounded memory (iterative BFS + bottom-up processing with back-pressure)
 
         # Statistics
         self.stats = {
@@ -446,21 +445,12 @@ class AsyncEFSPurger:
         # Rate tracking for enhanced metrics
         self.rate_tracker = RateTracker()
 
-        # Track empty directories for post-order deletion
-        # Use set to prevent duplicates from concurrent scans
+        # Track empty directories for post-order deletion (Phase 3: post-scan cleanup)
+        # Used by _remove_empty_directories() for dirs that became empty after file purging
         self.empty_dirs: set[Path] = set()
 
-        # Incremental processing: track total processed across batches
+        # Track total empty dirs processed across all phases
         self.empty_dirs_processed_total = 0
-
-        # Incremental processing thresholds
-        # Process when memory exceeds 70% OR empty_dirs count exceeds threshold
-        self.empty_dirs_memory_threshold = 0.70  # 70% of memory limit
-        # Calculate safe count threshold: ~0.1 MB per directory path in memory
-        # Use 50% of memory for empty_dirs to leave room for other operations
-        self.empty_dirs_count_threshold = int((self.memory_limit_mb * 0.5) / 0.1) if self.memory_limit_mb > 0 else 50000
-        # Minimum batch size to process (prevents thrashing with tiny batches)
-        self.empty_dirs_min_batch_size = 100  # Don't process batches smaller than this
 
         # Concurrency control - separate semaphores for scanning and deletion
         self.scanning_semaphore = asyncio.Semaphore(max_concurrency_scanning)
@@ -469,9 +459,8 @@ class AsyncEFSPurger:
         self.subdir_semaphore = asyncio.Semaphore(max_concurrent_subdirs)
         self.stats_lock = asyncio.Lock()
 
-        # Lock to prevent concurrent incremental batch processing
-        # This prevents race conditions where multiple scan tasks trigger processing simultaneously
-        self.empty_dirs_batch_processing_lock = asyncio.Lock()
+        # Note: Incremental batch processing during scanning has been removed.
+        # Empty dirs are now handled in a standalone phase (_purge_empty_directories_standalone).
 
         # Custom ThreadPoolExecutor for directory scanning to bypass default thread pool limit
         # Default executor has ~32 threads, limiting directory scanning throughput to ~250-300 dirs/sec
@@ -635,290 +624,15 @@ class AsyncEFSPurger:
             async with self.active_tasks_lock:
                 self.active_tasks -= 1
 
-    async def _should_process_empty_dirs_incrementally(self, log_trigger: bool = False) -> tuple[bool, int, float]:
-        """
-        Check if we should process empty directories incrementally during scanning.
-
-        This prevents unbounded memory growth by processing empty directories in batches
-        when memory or count thresholds are exceeded.
-
-        Args:
-            log_trigger: If True, log the trigger message. Set to True only when actually processing.
-
-        Returns:
-            Tuple of (should_process, empty_dirs_count, memory_mb):
-            - should_process: True if we should process now
-            - empty_dirs_count: Current count of empty directories
-            - memory_mb: Current memory usage in MB
-        """
-        if not self.remove_empty_dirs:
-            return False, 0, 0.0
-
-        # Get current counts under lock
-        async with self.stats_lock:
-            empty_dirs_count = len(self.empty_dirs)
-
-        # Get current memory usage
-        memory_mb = get_memory_usage_mb()
-
-        # Check memory threshold
-        memory_threshold_mb = (
-            self.memory_limit_mb * self.empty_dirs_memory_threshold if self.memory_limit_mb > 0 else float("inf")
-        )
-        memory_exceeded = memory_mb > memory_threshold_mb
-
-        # Check count threshold
-        count_exceeded = empty_dirs_count > self.empty_dirs_count_threshold
-
-        # Check minimum batch size
-        # Always enforce min_batch_size to prevent rapid-fire tiny batches
-        # Exception: Allow smaller batches only if memory is critically high (90%+)
-        memory_critical_threshold = 0.90  # 90% of memory limit
-        memory_critical = (
-            memory_mb > (self.memory_limit_mb * memory_critical_threshold) if self.memory_limit_mb > 0 else False
-        )
-        batch_size_ok = empty_dirs_count >= self.empty_dirs_min_batch_size or memory_critical
-
-        # Process if either threshold is exceeded AND batch size is sufficient
-        should_process = (memory_exceeded or count_exceeded) and batch_size_ok
-
-        # Only log if explicitly requested (to avoid log spam from multiple concurrent checks)
-        if should_process and log_trigger:
-            memory_percent = (memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
-            log_with_context(
-                self.logger,
-                "info",
-                "Incremental empty directory processing triggered",
-                {
-                    "reason": "memory_threshold" if memory_exceeded else "count_threshold",
-                    "empty_dirs_count": empty_dirs_count,
-                    "memory_mb": round(memory_mb, 1),
-                    "memory_percent": round(memory_percent, 1),
-                    "memory_threshold_mb": round(memory_threshold_mb, 1)
-                    if memory_threshold_mb != float("inf")
-                    else None,
-                    "count_threshold": self.empty_dirs_count_threshold,
-                    "min_batch_size": self.empty_dirs_min_batch_size,
-                },
-            )
-
-        return should_process, empty_dirs_count, memory_mb
-
-    async def _check_empty_directory(self, directory: Path) -> None:
-        """
-        Check if directory is empty and add to deletion set if so.
-
-        This is called after all subdirectories have been processed,
-        so we can safely check if the directory is now empty.
-
-        If incremental processing is enabled and thresholds are exceeded,
-        this will trigger incremental processing of accumulated empty directories.
-
-        Args:
-            directory: Directory path to check
-        """
-        # Normalize paths for comparison (handle symlinks, relative paths, etc.)
-        try:
-            dir_resolved = directory.resolve()
-            root_resolved = self.root_path.resolve()
-        except (OSError, RuntimeError):
-            # If resolve fails (e.g., broken symlink), use original paths
-            dir_resolved = directory
-            root_resolved = self.root_path
-
-        # Never delete root directory
-        if dir_resolved == root_resolved:
-            return
-
-        # Lock entire check-and-add operation to prevent race conditions
-        async with self.stats_lock:
-            # Double-check directory is still empty (might have been populated)
-            # This check happens under lock to prevent race conditions
-            try:
-                entries = await async_scandir(directory, self.scandir_executor, self)
-                if len(entries) == 0:
-                    # Directory is empty, add to deletion set
-                    # Set automatically prevents duplicates from concurrent scans
-                    self.empty_dirs.add(directory)
-                    self.logger.debug(f"Found empty directory: {directory}")
-            except (FileNotFoundError, PermissionError):
-                # Directory was deleted or permission denied - ignore
-                pass
-            except Exception as e:
-                # Log but don't fail
-                self.logger.debug(f"Error checking empty directory {directory}: {e}")
-
-        # Check if we should process empty directories incrementally
-        # This happens after adding the directory to prevent missing it
-        # Use try_acquire on the lock to avoid blocking multiple tasks waiting to process
-        # Only one task will acquire the lock and process; others will skip and continue scanning
-        if self.empty_dirs_batch_processing_lock.locked():
-            # Another task is already processing, skip this check to avoid queue buildup
-            return
-
-        should_process, count, memory_mb = await self._should_process_empty_dirs_incrementally(log_trigger=False)
-        if should_process:
-            # Try to acquire the lock without blocking
-            # If we can't acquire immediately, another task is processing, so skip
-            if not self.empty_dirs_batch_processing_lock.locked():
-                try:
-                    # Try to acquire with a very short timeout by checking if locked
-                    async with self.empty_dirs_batch_processing_lock:
-                        # Double-check threshold after acquiring lock (may have been processed)
-                        should_process, count, memory_mb = await self._should_process_empty_dirs_incrementally(
-                            log_trigger=True
-                        )
-                        if should_process:
-                            # Process accumulated empty directories in a batch
-                            await self._process_empty_dirs_batch()
-                except asyncio.TimeoutError:
-                    # Lock is held, skip processing
-                    pass
-
-    async def _process_empty_dirs_batch(self) -> None:
-        """
-        Process a batch of accumulated empty directories during scanning.
-
-        This is called when memory or count thresholds are exceeded during scanning.
-        Processes the deepest directories first (post-order), then clears the set
-        to free memory for continued scanning.
-
-        This maintains post-order deletion within each batch while preventing
-        unbounded memory growth.
-
-        NOTE: This method should only be called while holding empty_dirs_batch_processing_lock
-        to prevent concurrent batch processing.
-        """
-        # Get the current batch of empty directories under lock
-        async with self.stats_lock:
-            if not self.empty_dirs:
-                return  # Nothing to process
-
-            batch = set(self.empty_dirs)  # Copy the set
-            batch_size = len(batch)
-            self.empty_dirs.clear()  # Clear for next batch
-
-        log_with_context(
-            self.logger,
-            "info",
-            "Processing empty directory batch during scanning",
-            {
-                "batch_size": batch_size,
-                "total_processed_so_far": self.empty_dirs_processed_total,
-            },
-        )
-
-        # Sort by depth (deepest first) for post-order deletion within batch
-        sorted_batch = sorted(batch, key=lambda p: len(p.parts), reverse=True)
-
-        # Normalize root path for comparison
-        try:
-            root_resolved = self.root_path.resolve()
-        except (OSError, RuntimeError):
-            root_resolved = self.root_path
-
-        # Track deletions in THIS batch (not cumulative)
-        batch_deleted_count = 0
-        batch_deleted_lock = asyncio.Lock()
-
-        # Process directories using the same logic as _remove_empty_directories
-        # but without the cascading parent deletion (that happens in final pass)
-        async def remove_directory(directory: Path) -> None:
-            """Remove a single empty directory from the batch."""
-            nonlocal batch_deleted_count
-
-            # Check rate limit
-            if self.max_empty_dirs_to_delete > 0:
-                async with self.stats_lock:
-                    to_delete_count = self.stats.get("empty_dirs_to_delete", 0)
-                    if to_delete_count >= self.max_empty_dirs_to_delete:
-                        return
-                    # Atomically increment counter
-                    self.stats["empty_dirs_to_delete"] = to_delete_count + 1
-
-            try:
-                # Normalize directory path
-                try:
-                    dir_resolved = directory.resolve()
-                except (OSError, RuntimeError):
-                    dir_resolved = directory
-
-                # Never delete root directory
-                if dir_resolved == root_resolved:
-                    # Decrement counter if we're not processing
-                    if self.max_empty_dirs_to_delete > 0:
-                        async with self.stats_lock:
-                            self.stats["empty_dirs_to_delete"] = max(0, self.stats.get("empty_dirs_to_delete", 0) - 1)
-                    return
-
-                # Delete directory
-                if not self.dry_run:
-                    async with self.deletion_semaphore:
-                        await aiofiles.os.rmdir(directory)
-                    await self.update_stats(empty_dirs_deleted=1)
-                    async with batch_deleted_lock:
-                        batch_deleted_count += 1
-                    self.logger.debug(f"Removed empty directory (incremental): {directory}")
-                else:
-                    # In dry-run, we already incremented empty_dirs_to_delete above in rate limit check
-                    async with batch_deleted_lock:
-                        batch_deleted_count += 1
-                    self.logger.debug(f"Would remove empty directory (incremental): {directory}")
-
-            except FileNotFoundError:
-                # Already deleted
-                if self.max_empty_dirs_to_delete > 0:
-                    async with self.stats_lock:
-                        self.stats["empty_dirs_to_delete"] = max(0, self.stats.get("empty_dirs_to_delete", 0) - 1)
-                self.logger.debug(f"Empty directory already deleted: {directory}")
-            except OSError as e:
-                # Error deleting
-                if self.max_empty_dirs_to_delete > 0:
-                    async with self.stats_lock:
-                        self.stats["empty_dirs_to_delete"] = max(0, self.stats.get("empty_dirs_to_delete", 0) - 1)
-                log_with_context(
-                    self.logger,
-                    "warning",
-                    "Could not remove empty directory (incremental)",
-                    {"directory": str(directory), "error": str(e)},
-                )
-                await self.update_stats(errors=1)
-
-        # Process batch with concurrency control
-        # Process all directories concurrently - the deletion_semaphore naturally limits
-        # active concurrent operations to max_concurrency_deletion, so we can safely
-        # process the entire batch at once without sequential sub-batching
-        tasks = [remove_directory(d) for d in sorted_batch]
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Update total processed counter
-        self.empty_dirs_processed_total += batch_size
-
-        # Force garbage collection to free memory
-        import gc
-
-        gc.collect()
-
-        log_with_context(
-            self.logger,
-            "info",
-            "Empty directory batch processed",
-            {
-                "batch_size": batch_size,
-                "deleted_in_batch": batch_deleted_count,  # Fixed: now reports batch-specific count
-                "total_processed": self.empty_dirs_processed_total,
-            },
-        )
-
     async def _remove_empty_directories(self) -> None:
         """
-        Remove empty directories in post-order (children before parents).
+        Phase 3: Remove directories that became empty after file purging.
 
-        This ensures we can delete nested empty directories correctly.
-        After deleting a directory, we check if its parent is now empty.
+        This runs AFTER file scanning/purging to catch directories that were
+        non-empty before (had old files) but became empty after those files were purged.
 
-        Uses concurrent processing with deletion_semaphore for high throughput.
-        Processes directories in batches to maintain memory efficiency.
+        Uses post-order deletion (children before parents) with cascading parent checks.
+        Concurrent processing with deletion_semaphore for high throughput.
         """
         if not self.empty_dirs:
             return
@@ -1459,11 +1173,394 @@ class AsyncEFSPurger:
                 "total_empty_dirs_to_delete": to_delete_count,
                 "total_empty_dirs_deleted": deleted_count,
                 "iterations": iteration,
-                "incremental_batches_processed": self.empty_dirs_processed_total
-                if hasattr(self, "empty_dirs_processed_total")
-                else 0,
+                "phase": "post_scan_cleanup",
             },
         )
+
+    async def _purge_empty_directories_standalone(self) -> int:
+        """
+        Efficient standalone empty directory purger (Phase 1).
+
+        This is a purpose-built bottom-up directory walker optimized for deleting
+        millions of empty directories with bounded memory usage. It runs as a
+        separate phase BEFORE file scanning.
+
+        Design:
+        - Phase A: Walk the tree iteratively (BFS), bucketing directories by depth.
+          Memory: O(total_dirs) during discovery (just Path strings, not coroutines).
+        - Phase B: Process depth levels from deepest to shallowest. For each level,
+          check each directory and delete if empty, then FREE the entire level before
+          moving to the next. This means deletion memory is O(widest_single_level)
+          rather than O(total_dirs). Parents that become empty after their children
+          are deleted in the current level are naturally caught when their level is
+          processed next.
+        - Real back-pressure: When memory exceeds threshold, reduce active concurrency
+          dynamically and pause discovery to let deletions catch up.
+        - No recursive coroutine tree - just bucketed paths processed level by level.
+
+        Returns:
+            Number of empty directories deleted
+        """
+        self.current_phase = "removing_empty_dirs"
+        self.rate_tracker.set_phase_start("removing_empty_dirs")
+
+        # Normalize root path for comparison
+        try:
+            root_resolved = self.root_path.resolve()
+        except (OSError, RuntimeError):
+            root_resolved = self.root_path
+
+        log_with_context(
+            self.logger,
+            "info",
+            "Phase 1: Starting standalone empty directory purge",
+            {
+                "root_path": str(self.root_path),
+                "max_concurrent_subdirs": self.max_concurrent_subdirs,
+                "max_concurrency_deletion": self.max_concurrency_deletion,
+                "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
+                "memory_limit_mb": self.memory_limit_mb,
+            },
+        )
+
+        # Phase A: Discover all directories using iterative BFS, bucketed by depth.
+        # Each directory is placed into a bucket keyed by its depth (number of path
+        # components). This avoids a costly sort later and enables level-by-level
+        # freeing during deletion.
+        dirs_by_depth: defaultdict[int, list[Path]] = defaultdict(list)
+        dirs_to_visit: deque[Path] = deque([self.root_path])
+        discovery_errors = 0
+        total_dirs_discovered = 0
+        root_depth = len(self.root_path.parts)
+
+        log_with_context(
+            self.logger,
+            "info",
+            "Phase 1a: Discovering directory tree structure",
+            {"root_path": str(self.root_path)},
+        )
+
+        while dirs_to_visit:
+            # Check memory pressure during discovery
+            if self.memory_limit_mb > 0:
+                memory_mb = get_memory_usage_mb()
+                memory_percent = memory_mb / self.memory_limit_mb
+                if memory_percent > 0.90:
+                    # At 90%+, pause discovery briefly and GC
+                    import gc
+
+                    gc.collect()
+                    await asyncio.sleep(0.5)
+                    memory_mb = get_memory_usage_mb()
+                    memory_percent = memory_mb / self.memory_limit_mb
+                    if memory_percent > 0.95:
+                        log_with_context(
+                            self.logger,
+                            "warning",
+                            "Memory critical during directory discovery, proceeding with partial tree",
+                            {
+                                "dirs_discovered": total_dirs_discovered,
+                                "dirs_remaining_in_queue": len(dirs_to_visit),
+                                "memory_mb": round(memory_mb, 1),
+                                "memory_percent": round(memory_percent * 100, 1),
+                            },
+                        )
+                        break
+
+            current_dir = dirs_to_visit.popleft()
+
+            try:
+                entries = await async_scandir(current_dir, self.scandir_executor, self)
+                await self.update_stats(dirs_scanned=1)
+                self.rate_tracker.record("removing_empty_dirs", "dirs", 1)
+
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            entry_path = Path(entry.path)
+                            depth = len(entry_path.parts) - root_depth
+                            dirs_by_depth[depth].append(entry_path)
+                            dirs_to_visit.append(entry_path)
+                            total_dirs_discovered += 1
+                    except OSError:
+                        discovery_errors += 1
+
+            except PermissionError:
+                discovery_errors += 1
+                self.logger.debug(f"Permission denied during discovery: {current_dir}")
+            except FileNotFoundError:
+                pass  # Directory was deleted concurrently
+            except OSError as e:
+                discovery_errors += 1
+                self.logger.debug(f"Error scanning {current_dir}: {e}")
+
+            # Log progress periodically during discovery
+            if total_dirs_discovered % 50000 == 0 and total_dirs_discovered > 0:
+                memory_mb = get_memory_usage_mb() if self.memory_limit_mb > 0 else 0
+                log_with_context(
+                    self.logger,
+                    "info",
+                    "Directory discovery progress",
+                    {
+                        "dirs_discovered": total_dirs_discovered,
+                        "dirs_remaining_in_queue": len(dirs_to_visit),
+                        "depth_levels": len(dirs_by_depth),
+                        "memory_mb": round(memory_mb, 1),
+                        "discovery_errors": discovery_errors,
+                    },
+                )
+
+        # Free the BFS queue now that discovery is complete
+        del dirs_to_visit
+
+        max_depth = max(dirs_by_depth.keys()) if dirs_by_depth else 0
+
+        log_with_context(
+            self.logger,
+            "info",
+            "Phase 1a complete: Directory tree discovered",
+            {
+                "total_dirs_discovered": total_dirs_discovered,
+                "depth_levels": len(dirs_by_depth),
+                "max_depth": max_depth,
+                "discovery_errors": discovery_errors,
+                "memory_mb": round(get_memory_usage_mb(), 1),
+            },
+        )
+
+        if not dirs_by_depth:
+            log_with_context(self.logger, "info", "No subdirectories found, skipping empty dir purge", {})
+            return 0
+
+        # Phase B: Process depth levels from deepest to shallowest (bottom-up).
+        # After processing each level, the list for that level is deleted, freeing
+        # memory before the next level is processed. This means peak deletion memory
+        # is O(dirs_at_widest_level) rather than O(total_dirs).
+        depth_levels = sorted(dirs_by_depth.keys(), reverse=True)
+
+        log_with_context(
+            self.logger,
+            "info",
+            "Phase 1b: Processing directories bottom-up for empty dir deletion",
+            {
+                "total_dirs_to_check": total_dirs_discovered,
+                "depth_levels_count": len(depth_levels),
+                "max_depth": max_depth,
+                "max_concurrency_deletion": self.max_concurrency_deletion,
+            },
+        )
+
+        deleted_count = 0
+        checked_count = 0
+        deletion_errors = 0
+        skipped_not_empty = 0
+        deleted_lock = asyncio.Lock()
+        rate_limit_reached = False
+
+        # Use a semaphore for concurrency control
+        deletion_sem = asyncio.Semaphore(self.max_concurrency_deletion)
+
+        async def check_and_delete_if_empty(directory: Path) -> None:
+            """Check if directory is empty and delete it if so."""
+            nonlocal deleted_count, checked_count, deletion_errors, skipped_not_empty
+
+            async with deletion_sem:
+                try:
+                    # Rate limit check - atomic check-and-increment under lock
+                    if self.max_empty_dirs_to_delete > 0:
+                        async with self.stats_lock:
+                            to_delete_count = self.stats.get("empty_dirs_to_delete", 0)
+                            if to_delete_count >= self.max_empty_dirs_to_delete:
+                                return
+                            # Reserve a slot atomically
+                            self.stats["empty_dirs_to_delete"] = to_delete_count + 1
+
+                    # Normalize for root protection
+                    try:
+                        dir_resolved = directory.resolve()
+                    except (OSError, RuntimeError):
+                        dir_resolved = directory
+
+                    if dir_resolved == root_resolved:
+                        # Unreserve slot
+                        if self.max_empty_dirs_to_delete > 0:
+                            async with self.stats_lock:
+                                current = self.stats.get("empty_dirs_to_delete", 0)
+                                self.stats["empty_dirs_to_delete"] = max(0, current - 1)
+                        return
+
+                    # Check if directory is empty
+                    entries = await async_scandir(directory, self.scandir_executor, self)
+
+                    async with deleted_lock:
+                        checked_count += 1
+
+                    if len(entries) > 0:
+                        async with deleted_lock:
+                            skipped_not_empty += 1
+                        # Unreserve slot since we're not deleting
+                        if self.max_empty_dirs_to_delete > 0:
+                            async with self.stats_lock:
+                                current = self.stats.get("empty_dirs_to_delete", 0)
+                                self.stats["empty_dirs_to_delete"] = max(0, current - 1)
+                        return
+
+                    # Directory is empty - delete it
+                    if not self.dry_run:
+                        await aiofiles.os.rmdir(directory)
+                        # Update stats: empty_dirs_to_delete tracks total attempted (for reporting)
+                        # empty_dirs_deleted tracks actual deletions
+                        if self.max_empty_dirs_to_delete == 0:
+                            # No rate limit - increment to_delete for reporting only
+                            await self.update_stats(empty_dirs_deleted=1, empty_dirs_to_delete=1)
+                        else:
+                            # Rate limited - slot already reserved above, just update deleted
+                            await self.update_stats(empty_dirs_deleted=1)
+                        self.rate_tracker.record("removing_empty_dirs", "dirs", 1)
+                        self.logger.debug(f"Removed empty directory: {directory}")
+                    else:
+                        # Dry run - count but don't delete
+                        if self.max_empty_dirs_to_delete == 0:
+                            await self.update_stats(empty_dirs_to_delete=1)
+                        # else: slot already reserved above
+                        self.logger.debug(f"Would remove empty directory: {directory}")
+
+                    async with deleted_lock:
+                        deleted_count += 1
+
+                except FileNotFoundError:
+                    # Already deleted - unreserve slot
+                    if self.max_empty_dirs_to_delete > 0:
+                        async with self.stats_lock:
+                            current = self.stats.get("empty_dirs_to_delete", 0)
+                            self.stats["empty_dirs_to_delete"] = max(0, current - 1)
+                except OSError as e:
+                    if "not empty" in str(e).lower() or "directory not empty" in str(e).lower():
+                        async with deleted_lock:
+                            skipped_not_empty += 1
+                    else:
+                        async with deleted_lock:
+                            deletion_errors += 1
+                        self.logger.debug(f"Error deleting {directory}: {e}")
+                        await self.update_stats(errors=1)
+                    # Unreserve slot on error
+                    if self.max_empty_dirs_to_delete > 0:
+                        async with self.stats_lock:
+                            current = self.stats.get("empty_dirs_to_delete", 0)
+                            self.stats["empty_dirs_to_delete"] = max(0, current - 1)
+
+        # Process each depth level from deepest to shallowest
+        BATCH_SIZE = 5000  # Process this many at a time within each level
+
+        for current_depth in depth_levels:
+            if rate_limit_reached:
+                break
+
+            level_dirs = dirs_by_depth.pop(current_depth)  # pop to free as we go
+            level_size = len(level_dirs)
+            i = 0
+
+            while i < level_size:
+                # Check rate limit
+                if self.max_empty_dirs_to_delete > 0:
+                    async with self.stats_lock:
+                        current_deleted = self.stats.get("empty_dirs_deleted", 0)
+                        if current_deleted >= self.max_empty_dirs_to_delete:
+                            log_with_context(
+                                self.logger,
+                                "info",
+                                "Rate limit reached for empty directory deletion",
+                                {
+                                    "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
+                                    "deleted": current_deleted,
+                                    "checked": checked_count,
+                                    "current_depth": current_depth,
+                                    "remaining_in_level": level_size - i,
+                                    "remaining_levels": len(dirs_by_depth),
+                                },
+                            )
+                            rate_limit_reached = True
+                            break
+
+                # Apply back-pressure: check memory and adjust batch size
+                if self.memory_limit_mb > 0:
+                    memory_mb = get_memory_usage_mb()
+                    memory_percent = memory_mb / self.memory_limit_mb
+
+                    if memory_percent > 0.90:
+                        # High memory - reduce batch size and pause
+                        import gc
+
+                        gc.collect()
+                        await asyncio.sleep(1.0)
+                        current_batch_size = max(100, BATCH_SIZE // 4)
+                    elif memory_percent > 0.75:
+                        current_batch_size = max(500, BATCH_SIZE // 2)
+                    else:
+                        current_batch_size = BATCH_SIZE
+                else:
+                    current_batch_size = BATCH_SIZE
+
+                # Get the next batch from this level
+                batch_end = min(i + current_batch_size, level_size)
+                batch = level_dirs[i:batch_end]
+                i = batch_end
+
+                # Process batch concurrently (semaphore limits actual concurrency)
+                tasks = [asyncio.create_task(check_and_delete_if_empty(d)) for d in batch]
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Free batch reference
+                del batch
+                del tasks
+
+            # Free this entire depth level before moving to the next
+            del level_dirs
+
+            # Log progress after each depth level
+            memory_mb = get_memory_usage_mb() if self.memory_limit_mb > 0 else 0
+            remaining_dirs = sum(len(v) for v in dirs_by_depth.values())
+            log_with_context(
+                self.logger,
+                "info",
+                "Empty directory purge progress",
+                {
+                    "checked": checked_count,
+                    "deleted": deleted_count,
+                    "skipped_not_empty": skipped_not_empty,
+                    "errors": deletion_errors,
+                    "total_dirs": total_dirs_discovered,
+                    "completed_depth": current_depth,
+                    "remaining_levels": len(dirs_by_depth),
+                    "remaining_dirs": remaining_dirs,
+                    "memory_mb": round(memory_mb, 1),
+                },
+            )
+
+        # Free any remaining depth levels (e.g. if rate limit stopped us early)
+        dirs_by_depth.clear()
+        del dirs_by_depth
+
+        # Force GC after releasing all directory data
+        import gc
+
+        gc.collect()
+
+        log_with_context(
+            self.logger,
+            "info",
+            "Phase 1 complete: Standalone empty directory purge finished",
+            {
+                "total_dirs_discovered": total_dirs_discovered,
+                "checked": checked_count,
+                "deleted": deleted_count,
+                "skipped_not_empty": skipped_not_empty,
+                "errors": deletion_errors + discovery_errors,
+                "memory_mb": round(get_memory_usage_mb(), 1),
+            },
+        )
+
+        return deleted_count
 
     async def _process_file_batch(self, file_tasks: list) -> None:
         """
@@ -1668,11 +1765,23 @@ class AsyncEFSPurger:
                     for subdir in subdirs:
                         await self.scan_directory(subdir)
 
-            # Check if directory is empty (AFTER all subdirs have been fully processed recursively)
-            # This ensures nested empty directories are handled correctly
-            # Only check if remove_empty_dirs is enabled
-            if self.remove_empty_dirs:
-                await self._check_empty_directory(directory)
+            # Phase 3 prep: After all subdirs processed, check if this directory is now empty
+            # (it may have become empty because we purged all its files in this scan).
+            # Just add to the set - actual deletion happens in _remove_empty_directories().
+            if self.remove_empty_dirs and self.max_age_days > 0:
+                try:
+                    post_entries = await async_scandir(directory, self.scandir_executor, self)
+                    if len(post_entries) == 0:
+                        try:
+                            dir_resolved = directory.resolve()
+                            root_resolved = self.root_path.resolve()
+                        except (OSError, RuntimeError):
+                            dir_resolved = directory
+                            root_resolved = self.root_path
+                        if dir_resolved != root_resolved:
+                            self.empty_dirs.add(directory)
+                except (FileNotFoundError, PermissionError, OSError):
+                    pass  # Directory gone or inaccessible
 
         except PermissionError as e:
             log_with_context(
@@ -1960,12 +2069,6 @@ class AsyncEFSPurger:
                 "remove_empty_dirs": self.remove_empty_dirs,
                 "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
                 "scandir_executor_threads": self.scandir_executor._max_workers,
-                # Incremental processing settings
-                "empty_dirs_incremental_processing": self.remove_empty_dirs,
-                "empty_dirs_memory_threshold_percent": round(self.empty_dirs_memory_threshold * 100, 0)
-                if self.remove_empty_dirs
-                else None,
-                "empty_dirs_count_threshold": self.empty_dirs_count_threshold if self.remove_empty_dirs else None,
             },
         )
 
@@ -1979,7 +2082,13 @@ class AsyncEFSPurger:
         progress_task = asyncio.create_task(self._background_progress_reporter())
 
         try:
-            # Start the recursive scan
+            # Phase 1: Remove empty directories FIRST (standalone, efficient walker)
+            # This runs before file scanning to reduce the directory tree size,
+            # making subsequent file scanning faster and lighter on memory.
+            if self.remove_empty_dirs:
+                await self._purge_empty_directories_standalone()
+
+            # Phase 2: Scan and purge files
             self.current_phase = "scanning"
             self.rate_tracker.set_phase_start("scanning")
             await self.scan_directory(self.root_path)
@@ -1987,7 +2096,9 @@ class AsyncEFSPurger:
             # Mark scanning phase as complete (for accurate overall rate calculation)
             self.scanning_end_time = time.time()
 
-            # After all scanning is complete, remove empty directories in post-order
+            # Phase 3: Post-scan empty directory cleanup
+            # After purging files, some directories may have become empty.
+            # Run the existing post-order deletion to catch these.
             if self.remove_empty_dirs:
                 await self._remove_empty_directories()
         finally:

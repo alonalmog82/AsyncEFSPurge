@@ -5,42 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.0] - 2026-02-08
+
+### Changed
+- **ARCHITECTURAL CHANGE**: Two-pass empty directory purging replaces incremental processing
+  - **Phase 1 (Standalone Empty Dir Purge)**: Runs BEFORE file scanning to reduce the directory tree size
+    - Iterative BFS traversal discovers directories bucketed by depth (just path strings, no coroutines)
+    - Level-by-level bottom-up deletion: processes deepest level first, frees it, then moves to next
+    - Deletion memory is O(widest_single_level) instead of O(total_dirs)
+    - Dynamic back-pressure: reduces concurrency and pauses discovery when memory exceeds threshold
+    - Atomic rate limiting prevents over-deletion under concurrent access
+    - Handles millions of empty directories efficiently with bounded memory
+  - **Phase 2 (File Scan & Purge)**: Standard file scanning and deletion (unchanged)
+  - **Phase 3 (Post-Scan Cleanup)**: Catches directories that became empty after file purging
+  - Removed incremental batch processing during scanning (no longer needed)
+  - Removed attributes: `empty_dirs_count_threshold`, `empty_dirs_memory_threshold`, `empty_dirs_min_batch_size`, `batch_processing_cooldown`, `empty_dirs_batch_processing_lock`
+  - Removed methods: `_should_process_empty_dirs_incrementally`, `_check_empty_directory`, `_process_empty_dirs_batch`
+
+### Performance
+- **Memory Bounded**: Level-by-level processing instead of holding all paths during deletion
+  - Phase 1 discovery: O(total_dirs) for path strings bucketed by depth (not coroutines or scandir results)
+  - Phase 1 deletion: O(widest_single_level) — each depth level is freed after processing
+  - Dynamic back-pressure pauses discovery and reduces batch sizes when memory is high
+- **Faster Directory Cleanup**: Dedicated Phase 1 processes directories without competing with file scanning I/O
+- **Reduced Scan Time**: Removing empty directories first makes subsequent file scanning faster and lighter
+
+### Testing
+- **Comprehensive Test Suite**: Rewrote and added tests for two-pass architecture
+  - `test_standalone_purge_deletes_all_empty_dirs`: Phase 1 basic functionality
+  - `test_standalone_purge_handles_nested_empty_dirs`: Phase 1 nested directory handling
+  - `test_standalone_purge_respects_rate_limit`: Phase 1 rate limiting
+  - `test_standalone_purge_with_dry_run`: Phase 1 dry-run mode
+  - `test_standalone_purge_skips_non_empty_dirs`: Phase 1 skips directories with files
+  - `test_standalone_purge_never_deletes_root`: Phase 1 root protection
+  - `test_standalone_purge_handles_permission_errors`: Phase 1 error handling
+  - `test_two_pass_order_empty_dirs_before_scan`: Verifies phase ordering
+  - `test_standalone_purge_no_recursive_coroutine_overhead`: Verifies iterative BFS
+  - `test_standalone_purge_back_pressure_reduces_batch_size`: Verifies memory throttling
+  - `test_post_scan_empty_dir_cleanup`: Verifies Phase 3 pipeline
+  - `test_standalone_empty_dir_purger`: End-to-end Phase 1 test
+
+### Documentation
+- **Updated README**: Two-pass architecture description, updated CLI help, performance section
+- **Updated CLI**: `--remove-empty-dirs` help text reflects two-pass approach
+
 ## [1.14.0] - 2026-02-04
 
 ### Added
-- **Incremental Empty Directory Processing**: Prevents OOM on filesystems with millions of empty directories
-  - Automatically processes empty directories in batches during scanning when memory/count thresholds are exceeded
-  - Memory threshold: 70% of `memory_limit_mb` (default: 560 MB for 800 MB limit)
-  - Count threshold: Calculated based on memory limit (~4000 directories for 800 MB limit)
-  - Maintains post-order deletion (deepest first) within each batch
-  - Frees memory after each batch (clears `empty_dirs` set and triggers garbage collection)
-  - Continues scanning after processing batch, repeating as needed
-  - No configuration required - works automatically to prevent unbounded memory growth
-
-### Performance
-- **Memory Bounded**: Prevents OOM on very large filesystems with millions of empty directories
-  - Previously: `empty_dirs` set could grow unbounded, causing OOM
-  - Now: Automatically processes and clears directories when thresholds exceeded
-  - Safe for filesystems with unlimited empty directories
-- **Transparent Operation**: Incremental processing happens automatically during scanning
-  - Users benefit without configuration changes
-  - Batch tracking: `empty_dirs_processed_total` counter tracks batches
-
-### Testing
-- **Comprehensive Test Suite**: 6 new tests for incremental processing
-  - `test_incremental_processing_triggers_on_count_threshold`: Verifies triggering on count threshold
-  - `test_incremental_processing_maintains_post_order`: Verifies post-order deletion maintained
-  - `test_incremental_processing_respects_rate_limit`: Verifies rate limiting works with incremental processing
-  - `test_incremental_processing_frees_memory`: Verifies memory freed after batch
-  - `test_no_incremental_processing_when_disabled`: Verifies no processing when feature disabled
-  - `test_incremental_processing_with_dry_run`: Verifies dry-run mode works correctly
-- **Updated Existing Tests**: Fixed 3 tests to account for incremental processing behavior
-  - Tests can disable incremental processing with `purger.empty_dirs_count_threshold = float('inf')`
-
-### Documentation
-- **Updated README**: Added incremental processing to performance features
-- **Environment Variables**: Completed documentation of all environment variables
-  - Added `EFSPURGE_MAX_AGE_DAYS`, `EFSPURGE_LOG_LEVEL`, `EFSPURGE_MEMORY_LIMIT_MB`, `EFSPURGE_TASK_BATCH_SIZE`
+- **Incremental Empty Directory Processing** (superseded by v1.15.0 two-pass approach)
 
 ## [1.13.1] - 2026-01-28
 

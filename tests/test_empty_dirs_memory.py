@@ -179,8 +179,8 @@ async def test_empty_dir_deletion_memory_pressure_checks(temp_dir):
     directories to the queue. This prevents memory growth by stopping queue feeding
     when memory is high.
 
-    With incremental processing, directories may be deleted during scanning, so the
-    final pass may have fewer directories to process.
+    Note: With the two-pass architecture, Phase 1 (standalone purge) runs before scanning,
+    so directories found during scan are only those that became empty after file purging.
     """
     # Create many empty directories - enough to trigger multiple memory checks
     # Producer checks memory before adding each directory to queue
@@ -199,10 +199,6 @@ async def test_empty_dir_deletion_memory_pressure_checks(temp_dir):
         max_empty_dirs_to_delete=0,  # Unlimited for this test
         dry_run=False,
     )
-
-    # Disable incremental processing to test final pass behavior
-    purger.empty_dirs_count_threshold = float("inf")  # Never trigger incremental processing
-    purger.empty_dirs_memory_threshold = 1.0  # Never trigger on memory (100% threshold)
 
     await purger.scan_directory(temp_dir)
 
@@ -337,30 +333,22 @@ async def test_cascading_deletion_memory_bounded(temp_dir):
         dry_run=False,
     )
 
-    # Disable incremental processing to test the full cascading deletion behavior
-    purger.empty_dirs_count_threshold = float("inf")  # Never trigger incremental processing
-    purger.empty_dirs_memory_threshold = 1.0  # Never trigger on memory (100% threshold)
-
     await purger.scan_directory(temp_dir)
 
     # Monitor memory during cascading deletion
     process = psutil.Process(os.getpid())
     memory_before = process.memory_info().rss / 1024 / 1024
 
-    # Track incremental processing
-    incremental_deleted = purger.stats.get("empty_dirs_deleted", 0)
-    print(f"Deleted during incremental processing: {incremental_deleted}")
-
     await purger._remove_empty_directories()
 
     memory_after = process.memory_info().rss / 1024 / 1024
     memory_increase = memory_after - memory_before
 
-    # Total deleted includes both incremental and final pass
+    # Total deleted from Phase 3 (post-scan cleanup)
     total_deleted = purger.stats["empty_dirs_deleted"]
-    print(f"Total deleted (incremental + final): {total_deleted}")
+    print(f"Total deleted (Phase 3): {total_deleted}")
 
-    # Verify all directories were deleted (allowing for incremental processing)
+    # Verify all directories were deleted
     assert total_deleted == total_dirs, (
         f"Expected {total_dirs} directories to be deleted, but {total_deleted} were deleted"
     )
@@ -372,80 +360,44 @@ async def test_cascading_deletion_memory_bounded(temp_dir):
 
 
 @pytest.mark.asyncio
-async def test_critical_memory_threshold_allows_small_batches(temp_dir):
+async def test_standalone_empty_dir_purger(temp_dir):
     """
-    Test that small batches are allowed only when memory reaches critical level (90%).
+    Test the standalone empty directory purger (Phase 1).
 
-    This ensures the fix correctly allows bypassing min_batch_size only at 90%+ memory,
-    not at the 70% memory threshold.
+    This verifies the two-pass approach: Phase 1 discovers and deletes empty
+    directories using an efficient iterative BFS + bottom-up walker, without
+    the overhead of the full recursive scanning infrastructure.
     """
-    import efspurge.purger
+    # Create a mix of empty and non-empty directories
+    num_empty = 200
+    num_with_files = 50
 
-    # Create some empty directories
-    num_dirs = 50
-    for i in range(num_dirs):
-        (temp_dir / f"empty_{i:03d}").mkdir()
+    for i in range(num_empty):
+        (temp_dir / f"empty_{i:04d}").mkdir()
 
-    # Set very low memory limit to easily hit 90%
+    for i in range(num_with_files):
+        d = temp_dir / f"has_files_{i:04d}"
+        d.mkdir()
+        (d / "file.txt").write_text("content")
+
     purger = AsyncEFSPurger(
         root_path=str(temp_dir),
         max_age_days=0,
         dry_run=False,
         remove_empty_dirs=True,
-        max_empty_dirs_to_delete=0,
-        memory_limit_mb=100,  # Very low to easily hit thresholds
+        max_empty_dirs_to_delete=0,  # Unlimited
+        memory_limit_mb=800,
         log_level="INFO",
     )
 
-    # Configure thresholds
-    purger.empty_dirs_memory_threshold = 0.70  # 70 MB
-    purger.empty_dirs_min_batch_size = 100  # Higher than total dirs
-    purger.empty_dirs_count_threshold = 1000  # Won't trigger
+    deleted = await purger._purge_empty_directories_standalone()
 
-    # Test the logic directly
-    # At 60 MB (60% of 100 MB limit) - below memory threshold
-    # Should NOT process with only 30 dirs (below min_batch_size)
-    async with purger.stats_lock:
-        for i in range(30):
-            purger.empty_dirs.add(temp_dir / f"test_{i}")
+    # All empty dirs should be deleted
+    assert deleted == num_empty, f"Expected {num_empty} empty dirs deleted, got {deleted}"
 
-    # Mock memory to be at 60 MB (below 70% threshold)
-    original_get_memory = efspurge.purger.get_memory_usage_mb
+    # Non-empty dirs should still exist
+    remaining = [d for d in temp_dir.iterdir() if d.is_dir()]
+    assert len(remaining) == num_with_files, f"Expected {num_with_files} non-empty dirs remaining, got {len(remaining)}"
 
-    def mock_memory_60mb():
-        return 60.0
-
-    efspurge.purger.get_memory_usage_mb = mock_memory_60mb
-
-    try:
-        should_process, count, mem = await purger._should_process_empty_dirs_incrementally()
-        assert not should_process, "Should NOT process at 60% memory with only 30 dirs (below min_batch_size)"
-
-        # At 75 MB (75% of 100 MB limit) - above 70% memory threshold but below 90% critical
-        # Should NOT process with only 30 dirs (below min_batch_size)
-        def mock_memory_75mb():
-            return 75.0
-
-        efspurge.purger.get_memory_usage_mb = mock_memory_75mb
-
-        should_process, count, mem = await purger._should_process_empty_dirs_incrementally()
-        assert not should_process, (
-            "Should NOT process at 75% memory with only 30 dirs (below min_batch_size). "
-            "Only critical memory (90%+) should bypass min_batch_size."
-        )
-
-        # At 91 MB (91% of 100 MB limit) - above 90% critical threshold
-        # Should process even with only 30 dirs (critical memory bypasses min_batch_size)
-        def mock_memory_91mb():
-            return 91.0
-
-        efspurge.purger.get_memory_usage_mb = mock_memory_91mb
-
-        should_process, count, mem = await purger._should_process_empty_dirs_incrementally()
-        assert should_process, (
-            "SHOULD process at 91% memory even with only 30 dirs. "
-            "Critical memory (90%+) should bypass min_batch_size to prevent OOM."
-        )
-    finally:
-        # Restore original
-        efspurge.purger.get_memory_usage_mb = original_get_memory
+    # Stats should be updated
+    assert purger.stats["empty_dirs_deleted"] == num_empty

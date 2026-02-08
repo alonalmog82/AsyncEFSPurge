@@ -99,7 +99,11 @@ def parse_args() -> argparse.Namespace:
         "--remove-empty-dirs",
         action="store_true",
         default=os.getenv("EFSPURGE_REMOVE_EMPTY_DIRS", "").lower() in ("1", "true", "yes"),
-        help="Remove empty directories after scanning (post-order deletion)",
+        help=(
+            "Remove empty directories using two-pass approach: "
+            "Phase 1 deletes existing empty dirs before scanning, "
+            "Phase 3 cleans up dirs that became empty after file purging"
+        ),
     )
 
     parser.add_argument(

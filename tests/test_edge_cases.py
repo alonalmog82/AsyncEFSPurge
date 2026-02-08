@@ -278,8 +278,8 @@ async def test_max_age_days_zero_skips_file_processing(temp_dir):
     # But directories should still be scanned
     assert purger.stats["dirs_scanned"] >= 1
 
-    # Empty directory should be found and marked for deletion
-    assert len(purger.empty_dirs) >= 1
+    # Empty directory should be found and marked for deletion (handled in Phase 1 standalone)
+    assert purger.stats["empty_dirs_to_delete"] >= 1
 
 
 @pytest.mark.asyncio

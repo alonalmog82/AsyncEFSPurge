@@ -159,10 +159,8 @@ async def test_memory_pressure_stops_queue_feeding(temp_dir):
         dry_run=False,
     )
 
-    # Disable incremental processing to test final pass behavior
-    purger.empty_dirs_count_threshold = float("inf")  # Never trigger incremental processing
-    purger.empty_dirs_memory_threshold = 1.0  # Never trigger on memory (100% threshold)
-    purger.empty_dirs_min_batch_size = float("inf")  # Never process incrementally
+    # Note: Incremental processing has been removed in favor of two-pass approach
+    # Phase 1 (standalone) handles empty dirs, Phase 3 handles post-scan cleanup
 
     await purger.scan_directory(temp_dir)
 

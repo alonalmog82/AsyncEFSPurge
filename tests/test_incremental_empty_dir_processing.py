@@ -1,8 +1,10 @@
 """
-Tests for incremental empty directory processing feature.
+Tests for the standalone two-pass empty directory processing feature.
 
-This feature prevents OOM by processing empty directories in batches
-during scanning when memory or count thresholds are exceeded.
+Phase 1 (standalone): Efficient iterative BFS + bottom-up walker that discovers
+and deletes empty directories BEFORE file scanning.
+Phase 2: Normal file scanning and purging.
+Phase 3: Post-scan cleanup of directories that became empty after file purging.
 """
 
 from pathlib import Path
@@ -13,49 +15,40 @@ from efspurge.purger import AsyncEFSPurger
 
 
 @pytest.mark.asyncio
-async def test_incremental_processing_triggers_on_count_threshold(tmp_path: Path) -> None:
-    """Test that incremental processing triggers when count threshold is exceeded."""
-    # Create a structure with many empty directories
-    # We'll create more than the default count threshold
-    num_dirs = 100  # Create 100 empty dirs
-
+async def test_standalone_purge_deletes_all_empty_dirs(tmp_path: Path) -> None:
+    """Test that standalone purge deletes all empty directories."""
+    num_dirs = 100
     for i in range(num_dirs):
-        dir_path = tmp_path / f"empty_{i:03d}"
-        dir_path.mkdir()
+        (tmp_path / f"empty_{i:03d}").mkdir()
 
-    # Configure purger with low count threshold to trigger incremental processing
     purger = AsyncEFSPurger(
         root_path=str(tmp_path),
-        max_age_days=0,  # Skip file processing
+        max_age_days=0,
         dry_run=False,
         remove_empty_dirs=True,
         max_empty_dirs_to_delete=0,  # Unlimited
         memory_limit_mb=800,
-        log_level="INFO",
     )
 
-    # Override the count threshold to a low value to trigger incremental processing
-    purger.empty_dirs_count_threshold = 50  # Process when we have > 50 empty dirs
-
-    # Run purge
     stats = await purger.purge()
 
-    # Verify all directories were deleted
+    # All empty dirs should be deleted
     assert stats["dirs_purged"] == num_dirs
-    # Verify incremental processing was used (check that counter was incremented)
-    assert purger.empty_dirs_processed_total > 0
+    # No files should be processed (max_age_days=0)
+    assert stats["files_scanned"] == 0
 
 
 @pytest.mark.asyncio
-async def test_incremental_processing_maintains_post_order(tmp_path: Path) -> None:
-    """Test that incremental processing maintains post-order deletion (deepest first)."""
-    # Create nested directory structure
-    # parent/
-    #   child1/ (empty)
-    #   child2/
-    #     grandchild1/ (empty)
-    #     grandchild2/ (empty)
+async def test_standalone_purge_handles_nested_empty_dirs(tmp_path: Path) -> None:
+    """Test that standalone purge handles nested empty directories correctly.
 
+    Bottom-up processing means children are deleted before parents,
+    allowing parent directories to become empty and be deleted too.
+    """
+    # Create nested structure:
+    # parent/child1/ (empty)
+    # parent/child2/grandchild1/ (empty)
+    # parent/child2/grandchild2/ (empty)
     parent = tmp_path / "parent"
     child1 = parent / "child1"
     child2 = parent / "child2"
@@ -66,7 +59,6 @@ async def test_incremental_processing_maintains_post_order(tmp_path: Path) -> No
     grandchild1.mkdir(parents=True)
     grandchild2.mkdir(parents=True)
 
-    # Configure purger with low count threshold
     purger = AsyncEFSPurger(
         root_path=str(tmp_path),
         max_age_days=0,
@@ -77,34 +69,24 @@ async def test_incremental_processing_maintains_post_order(tmp_path: Path) -> No
         log_level="DEBUG",
     )
 
-    # Set low threshold to trigger incremental processing
-    purger.empty_dirs_count_threshold = 2
-
-    # Run purge
     stats = await purger.purge()
 
-    # Incremental processing deletes the leaf directories (grandchild1, grandchild2, child1)
-    # The final pass will handle parent directories that become empty (child2, parent)
-    # Total: grandchild1, grandchild2, child1, child2, parent = 5 directories
-    # But incremental processing only gets the first batch (3 leaf dirs)
-    # Final pass should get child2 and parent
-    assert stats["dirs_purged"] >= 3  # At least the 3 leaf dirs
+    # All 5 directories should be deleted (grandchild1, grandchild2, child1, child2, parent)
+    assert stats["dirs_purged"] >= 3  # At least the leaf dirs
 
-    # Verify leaf directories are deleted
+    # Leaf dirs should definitely be gone
     assert not child1.exists()
     assert not grandchild1.exists()
     assert not grandchild2.exists()
 
 
 @pytest.mark.asyncio
-async def test_incremental_processing_respects_rate_limit(tmp_path: Path) -> None:
-    """Test that incremental processing respects max_empty_dirs_to_delete limit."""
-    # Create many empty directories
+async def test_standalone_purge_respects_rate_limit(tmp_path: Path) -> None:
+    """Test that standalone purge respects max_empty_dirs_to_delete limit."""
     num_dirs = 100
     for i in range(num_dirs):
         (tmp_path / f"empty_{i:03d}").mkdir()
 
-    # Configure with rate limit
     max_to_delete = 30
     purger = AsyncEFSPurger(
         root_path=str(tmp_path),
@@ -113,13 +95,8 @@ async def test_incremental_processing_respects_rate_limit(tmp_path: Path) -> Non
         remove_empty_dirs=True,
         max_empty_dirs_to_delete=max_to_delete,
         memory_limit_mb=800,
-        log_level="INFO",
     )
 
-    # Set low threshold to trigger incremental processing
-    purger.empty_dirs_count_threshold = 20
-
-    # Run purge
     stats = await purger.purge()
 
     # Should delete at most max_to_delete directories
@@ -128,57 +105,8 @@ async def test_incremental_processing_respects_rate_limit(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_incremental_processing_frees_memory(tmp_path: Path) -> None:
-    """Test that incremental processing clears empty_dirs set to free memory."""
-    # Create directories - need more to see the effect of incremental processing
-    num_dirs = 200
-    for i in range(num_dirs):
-        (tmp_path / f"empty_{i:03d}").mkdir()
-
-    purger = AsyncEFSPurger(
-        root_path=str(tmp_path),
-        max_age_days=0,
-        dry_run=False,
-        remove_empty_dirs=True,
-        max_empty_dirs_to_delete=0,
-        memory_limit_mb=800,
-        log_level="INFO",
-    )
-
-    # Set threshold to trigger after 50 dirs
-    purger.empty_dirs_count_threshold = 50
-    # Set low min batch size so it will actually process
-    purger.empty_dirs_min_batch_size = 40
-
-    # Track empty_dirs size during scan
-    original_check_empty = purger._check_empty_directory
-    max_empty_dirs_seen = 0
-
-    async def tracked_check_empty(directory: Path) -> None:
-        nonlocal max_empty_dirs_seen
-        await original_check_empty(directory)
-        async with purger.stats_lock:
-            max_empty_dirs_seen = max(max_empty_dirs_seen, len(purger.empty_dirs))
-
-    purger._check_empty_directory = tracked_check_empty
-
-    # Run purge
-    stats = await purger.purge()
-
-    # Verify that incremental processing happened (processed more than one batch)
-    assert purger.empty_dirs_processed_total > purger.empty_dirs_count_threshold, (
-        f"Expected multiple batches to be processed. "
-        f"Total processed: {purger.empty_dirs_processed_total}, threshold: {purger.empty_dirs_count_threshold}"
-    )
-
-    # Verify that all directories were eventually deleted
-    assert stats["dirs_purged"] == num_dirs
-
-
-@pytest.mark.asyncio
-async def test_no_incremental_processing_when_disabled(tmp_path: Path) -> None:
-    """Test that incremental processing doesn't run when remove_empty_dirs=False."""
-    # Create many directories (but don't enable removal)
+async def test_no_deletion_when_disabled(tmp_path: Path) -> None:
+    """Test that no directories are deleted when remove_empty_dirs=False."""
     num_dirs = 100
     for i in range(num_dirs):
         (tmp_path / f"empty_{i:03d}").mkdir()
@@ -187,18 +115,15 @@ async def test_no_incremental_processing_when_disabled(tmp_path: Path) -> None:
         root_path=str(tmp_path),
         max_age_days=0,
         dry_run=False,
-        remove_empty_dirs=False,  # Disabled
+        remove_empty_dirs=False,
         memory_limit_mb=800,
-        log_level="INFO",
     )
 
-    # Run purge
     stats = await purger.purge()
 
     # No directories should be deleted
     assert stats.get("dirs_purged", 0) == 0
     assert stats.get("dirs_to_purge", 0) == 0
-    assert purger.empty_dirs_processed_total == 0
 
     # All directories should still exist
     for i in range(num_dirs):
@@ -206,9 +131,8 @@ async def test_no_incremental_processing_when_disabled(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_incremental_processing_with_dry_run(tmp_path: Path) -> None:
-    """Test that incremental processing works correctly in dry-run mode."""
-    # Create directories
+async def test_standalone_purge_with_dry_run(tmp_path: Path) -> None:
+    """Test that standalone purge works correctly in dry-run mode."""
     num_dirs = 60
     for i in range(num_dirs):
         (tmp_path / f"empty_{i:03d}").mkdir()
@@ -216,28 +140,17 @@ async def test_incremental_processing_with_dry_run(tmp_path: Path) -> None:
     purger = AsyncEFSPurger(
         root_path=str(tmp_path),
         max_age_days=0,
-        dry_run=True,  # Dry run
+        dry_run=True,
         remove_empty_dirs=True,
-        max_empty_dirs_to_delete=100,  # Use a limit so counter is incremented
+        max_empty_dirs_to_delete=0,
         memory_limit_mb=800,
-        log_level="INFO",
     )
 
-    # Set low threshold to trigger incremental processing
-    purger.empty_dirs_count_threshold = 30
-    # Set low min batch size so it will actually process
-    purger.empty_dirs_min_batch_size = 20
-
-    # Run purge
     stats = await purger.purge()
 
-    # In dry run, empty_dirs_to_delete is incremented but empty_dirs_deleted is 0
-    # Since we set limit to 100 and only have 60 dirs, all should be counted
-    assert stats.get("empty_dirs_to_delete", 0) == num_dirs or stats.get("dirs_to_purge", 0) == num_dirs
+    # In dry run, dirs should be counted but not actually deleted
+    assert stats.get("dirs_to_purge", 0) == num_dirs
     assert stats.get("empty_dirs_deleted", 0) == 0 or stats.get("dirs_purged", 0) == 0
-
-    # Verify incremental processing was used
-    assert purger.empty_dirs_processed_total > 0
 
     # All directories should still exist (dry run)
     for i in range(num_dirs):
@@ -245,19 +158,19 @@ async def test_incremental_processing_with_dry_run(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_min_batch_size_enforced_below_critical_memory(tmp_path: Path) -> None:
-    """
-    Test that min_batch_size is enforced even when memory threshold is exceeded,
-    as long as memory is below critical level (90%).
+async def test_standalone_purge_skips_non_empty_dirs(tmp_path: Path) -> None:
+    """Test that standalone purge skips directories that contain files."""
+    # Create mix of empty and non-empty directories
+    num_empty = 50
+    num_non_empty = 50
 
-    This test catches the bug where memory_exceeded would bypass min_batch_size,
-    causing rapid-fire tiny batches when memory hovered above the 70% threshold
-    but below the critical 90% threshold.
-    """
-    # Create directories
-    num_dirs = 200
-    for i in range(num_dirs):
+    for i in range(num_empty):
         (tmp_path / f"empty_{i:03d}").mkdir()
+
+    for i in range(num_non_empty):
+        d = tmp_path / f"has_file_{i:03d}"
+        d.mkdir()
+        (d / "file.txt").write_text("content")
 
     purger = AsyncEFSPurger(
         root_path=str(tmp_path),
@@ -266,47 +179,34 @@ async def test_min_batch_size_enforced_below_critical_memory(tmp_path: Path) -> 
         remove_empty_dirs=True,
         max_empty_dirs_to_delete=0,
         memory_limit_mb=800,
-        log_level="INFO",
     )
 
-    # Configure thresholds:
-    # - Memory threshold at 70% = 560 MB
-    # - Min batch size = 100 (enforce this!)
-    # - Count threshold = 1000 (won't trigger)
-    purger.empty_dirs_memory_threshold = 0.70
-    purger.empty_dirs_min_batch_size = 100
-    purger.empty_dirs_count_threshold = 1000
-
-    # Track batch sizes during processing
-    batch_sizes = []
-    original_process_batch = purger._process_empty_dirs_batch
-
-    async def tracked_process_batch() -> None:
-        async with purger.stats_lock:
-            batch_size = len(purger.empty_dirs)
-        batch_sizes.append(batch_size)
-        await original_process_batch()
-
-    purger._process_empty_dirs_batch = tracked_process_batch
-
-    # Run purge
     stats = await purger.purge()
 
-    # Verify all directories were deleted
-    assert stats["dirs_purged"] == num_dirs
+    # Only empty dirs should be deleted
+    assert stats["dirs_purged"] == num_empty
 
-    # Critical assertion: ALL batches should respect min_batch_size
-    # (unless it's the very last batch with remaining dirs < min_batch_size)
-    if batch_sizes:
-        # Filter out the final cleanup batch
-        scanning_batches = batch_sizes[:-1] if batch_sizes else []
+    # Non-empty dirs should still exist
+    for i in range(num_non_empty):
+        assert (tmp_path / f"has_file_{i:03d}").exists()
 
-        for i, batch_size in enumerate(scanning_batches):
-            # Each batch during scanning should be >= min_batch_size
-            # This would fail with the old buggy logic where memory_exceeded
-            # would allow tiny batches like 3, 5, 9, etc.
-            assert batch_size >= purger.empty_dirs_min_batch_size, (
-                f"Batch {i} had size {batch_size}, which is below min_batch_size "
-                f"{purger.empty_dirs_min_batch_size}. This indicates the bug where "
-                f"memory_exceeded bypasses min_batch_size is present."
-            )
+
+@pytest.mark.asyncio
+async def test_standalone_purge_never_deletes_root(tmp_path: Path) -> None:
+    """Test that standalone purge never deletes the root directory."""
+    # Create a single empty subdir so discovery finds something
+    (tmp_path / "subdir").mkdir()
+
+    purger = AsyncEFSPurger(
+        root_path=str(tmp_path),
+        max_age_days=0,
+        dry_run=False,
+        remove_empty_dirs=True,
+        max_empty_dirs_to_delete=0,
+        memory_limit_mb=800,
+    )
+
+    await purger.purge()
+
+    # Root should always exist
+    assert tmp_path.exists()

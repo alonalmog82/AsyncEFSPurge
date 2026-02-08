@@ -17,7 +17,7 @@ High-performance asynchronous file purger designed for AWS EFS and network files
 - 🎯 **Flexible** - Age-based filtering with day precision
 - 🐳 **Production Ready** - Docker support with security best practices
 - 📈 **Detailed Stats** - Files scanned, purged, bytes freed, errors, and performance metrics
-- 🗂️ **Empty Directory Cleanup** - Optional post-order deletion of empty directories with rate limiting
+- 🗂️ **Empty Directory Cleanup** - Two-pass empty directory purging: efficient standalone Phase 1 before file scanning, plus Phase 3 post-scan cleanup with rate limiting
 
 ## Quick Start
 
@@ -93,7 +93,7 @@ options:
   --task-batch-size N       Maximum tasks to create at once, prevents OOM (default: 5000)
   --max-concurrent-subdirs N  Maximum subdirectories to scan concurrently (default: 100)
   --dry-run                 Don't actually delete files, just report what would be deleted
-  --remove-empty-dirs       Remove empty directories after scanning (post-order deletion)
+  --remove-empty-dirs       Remove empty directories (two-pass: Phase 1 before scan, Phase 3 after scan)
   --max-empty-dirs-to-delete N  Maximum empty directories to delete per run (0 = unlimited, default: 500)
   --log-level LEVEL         Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL (default: INFO)
   --version                 Show version and exit
@@ -276,7 +276,7 @@ Optimized for network filesystems with high latency:
 - **Concurrent Directory Scanning**: Subdirectories processed in parallel (5-10x faster on deep hierarchies)
 - **Batched Task Creation**: Prevents OOM on large directories
 - **Memory Back-Pressure**: Automatic throttling when memory usage is high
-- **Incremental Empty Directory Processing**: Automatically processes empty directories in batches during scanning to prevent unbounded memory growth (70% memory threshold)
+- **Two-Pass Empty Directory Purging**: Efficient standalone Phase 1 deletes existing empty directories before file scanning using iterative BFS with level-by-level bottom-up deletion and dynamic back-pressure; Phase 3 cleans up directories that became empty after file purging
 - **Controlled Concurrency**: Prevents filesystem overload
 - **Efficient I/O**: Async operations overlap network latency
 
@@ -325,7 +325,7 @@ Logs are JSON-formatted for easy parsing and integration with logging systems:
 - **Root Directory Protection**: Root directory is never deleted, even if empty
 - **Error Isolation**: Individual file errors don't stop the entire operation
 - **Permission Handling**: Gracefully handles permission denied errors
-- **Post-Order Deletion**: Empty directories deleted in safe order (children before parents)
+- **Bottom-Up Deletion**: Empty directories deleted in safe order (deepest first, children before parents)
 - **Transparent Limitations**: See [Race Condition Considerations](#race-condition-considerations-toctou) for POSIX-inherent limitations that affect all file purgers
 
 ## Race Condition Considerations (TOCTOU)
@@ -644,6 +644,15 @@ MIT License - see [LICENSE](LICENSE) file for details.
 Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests.
 
 ## Changelog
+
+### Version 1.15.0 (2026-02-XX)
+- **ARCHITECTURAL CHANGE**: Two-pass empty directory purging replaces incremental processing
+  - **Phase 1**: Efficient standalone empty directory purge runs BEFORE file scanning using iterative BFS with level-by-level bottom-up deletion
+  - **Phase 3**: Post-scan cleanup catches directories that became empty after file purging
+  - Real back-pressure: dynamic concurrency throttling when memory is high
+  - Bounded deletion memory: O(widest single depth level) instead of O(total dirs)
+  - Handles millions of empty directories efficiently
+- See [CHANGELOG.md](CHANGELOG.md) for detailed changelog
 
 ### Version 1.9.0 (2026-01-XX)
 - **BREAKING CHANGE**: Split concurrency parameters into separate scanning and deletion limits

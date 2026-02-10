@@ -2136,9 +2136,7 @@ class AsyncEFSPurger:
                             "dirs_discovered": self._discovery_dirs_found,
                             "dirs_queued": self._discovery_queue_size,
                             "memory_mb": round(get_memory_usage_mb(), 1),
-                            "memory_usage_percent": round(
-                                get_memory_usage_mb() / self.memory_limit_mb * 100, 1
-                            )
+                            "memory_usage_percent": round(get_memory_usage_mb() / self.memory_limit_mb * 100, 1)
                             if self.memory_limit_mb > 0
                             else 0,
                         },

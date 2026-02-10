@@ -528,6 +528,13 @@ class AsyncEFSPurger:
         self.last_empty_dirs_deleted = 0
         self.stuck_detection_count = 0  # How many consecutive progress checks showed no change
 
+        # Discovery state: tracked so the progress monitor can report what's happening
+        # during Phase 1a instead of emitting false hang warnings.
+        self._discovery_active = False
+        self._discovery_current_dir: str | None = None
+        self._discovery_dirs_found = 0
+        self._discovery_queue_size = 0
+
         # Track directories currently being scanned (for diagnostics when stuck)
         self.active_directories: set[Path] = set()
         self.active_directories_lock = asyncio.Lock()
@@ -1340,6 +1347,11 @@ class AsyncEFSPurger:
             },
         )
 
+        self._discovery_active = True
+        self._discovery_dirs_found = 0
+        self._discovery_current_dir = str(self.root_path)
+        self._discovery_queue_size = len(dirs_to_visit)
+
         memory_abort = False
         while dirs_to_visit and not memory_abort:
             # Check memory pressure during discovery
@@ -1369,6 +1381,9 @@ class AsyncEFSPurger:
                         break
 
             current_dir = dirs_to_visit.popleft()
+            self._discovery_current_dir = str(current_dir)
+            self._discovery_dirs_found = total_dirs_discovered
+            self._discovery_queue_size = len(dirs_to_visit)
 
             try:
                 # Use batched scandir to avoid blocking the event loop for a long
@@ -1446,6 +1461,10 @@ class AsyncEFSPurger:
                         "discovery_errors": discovery_errors,
                     },
                 )
+
+        # Discovery complete - clear state so progress monitor stops reporting discovery
+        self._discovery_active = False
+        self._discovery_current_dir = None
 
         # Free the BFS queue now that discovery is complete
         del dirs_to_visit
@@ -2102,9 +2121,32 @@ class AsyncEFSPurger:
             # Stuck detection: check if progress has stalled
             # During scanning phase: check files_scanned and dirs_scanned
             # During empty dir removal phase: check empty_dirs_deleted
+            # During discovery (Phase 1a): report progress instead of false hang warnings
             if self.current_phase == "removing_empty_dirs":
-                # During empty directory removal, check empty_dirs_deleted for progress
-                if current_empty_dirs_deleted == self.last_empty_dirs_deleted:
+                if self._discovery_active:
+                    # Still in Phase 1a directory discovery - not stuck, just scanning
+                    # a large directory tree. Report discovery progress instead of a hang warning.
+                    log_with_context(
+                        self.logger,
+                        "info",
+                        "Phase 1a: Directory discovery in progress",
+                        {
+                            "phase": "discovery",
+                            "current_directory": self._discovery_current_dir,
+                            "dirs_discovered": self._discovery_dirs_found,
+                            "dirs_queued": self._discovery_queue_size,
+                            "memory_mb": round(get_memory_usage_mb(), 1),
+                            "memory_usage_percent": round(
+                                get_memory_usage_mb() / self.memory_limit_mb * 100, 1
+                            )
+                            if self.memory_limit_mb > 0
+                            else 0,
+                        },
+                    )
+                    # Reset stuck counter - discovery is making progress even if deletion isn't
+                    self.stuck_detection_count = 0
+                elif current_empty_dirs_deleted == self.last_empty_dirs_deleted:
+                    # Actual deletion phase with no progress
                     self.stuck_detection_count += 1
 
                     if self.stuck_detection_count >= 2:

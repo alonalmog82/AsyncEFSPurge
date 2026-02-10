@@ -1,6 +1,7 @@
 """Async file purger optimized for AWS EFS and network storage."""
 
 import asyncio
+import gc
 import logging
 import os
 import queue
@@ -13,6 +14,13 @@ import aiofiles.os
 
 from . import __version__
 from .logging import log_with_context, setup_logging
+
+# Maximum number of directories to discover in Phase 1a.
+# This caps the memory footprint of dirs_by_depth.  Each Path object
+# is ~400-600 bytes, so 1M dirs ≈ 400-600 MB.  Setting this to 1M
+# keeps discovery memory well within a 4.5 GB container budget while
+# still covering the vast majority of real-world directory trees.
+MAX_DISCOVERY_DIRS_DEFAULT = 1_000_000
 
 
 def get_memory_usage_mb() -> float:
@@ -96,6 +104,30 @@ async def async_scandir(path: Path, executor: ThreadPoolExecutor | None = None, 
                 await _log_scandir_diagnostics(purger_instance, executor, current_time)
 
     return result
+
+
+async def async_is_dir_empty(path: Path, executor: ThreadPoolExecutor | None = None) -> bool:
+    """
+    Efficiently check if a directory is empty without materializing all entries.
+
+    Unlike async_scandir which returns list(os.scandir(path)) - materializing every
+    entry into memory - this function uses next() to check for just the first entry.
+    For directories with thousands of files (common on EFS), this avoids creating
+    a list of thousands of DirEntry objects just to determine the dir is non-empty.
+
+    Returns:
+        True if the directory is empty, False otherwise.
+
+    Raises:
+        FileNotFoundError, PermissionError, OSError on I/O errors.
+    """
+    loop = asyncio.get_running_loop()
+
+    def _is_empty():
+        with os.scandir(path) as it:
+            return next(it, None) is None
+
+    return await loop.run_in_executor(executor, _is_empty)
 
 
 async def async_scandir_batched(
@@ -384,6 +416,7 @@ class AsyncEFSPurger:
         remove_empty_dirs: bool = False,
         max_empty_dirs_to_delete: int = 500,
         max_concurrent_subdirs: int = 100,
+        max_discovery_dirs: int = 0,
     ):
         """
         Initialize the async EFS purger.
@@ -401,6 +434,7 @@ class AsyncEFSPurger:
             remove_empty_dirs: If True, remove empty directories after scanning (post-order)
             max_empty_dirs_to_delete: Maximum empty directories to delete per run (0 = unlimited, default: 500)
             max_concurrent_subdirs: Maximum subdirectories to scan concurrently (lower = less memory, default: 100)
+            max_discovery_dirs: Maximum directories to discover in Phase 1a (0 = use automatic limit based on memory)
 
         Raises:
             ValueError: If invalid parameters are provided
@@ -502,6 +536,16 @@ class AsyncEFSPurger:
         self.remove_empty_dirs = remove_empty_dirs
         self.max_empty_dirs_to_delete = max_empty_dirs_to_delete
         self.max_concurrent_subdirs = max_concurrent_subdirs
+
+        # Compute discovery limit: if explicitly set use that, otherwise derive from memory budget.
+        # Each Path object is ~400-600 bytes, so we allow roughly 60% of the memory budget for paths.
+        if max_discovery_dirs > 0:
+            self.max_discovery_dirs = max_discovery_dirs
+        elif memory_limit_mb > 0:
+            # Budget ~60% of memory for directory paths (~500 bytes each)
+            self.max_discovery_dirs = int((memory_limit_mb * 0.6 * 1024 * 1024) / 500)
+        else:
+            self.max_discovery_dirs = MAX_DISCOVERY_DIRS_DEFAULT
 
         # Note: max_empty_dirs_to_delete=0 (unlimited) is safe with the standalone two-pass approach
         # Phase 1 uses bounded memory (iterative BFS + bottom-up processing with back-pressure)
@@ -657,8 +701,6 @@ class AsyncEFSPurger:
                 await asyncio.sleep(0.5)  # Shorter pause, but happens under lock
 
                 # Force garbage collection
-                import gc
-
                 gc.collect()
 
                 return True, memory_mb  # Memory is high, caller should reduce batch sizes
@@ -1323,6 +1365,7 @@ class AsyncEFSPurger:
                 "max_concurrency_deletion": self.max_concurrency_deletion,
                 "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
                 "memory_limit_mb": self.memory_limit_mb,
+                "max_discovery_dirs": self.max_discovery_dirs,
             },
         )
 
@@ -1343,6 +1386,7 @@ class AsyncEFSPurger:
             {
                 "root_path": str(self.root_path),
                 "memory_limit_mb": self.memory_limit_mb,
+                "max_discovery_dirs": self.max_discovery_dirs,
                 "initial_memory_mb": round(get_memory_usage_mb(), 1),
             },
         )
@@ -1353,15 +1397,30 @@ class AsyncEFSPurger:
         self._discovery_queue_size = len(dirs_to_visit)
 
         memory_abort = False
-        while dirs_to_visit and not memory_abort:
+        discovery_limit_reached = False
+        while dirs_to_visit and not memory_abort and not discovery_limit_reached:
+            # Check directory count limit
+            if self.max_discovery_dirs > 0 and total_dirs_discovered >= self.max_discovery_dirs:
+                log_with_context(
+                    self.logger,
+                    "info",
+                    "Discovery directory count limit reached, proceeding with partial tree",
+                    {
+                        "max_discovery_dirs": self.max_discovery_dirs,
+                        "dirs_discovered": total_dirs_discovered,
+                        "dirs_remaining_in_queue": len(dirs_to_visit),
+                        "memory_mb": round(get_memory_usage_mb(), 1),
+                    },
+                )
+                discovery_limit_reached = True
+                break
+
             # Check memory pressure during discovery
             if self.memory_limit_mb > 0:
                 memory_mb = get_memory_usage_mb()
                 memory_percent = memory_mb / self.memory_limit_mb
                 if memory_percent > 0.90:
                     # At 90%+, pause discovery briefly and GC
-                    import gc
-
                     gc.collect()
                     await asyncio.sleep(0.5)
                     memory_mb = get_memory_usage_mb()
@@ -1408,8 +1467,6 @@ class AsyncEFSPurger:
                         memory_mb = get_memory_usage_mb()
                         memory_percent = memory_mb / self.memory_limit_mb
                         if memory_percent > 0.90:
-                            import gc
-
                             gc.collect()
                             await asyncio.sleep(0.1)
                             memory_mb = get_memory_usage_mb()
@@ -1545,13 +1602,16 @@ class AsyncEFSPurger:
                                 self.stats["empty_dirs_to_delete"] = max(0, current - 1)
                         return
 
-                    # Check if directory is empty
-                    entries = await async_scandir(directory, self.scandir_executor, self)
+                    # Check if directory is empty using a lightweight check.
+                    # async_is_dir_empty only peeks at the first entry via next(scandir),
+                    # avoiding materializing a full list(scandir) which for non-empty dirs
+                    # on EFS could be thousands of DirEntry objects that bloat memory.
+                    is_empty = await async_is_dir_empty(directory, self.scandir_executor)
 
                     async with deleted_lock:
                         checked_count += 1
 
-                    if len(entries) > 0:
+                    if not is_empty:
                         async with deleted_lock:
                             skipped_not_empty += 1
                         # Unreserve slot since we're not deleting
@@ -1643,10 +1703,34 @@ class AsyncEFSPurger:
                     memory_mb = get_memory_usage_mb()
                     memory_percent = memory_mb / self.memory_limit_mb
 
-                    if memory_percent > 0.90:
+                    if memory_percent > 0.95:
+                        # Critical memory during deletion - GC aggressively and recheck
+                        gc.collect()
+                        await asyncio.sleep(2.0)
+                        memory_mb = get_memory_usage_mb()
+                        memory_percent = memory_mb / self.memory_limit_mb
+                        if memory_percent > 0.95:
+                            # Still critical after GC - abort remaining deletion
+                            log_with_context(
+                                self.logger,
+                                "warning",
+                                "Memory critical during deletion, stopping to prevent OOM",
+                                {
+                                    "memory_mb": round(memory_mb, 1),
+                                    "memory_percent": round(memory_percent * 100, 1),
+                                    "memory_limit_mb": self.memory_limit_mb,
+                                    "deleted": deleted_count,
+                                    "checked": checked_count,
+                                    "current_depth": current_depth,
+                                    "remaining_in_level": level_size - i,
+                                    "remaining_levels": len(dirs_by_depth),
+                                },
+                            )
+                            rate_limit_reached = True
+                            break
+                        current_batch_size = max(100, BATCH_SIZE // 4)
+                    elif memory_percent > 0.90:
                         # High memory - reduce batch size and pause
-                        import gc
-
                         gc.collect()
                         await asyncio.sleep(1.0)
                         current_batch_size = max(100, BATCH_SIZE // 4)
@@ -1669,6 +1753,10 @@ class AsyncEFSPurger:
                 # Free batch reference
                 del batch
                 del tasks
+
+                # Periodic GC during large deletion runs to prevent memory creep
+                if checked_count % 10000 == 0:
+                    gc.collect()
 
             # Free this entire depth level before moving to the next
             del level_dirs
@@ -1698,8 +1786,6 @@ class AsyncEFSPurger:
         del dirs_by_depth
 
         # Force GC after releasing all directory data
-        import gc
-
         gc.collect()
 
         log_with_context(
@@ -2411,6 +2497,7 @@ async def async_main(
     remove_empty_dirs: bool = False,
     max_empty_dirs_to_delete: int = 500,
     max_concurrent_subdirs: int = 100,
+    max_discovery_dirs: int = 0,
 ) -> dict:
     """
     Async entry point for the purger.
@@ -2428,6 +2515,7 @@ async def async_main(
         remove_empty_dirs: If True, remove empty directories after scanning
         max_empty_dirs_to_delete: Maximum empty directories to delete per run (0 = unlimited, default: 500)
         max_concurrent_subdirs: Maximum subdirectories to scan concurrently (lower = less memory, default: 100)
+        max_discovery_dirs: Maximum directories to discover in Phase 1a (0 = auto based on memory)
 
     Returns:
         Operation statistics
@@ -2445,6 +2533,7 @@ async def async_main(
         remove_empty_dirs=remove_empty_dirs,
         max_empty_dirs_to_delete=max_empty_dirs_to_delete,
         max_concurrent_subdirs=max_concurrent_subdirs,
+        max_discovery_dirs=max_discovery_dirs,
     )
 
     return await purger.purge()

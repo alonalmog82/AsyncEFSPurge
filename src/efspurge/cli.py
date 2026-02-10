@@ -121,6 +121,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--max-discovery-dirs",
+        type=int,
+        default=int(os.getenv("EFSPURGE_MAX_DISCOVERY_DIRS", "0")),
+        help="Maximum directories to discover in Phase 1a (0 = auto based on memory limit)",
+    )
+
+    parser.add_argument(
         "--version",
         action="version",
         version=f"efspurge {__version__}",
@@ -162,6 +169,7 @@ def main() -> None:
                 remove_empty_dirs=args.remove_empty_dirs,
                 max_empty_dirs_to_delete=args.max_empty_dirs_to_delete,
                 max_concurrent_subdirs=args.max_concurrent_subdirs,
+                max_discovery_dirs=args.max_discovery_dirs,
             )
         )
 

@@ -92,6 +92,7 @@ options:
   --memory-limit-mb MB      Soft memory limit in MB, triggers back-pressure (default: 800)
   --task-batch-size N       Maximum tasks to create at once, prevents OOM (default: 5000)
   --max-concurrent-subdirs N  Maximum subdirectories to scan concurrently (default: 100)
+  --max-discovery-dirs N    Maximum directories to discover in Phase 1a (0 = auto based on memory limit)
   --dry-run                 Don't actually delete files, just report what would be deleted
   --remove-empty-dirs       Remove empty directories (two-pass: Phase 1 before scan, Phase 3 after scan)
   --max-empty-dirs-to-delete N  Maximum empty directories to delete per run (0 = unlimited, default: 500)
@@ -457,6 +458,7 @@ ruff format .
 - `EFSPURGE_REMOVE_EMPTY_DIRS=1` - Enable empty directory removal (same as `--remove-empty-dirs` flag)
 - `EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE=N` - Maximum empty directories to delete per run (0 = unlimited, default: 500)
 - `EFSPURGE_MAX_CONCURRENT_SUBDIRS=N` - Maximum subdirectories to scan concurrently (default: 100, lower for deep trees)
+- `EFSPURGE_MAX_DISCOVERY_DIRS=N` - Maximum directories to discover in Phase 1a (0 = auto based on memory limit)
 - `EFSPURGE_MAX_CONCURRENCY=N` - [DEPRECATED] Maximum concurrent operations (use `EFSPURGE_MAX_CONCURRENCY_SCANNING`/`EFSPURGE_MAX_CONCURRENCY_DELETION`)
 - `EFSPURGE_MAX_CONCURRENCY_SCANNING=N` - Maximum concurrent file scanning operations (default: 1000)
 - `EFSPURGE_MAX_CONCURRENCY_DELETION=N` - Maximum concurrent file deletion operations (default: 1000)

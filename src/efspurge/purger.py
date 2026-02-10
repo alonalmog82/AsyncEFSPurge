@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import os
+import queue
 import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -15,20 +16,45 @@ from .logging import log_with_context, setup_logging
 
 
 def get_memory_usage_mb() -> float:
-    """Get current memory usage in MB."""
+    """
+    Get current memory usage in MB.
+
+    In container environments (K8s), this tries to read from cgroup memory stats
+    which reflects the container's actual memory usage, not the host's RSS.
+    """
+    # First, try reading container memory usage from cgroup v2
+    try:
+        with open("/sys/fs/cgroup/memory.current", "r") as f:
+            bytes_used = int(f.read().strip())
+            return bytes_used / 1024 / 1024  # Convert bytes to MB
+    except (FileNotFoundError, PermissionError, ValueError):
+        pass
+
+    # Try cgroup v1
+    try:
+        with open("/sys/fs/cgroup/memory/memory.usage_in_bytes", "r") as f:
+            bytes_used = int(f.read().strip())
+            return bytes_used / 1024 / 1024  # Convert bytes to MB
+    except (FileNotFoundError, PermissionError, ValueError):
+        pass
+
+    # Fall back to psutil for non-container environments
     try:
         import psutil
 
         process = psutil.Process()
         return process.memory_info().rss / 1024 / 1024  # Convert bytes to MB
     except ImportError:
-        # If psutil not available, try alternative method
-        try:
-            import resource
+        pass
 
-            return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # KB to MB on Linux
-        except Exception:
-            return 0.0  # Return 0 if we can't measure
+    # Last resort: use resource module (less accurate)
+    try:
+        import resource
+
+        # On Linux, ru_maxrss is in kilobytes
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # KB to MB
+    except Exception:
+        return 0.0  # Return 0 if we can't measure
 
 
 async def async_scandir(path: Path, executor: ThreadPoolExecutor | None = None, purger_instance=None):
@@ -70,6 +96,76 @@ async def async_scandir(path: Path, executor: ThreadPoolExecutor | None = None, 
                 await _log_scandir_diagnostics(purger_instance, executor, current_time)
 
     return result
+
+
+async def async_scandir_batched(
+    path: Path,
+    executor: ThreadPoolExecutor | None = None,
+    batch_size: int = 5000,
+):
+    """
+    Async wrapper for os.scandir that yields results in batches.
+
+    Unlike async_scandir which materializes all entries at once (problematic for
+    directories with 100K+ entries on slow filesystems like EFS), this function
+    yields entries in fixed-size batches. This allows the caller to check memory
+    pressure between batches and abort early if needed.
+
+    Args:
+        path: Directory path to scan
+        executor: Optional ThreadPoolExecutor to use
+        batch_size: Number of entries per batch (default 5000)
+
+    Yields:
+        Lists of DirEntry objects, each list up to batch_size entries
+    """
+    loop = asyncio.get_running_loop()
+
+    # Use a queue to pass batches from the thread to the async caller.
+    # The thread reads os.scandir() in chunks and puts them on the queue;
+    # the async generator pulls batches off the queue with memory checks in between.
+    result_queue: queue.Queue = queue.Queue(maxsize=2)  # Small buffer to limit memory
+    _SENTINEL = object()
+
+    def _scandir_batched():
+        try:
+            with os.scandir(path) as it:
+                batch = []
+                for entry in it:
+                    batch.append(entry)
+                    if len(batch) >= batch_size:
+                        result_queue.put(batch)
+                        batch = []
+                if batch:
+                    result_queue.put(batch)
+        except Exception as exc:
+            result_queue.put(exc)
+        finally:
+            result_queue.put(_SENTINEL)
+
+    # Start the scandir thread
+    future = loop.run_in_executor(executor, _scandir_batched)
+
+    # Yield batches as they arrive
+    while True:
+        # Poll the queue without blocking the event loop
+        while True:
+            try:
+                item = result_queue.get_nowait()
+                break
+            except queue.Empty:
+                await asyncio.sleep(0.01)  # Yield to event loop briefly
+
+        if item is _SENTINEL:
+            break
+        if isinstance(item, Exception):
+            raise item
+        yield item
+
+    # Ensure the thread has completed (it should have by the time we get SENTINEL,
+    # but await it to propagate any unexpected thread exceptions).
+    if not future.done():
+        await future
 
 
 async def _log_scandir_diagnostics(purger_instance, executor, current_time=None):
@@ -1237,10 +1333,15 @@ class AsyncEFSPurger:
             self.logger,
             "info",
             "Phase 1a: Discovering directory tree structure",
-            {"root_path": str(self.root_path)},
+            {
+                "root_path": str(self.root_path),
+                "memory_limit_mb": self.memory_limit_mb,
+                "initial_memory_mb": round(get_memory_usage_mb(), 1),
+            },
         )
 
-        while dirs_to_visit:
+        memory_abort = False
+        while dirs_to_visit and not memory_abort:
             # Check memory pressure during discovery
             if self.memory_limit_mb > 0:
                 memory_mb = get_memory_usage_mb()
@@ -1270,20 +1371,53 @@ class AsyncEFSPurger:
             current_dir = dirs_to_visit.popleft()
 
             try:
-                entries = await async_scandir(current_dir, self.scandir_executor, self)
+                # Use batched scandir to avoid blocking the event loop for a long
+                # time when a single directory has 100K+ entries (common on EFS).
+                # Between batches we can check memory and abort early.
+                subdirs_added = 0
+                async for batch in async_scandir_batched(current_dir, self.scandir_executor):
+                    for entry in batch:
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                entry_path = Path(entry.path)
+                                depth = len(entry_path.parts) - root_depth
+                                dirs_by_depth[depth].append(entry_path)
+                                dirs_to_visit.append(entry_path)
+                                total_dirs_discovered += 1
+                                subdirs_added += 1
+                        except OSError:
+                            discovery_errors += 1
+
+                    # Check memory between batches from the same directory
+                    if self.memory_limit_mb > 0 and subdirs_added > 0:
+                        memory_mb = get_memory_usage_mb()
+                        memory_percent = memory_mb / self.memory_limit_mb
+                        if memory_percent > 0.90:
+                            import gc
+
+                            gc.collect()
+                            await asyncio.sleep(0.1)
+                            memory_mb = get_memory_usage_mb()
+                            memory_percent = memory_mb / self.memory_limit_mb
+                            if memory_percent > 0.95:
+                                log_with_context(
+                                    self.logger,
+                                    "warning",
+                                    "Memory critical during large directory scan, aborting discovery",
+                                    {
+                                        "current_dir": str(current_dir),
+                                        "subdirs_in_this_dir": subdirs_added,
+                                        "dirs_discovered": total_dirs_discovered,
+                                        "dirs_remaining_in_queue": len(dirs_to_visit),
+                                        "memory_mb": round(memory_mb, 1),
+                                        "memory_percent": round(memory_percent * 100, 1),
+                                    },
+                                )
+                                memory_abort = True
+                                break
+
                 await self.update_stats(dirs_scanned=1)
                 self.rate_tracker.record("removing_empty_dirs", "dirs", 1)
-
-                for entry in entries:
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            entry_path = Path(entry.path)
-                            depth = len(entry_path.parts) - root_depth
-                            dirs_by_depth[depth].append(entry_path)
-                            dirs_to_visit.append(entry_path)
-                            total_dirs_discovered += 1
-                    except OSError:
-                        discovery_errors += 1
 
             except PermissionError:
                 discovery_errors += 1
@@ -1297,6 +1431,7 @@ class AsyncEFSPurger:
             # Log progress periodically during discovery
             if total_dirs_discovered % 50000 == 0 and total_dirs_discovered > 0:
                 memory_mb = get_memory_usage_mb() if self.memory_limit_mb > 0 else 0
+                memory_percent = (memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
                 log_with_context(
                     self.logger,
                     "info",
@@ -1306,6 +1441,8 @@ class AsyncEFSPurger:
                         "dirs_remaining_in_queue": len(dirs_to_visit),
                         "depth_levels": len(dirs_by_depth),
                         "memory_mb": round(memory_mb, 1),
+                        "memory_percent": round(memory_percent, 1),
+                        "memory_limit_mb": self.memory_limit_mb,
                         "discovery_errors": discovery_errors,
                     },
                 )

@@ -128,6 +128,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--max-concurrent-discovery",
+        type=int,
+        default=int(os.getenv("EFSPURGE_MAX_CONCURRENT_DISCOVERY", "20")),
+        help="Maximum directories to scan concurrently during Phase 1a discovery (default: 20)",
+    )
+
+    parser.add_argument(
         "--version",
         action="version",
         version=f"efspurge {__version__}",
@@ -170,6 +177,7 @@ def main() -> None:
                 max_empty_dirs_to_delete=args.max_empty_dirs_to_delete,
                 max_concurrent_subdirs=args.max_concurrent_subdirs,
                 max_discovery_dirs=args.max_discovery_dirs,
+                max_concurrent_discovery=args.max_concurrent_discovery,
             )
         )
 

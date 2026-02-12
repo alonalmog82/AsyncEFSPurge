@@ -11,6 +11,7 @@ v1.15.4 fixes this by:
   3. Tracking ``_discovery_entries_scanned`` for progress visibility.
 """
 
+import asyncio
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -18,12 +19,6 @@ from unittest.mock import patch
 import pytest
 
 from efspurge.purger import AsyncEFSPurger
-
-# Capture a reference to the *original* function before any patches are applied.
-# This lets _small_batch_scandir delegate to the real implementation with a
-# reduced batch_size without infinite recursion when the module-level name is
-# replaced by a mock.
-from efspurge.purger import async_scandir_batched as _original_scandir_batched
 
 
 @pytest.fixture
@@ -40,9 +35,26 @@ def temp_dir():
 
 
 async def _small_batch_scandir(path, executor=None, batch_size=5000):
-    """Wrapper that forces batch_size=2 for testing."""
-    async for batch in _original_scandir_batched(path, executor, batch_size=2):
-        yield batch
+    """Wrapper that forces batch_size=2 for testing.
+
+    This directly scans the directory without using a thread executor to avoid
+    thread cleanup issues in tests.
+    """
+    import os
+
+    batch = []
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                batch.append(entry)
+                if len(batch) >= 2:  # Force batch_size=2
+                    yield batch
+                    batch = []
+                    await asyncio.sleep(0)  # Yield control
+            if batch:
+                yield batch
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -84,10 +96,13 @@ async def test_memory_abort_during_discovery_flat_directory(temp_dir):
     def fake_memory():
         nonlocal call_count
         call_count += 1
-        # Calls 1-2: initial log message + outer-loop memory check → safe.
+        # Call 1: initial_memory_mb log → safe
+        # Call 2: outer loop memory check → safe
+        # Call 3: batch 10 memory check (line 1481) → trigger abort
+        # Call 4: after GC retry (line 1486) → still critical
         if call_count <= 2:
             return 500.0  # 50% — well below threshold
-        # All subsequent calls (between-batch checks) → critical.
+        # All subsequent calls → critical to trigger abort.
         return 960.0  # 96% — triggers abort after GC retry
 
     with (

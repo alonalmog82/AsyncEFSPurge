@@ -578,6 +578,7 @@ class AsyncEFSPurger:
         self._discovery_current_dir: str | None = None
         self._discovery_dirs_found = 0
         self._discovery_queue_size = 0
+        self._discovery_entries_scanned = 0
 
         # Track directories currently being scanned (for diagnostics when stuck)
         self.active_directories: set[Path] = set()
@@ -645,6 +646,26 @@ class AsyncEFSPurger:
         self.last_memory_warning = 0  # Track last warning time
         self.memory_warning_interval = 60  # Only warn once per minute
         self.memory_check_lock = asyncio.Lock()  # Prevent concurrent checks
+
+    def close(self) -> None:
+        """Shut down the scandir ThreadPoolExecutor.
+
+        Call this when you're done with the purger to release threads.
+        Also called automatically by ``async with AsyncEFSPurger(...)``.
+        The ``purge()`` method calls this internally, so you only need to
+        call it when using lower-level methods like
+        ``_purge_empty_directories_standalone()`` or ``scan_directory()``
+        directly.
+        """
+        if hasattr(self, "scandir_executor") and self.scandir_executor is not None:
+            self.scandir_executor.shutdown(wait=False)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
     async def update_stats(self, **kwargs) -> None:
         """Thread-safe update of statistics."""
@@ -1395,6 +1416,7 @@ class AsyncEFSPurger:
         self._discovery_dirs_found = 0
         self._discovery_current_dir = str(self.root_path)
         self._discovery_queue_size = len(dirs_to_visit)
+        self._discovery_entries_scanned = 0
 
         memory_abort = False
         discovery_limit_reached = False
@@ -1449,7 +1471,12 @@ class AsyncEFSPurger:
                 # time when a single directory has 100K+ entries (common on EFS).
                 # Between batches we can check memory and abort early.
                 subdirs_added = 0
+                batches_processed = 0
+                entries_in_dir = 0
                 async for batch in async_scandir_batched(current_dir, self.scandir_executor):
+                    batches_processed += 1
+                    entries_in_dir += len(batch)
+                    self._discovery_entries_scanned += len(batch)
                     for entry in batch:
                         try:
                             if entry.is_dir(follow_symlinks=False):
@@ -1462,8 +1489,15 @@ class AsyncEFSPurger:
                         except OSError:
                             discovery_errors += 1
 
-                    # Check memory between batches from the same directory
-                    if self.memory_limit_mb > 0 and subdirs_added > 0:
+                    # Update discovery state for progress monitor visibility
+                    self._discovery_dirs_found = total_dirs_discovered
+                    self._discovery_queue_size = len(dirs_to_visit)
+
+                    # Check memory between batches unconditionally (every 10 batches
+                    # = every ~50,000 entries to limit overhead). This catches memory
+                    # growth even in flat directories with no subdirectories, which
+                    # was previously missed when the check required subdirs_added > 0.
+                    if self.memory_limit_mb > 0 and batches_processed % 10 == 0:
                         memory_mb = get_memory_usage_mb()
                         memory_percent = memory_mb / self.memory_limit_mb
                         if memory_percent > 0.90:
@@ -1478,6 +1512,7 @@ class AsyncEFSPurger:
                                     "Memory critical during large directory scan, aborting discovery",
                                     {
                                         "current_dir": str(current_dir),
+                                        "entries_scanned_in_dir": entries_in_dir,
                                         "subdirs_in_this_dir": subdirs_added,
                                         "dirs_discovered": total_dirs_discovered,
                                         "dirs_remaining_in_queue": len(dirs_to_visit),
@@ -2221,6 +2256,7 @@ class AsyncEFSPurger:
                             "current_directory": self._discovery_current_dir,
                             "dirs_discovered": self._discovery_dirs_found,
                             "dirs_queued": self._discovery_queue_size,
+                            "entries_scanned": self._discovery_entries_scanned,
                             "memory_mb": round(get_memory_usage_mb(), 1),
                             "memory_usage_percent": round(get_memory_usage_mb() / self.memory_limit_mb * 100, 1)
                             if self.memory_limit_mb > 0
@@ -2377,8 +2413,7 @@ class AsyncEFSPurger:
                 await _log_scandir_diagnostics(self, self.scandir_executor)
 
             # Shutdown custom executor for directory scanning
-            if hasattr(self, "scandir_executor"):
-                self.scandir_executor.shutdown(wait=False)
+            self.close()
 
         # Log one final progress update if we haven't logged recently
         elapsed = time.time() - self.stats.get("start_time", time.time())

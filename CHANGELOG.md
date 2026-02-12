@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.4] - 2026-02-12
+
+### Fixed
+- **Hotfix: Memory abort during Phase 1a discovery in flat directories**: In v1.15.3, the between-batch memory check inside `async_scandir_batched` was gated on `subdirs_added > 0`. This meant scanning a huge flat directory (millions of files, zero subdirectories) would never trigger the memory safety valve, leading to unbounded memory growth and eventual OOM.
+  - Removed the `subdirs_added > 0` gate — memory is now checked unconditionally between batches
+  - Checks run every 10 batches (~50,000 entries) to limit overhead while still catching runaway growth
+  - Added `_discovery_entries_scanned` counter for progress visibility during long directory scans
+
+### Testing
+- `test_memory_abort_during_discovery_flat_directory`: Verifies abort fires in flat-file directories
+- `test_memory_abort_during_discovery_prevents_further_bfs`: Verifies BFS stops after abort
+- `test_entries_scanned_tracked_during_normal_discovery`: Verifies entry counter accuracy
+- `test_discovery_state_cleared_after_completion`: Verifies cleanup of discovery state
+
+## [1.15.3] - 2026-02-11
+
+### Fixed
+- **Hotfix: Memory-safe directory emptiness check (`async_is_dir_empty`)**: Replaced `list(scandir)` with `next(scandir)` to check emptiness without materializing the full directory listing. Prevents large memory allocations when checking directories with thousands of files.
+- **Hotfix: Discovery cap (`max_discovery_dirs`) for Phase 1a**: Caps the number of directories discovered during Phase 1a BFS to limit memory consumed by the `dirs_by_depth` structure.
+  - Auto-calculated from `memory_limit_mb` when `max_discovery_dirs=0`: allocates ~60% of memory budget at ~500 bytes per path
+  - Explicit value via `--max-discovery-dirs` or `EFSPURGE_MAX_DISCOVERY_DIRS` takes precedence
+  - Falls back to `MAX_DISCOVERY_DIRS_DEFAULT` (1,000,000) when no memory limit is set
+- **Hotfix: Critical memory abort during Phase 1b deletion**: If memory stays above 95% after GC during bottom-up deletion, Phase 1b aborts early to avoid OOM. Non-empty directories are never deleted regardless of abort state.
+
+### Added
+- **Phase 1a progress reporting**: The background progress monitor now detects when Phase 1a discovery is active and reports discovery-specific metrics (`dirs_discovered`, `dirs_queued`, `entries_scanned`, `memory_mb`) instead of emitting false "POSSIBLE HANG DETECTED" warnings. Stuck detection counter is reset during active discovery.
+
+### Testing
+- `test_async_is_dir_empty_*`: 6 tests for the memory-safe emptiness check (empty, files, subdirs, nonexistent, many files, hidden files)
+- `test_max_discovery_dirs_*`: 4 tests for discovery cap (default, explicit, auto-calc, limit enforcement)
+- `test_critical_memory_abort_during_deletion`: Phase 1b aborts at 95%+ memory
+- `test_high_memory_reduces_batch_size_but_continues`: Phase 1b continues at 75-90% memory
+- `test_memory_abort_leaves_non_empty_dirs_intact`: Safety check for non-empty dirs
+- `test_periodic_gc_during_deletion`: GC smoke test
+- `test_cli_max_discovery_dirs_env_var`: CLI/env var integration
+
 ## [1.15.0] - 2026-02-08
 
 ### Changed

@@ -591,6 +591,32 @@ docker run --rm -m 2g -v /mnt/efs:/data efspurge:latest /data \
   --memory-limit-mb=1200
 ```
 
+**For wide directories (single directory with 100K+ subdirectories):**
+
+A single directory containing hundreds of thousands of child subdirectories (common in SFTP/multi-tenant layouts like `/sftp/{org_id}/...`) causes Phase 1a BFS to spend a long time scanning that one directory. During this scan, every discovered subdirectory is added to the BFS queue and depth-bucket structures, causing linear memory growth (~2-3 KB per directory).
+
+You can identify this pattern in the logs when Phase 1a progress reports show:
+- `dirs_discovered` growing steadily (e.g. 112K → 192K)
+- `current_directory` staying the same across multiple progress intervals
+- `entries_scanned` approximately equal to `dirs_discovered` (all entries are subdirectories)
+
+**Protections (v1.15.3+):**
+- Memory checks every 10 batches (~50K entries) abort discovery if memory exceeds 95% after GC
+- The outer BFS loop checks memory between directories and aborts at 95%
+- `max_discovery_dirs` caps total directories discovered (auto-calculated from `--memory-limit-mb`)
+- After any abort, Phase 1b proceeds with the partial tree already discovered
+
+**Estimating memory usage:**
+At ~2-3 KB per discovered directory, a 4500 MB memory limit allows roughly 1.5-2M directories before the 90% threshold triggers. The auto-calculated `max_discovery_dirs` uses a conservative estimate of 500 bytes per path, so the memory safety checks will typically fire before the discovery cap is reached.
+
+```bash
+# For wide directory trees: ensure memory limit is set and consider an explicit discovery cap
+efspurge /data --max-age-days 30 --remove-empty-dirs \
+  --memory-limit-mb=4500 \
+  --max-discovery-dirs=1000000 \
+  --max-empty-dirs-to-delete 0
+```
+
 **Key insight:** If memory spikes with `dirs_scanned` but `files_scanned=0`, the problem is `--max-concurrent-subdirs` (directory traversal), not file processing.
 
 ### Slow Performance
@@ -647,7 +673,17 @@ Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for de
 
 ## Changelog
 
-### Version 1.15.0 (2026-02-XX)
+### Version 1.15.4 (2026-02-12)
+- **Hotfix**: Memory abort during Phase 1a discovery now fires unconditionally (every 10 batches), fixing OOM in flat directories with millions of files and no subdirectories
+- **New**: `_discovery_entries_scanned` counter for progress visibility during long directory scans
+
+### Version 1.15.3 (2026-02-11)
+- **Hotfix**: Memory-safe `async_is_dir_empty` using `next(scandir)` instead of `list(scandir)`
+- **Hotfix**: `max_discovery_dirs` cap for Phase 1a discovery (auto-calculated from `--memory-limit-mb`, or set explicitly via `--max-discovery-dirs`)
+- **Hotfix**: Critical memory abort during Phase 1b deletion (aborts at 95%+ memory after GC)
+- **New**: Phase 1a progress reporting in background monitor (prevents false hang warnings)
+
+### Version 1.15.0 (2026-02-08)
 - **ARCHITECTURAL CHANGE**: Two-pass empty directory purging replaces incremental processing
   - **Phase 1**: Efficient standalone empty directory purge runs BEFORE file scanning using iterative BFS with level-by-level bottom-up deletion
   - **Phase 3**: Post-scan cleanup catches directories that became empty after file purging

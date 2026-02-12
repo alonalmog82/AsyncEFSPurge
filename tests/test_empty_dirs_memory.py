@@ -1,4 +1,9 @@
-"""Tests for memory safety during empty directory deletion."""
+"""Tests for memory safety during empty directory deletion.
+
+CI-friendly versions use reduced scale (500–1000 dirs, lower concurrency).
+High-scale stress tests (2k–11k dirs) are marked ``@pytest.mark.stress``
+and run on-demand via the ``stress-tests`` workflow before releases.
+"""
 
 import asyncio
 import os
@@ -18,18 +23,266 @@ def temp_dir():
         yield Path(tmpdir)
 
 
-@pytest.mark.asyncio
-async def test_large_scale_empty_dir_deletion_memory_bounded(temp_dir):
-    """
-    Test that memory stays bounded when deleting large numbers of empty directories.
+# ---------------------------------------------------------------------------
+# CI tests – lightweight versions that exercise the same code paths
+# ---------------------------------------------------------------------------
 
-    This test verifies the fix for memory explosion when deleting 100k+ empty directories.
-    Before the fix, memory could grow from ~250MB to 1500MB+.
-    After the fix, memory should stay bounded even with large numbers of empty dirs.
+
+@pytest.mark.asyncio
+async def test_empty_dir_deletion_memory_bounded(temp_dir):
+    """Memory stays bounded when deleting empty directories (CI-scale)."""
+    num_dirs = 500
+    for i in range(num_dirs):
+        (temp_dir / f"empty_{i:04d}").mkdir()
+
+    purger = AsyncEFSPurger(
+        root_path=str(temp_dir),
+        max_age_days=30,
+        remove_empty_dirs=True,
+        max_concurrency_deletion=200,
+        max_concurrent_subdirs=200,
+        memory_limit_mb=800,
+        max_empty_dirs_to_delete=0,
+        dry_run=False,
+    )
+
+    process = psutil.Process(os.getpid())
+    initial_memory = process.memory_info().rss / 1024 / 1024
+
+    await purger.scan_directory(temp_dir)
+
+    peak_memory = initial_memory
+
+    async def monitor_memory():
+        nonlocal peak_memory
+        while True:
+            current = process.memory_info().rss / 1024 / 1024
+            peak_memory = max(peak_memory, current)
+            await asyncio.sleep(0.1)
+
+    monitor_task = asyncio.create_task(monitor_memory())
+    try:
+        await purger._remove_empty_directories()
+    finally:
+        monitor_task.cancel()
+        try:
+            await monitor_task
+        except asyncio.CancelledError:
+            pass
+
+    assert purger.stats["empty_dirs_deleted"] == num_dirs
+
+    memory_increase = peak_memory - initial_memory
+    assert memory_increase < 300, (
+        f"Memory increase ({memory_increase:.1f}MB) should be bounded. "
+        f"Peak: {peak_memory:.1f}MB, Initial: {initial_memory:.1f}MB."
+    )
+
+
+@pytest.mark.asyncio
+async def test_empty_dir_deletion_queue_memory_bounded(temp_dir):
+    """Queue-based deletion keeps memory bounded (CI-scale)."""
+    num_dirs = 500
+    for i in range(num_dirs):
+        (temp_dir / f"empty_{i:04d}").mkdir()
+
+    purger = AsyncEFSPurger(
+        root_path=str(temp_dir),
+        max_age_days=30,
+        remove_empty_dirs=True,
+        max_concurrency_deletion=200,
+        max_empty_dirs_to_delete=0,
+        memory_limit_mb=800,
+        dry_run=False,
+    )
+
+    await purger.scan_directory(temp_dir)
+
+    process = psutil.Process(os.getpid())
+    memory_before = process.memory_info().rss / 1024 / 1024
+
+    start_time = time.time()
+    await purger._remove_empty_directories()
+    deletion_time = time.time() - start_time
+
+    memory_after = process.memory_info().rss / 1024 / 1024
+    memory_increase = memory_after - memory_before
+
+    assert purger.stats["empty_dirs_deleted"] == num_dirs
+    assert memory_increase < 200, f"Memory increase ({memory_increase:.1f}MB) suggests queue approach isn't working."
+    assert deletion_time < 30, f"Deletion took {deletion_time:.2f}s, expected < 30s"
+
+
+@pytest.mark.asyncio
+async def test_empty_dir_deletion_memory_pressure_checks(temp_dir):
+    """Memory pressure checks are triggered during deletion (CI-scale)."""
+    num_dirs = 500
+    for i in range(num_dirs):
+        (temp_dir / f"empty_{i:04d}").mkdir()
+
+    purger = AsyncEFSPurger(
+        root_path=str(temp_dir),
+        max_age_days=30,
+        remove_empty_dirs=True,
+        max_concurrency_deletion=200,
+        memory_limit_mb=200,
+        max_empty_dirs_to_delete=0,
+        dry_run=False,
+    )
+
+    await purger.scan_directory(temp_dir)
+
+    check_calls = []
+    check_results = []
+    original_check = purger.check_memory_pressure
+
+    async def tracked_check():
+        result = await original_check()
+        check_calls.append(time.time())
+        check_results.append(result)
+        return result
+
+    purger.check_memory_pressure = tracked_check
+
+    await purger._remove_empty_directories()
+
+    assert purger.stats["empty_dirs_deleted"] == num_dirs
+
+    # With 500 dirs we expect at least 50 memory checks
+    assert len(check_calls) >= 50, f"Memory checks should be called many times, but was called {len(check_calls)} times"
+    assert all(isinstance(r, tuple) and len(r) == 2 for r in check_results)
+    assert all(isinstance(r[0], bool) and isinstance(r[1], (int, float)) for r in check_results)
+
+
+@pytest.mark.asyncio
+async def test_memory_checks_in_producer(temp_dir):
+    """Memory checks happen in producer before adding to queue (CI-scale)."""
+    num_dirs = 500
+    for i in range(num_dirs):
+        (temp_dir / f"empty_{i:04d}").mkdir()
+
+    purger = AsyncEFSPurger(
+        root_path=str(temp_dir),
+        max_age_days=30,
+        remove_empty_dirs=True,
+        max_concurrency_deletion=200,
+        memory_limit_mb=500,
+        max_empty_dirs_to_delete=0,
+        dry_run=False,
+    )
+
+    await purger.scan_directory(temp_dir)
+
+    check_count = [0]
+    check_timings = []
+    original_check = purger.check_memory_pressure
+
+    async def tracked_check():
+        check_count[0] += 1
+        check_timings.append(time.time())
+        return await original_check()
+
+    purger.check_memory_pressure = tracked_check
+
+    await purger._remove_empty_directories()
+
+    assert purger.stats["empty_dirs_deleted"] == num_dirs
+    assert check_count[0] > 50, f"Memory checks should be called many times, but was called {check_count[0]} times"
+    if len(check_timings) > 1:
+        assert check_timings[-1] - check_timings[0] > 0
+
+
+@pytest.mark.asyncio
+async def test_cascading_deletion_memory_bounded(temp_dir):
+    """Cascading deletion doesn't cause memory explosion (CI-scale)."""
+    # depth=3, width=5 → 155 directories (manageable for CI)
+    depth = 3
+    width = 5
+
+    def create_nested(base, current_depth):
+        if current_depth >= depth:
+            return
+        for i in range(width):
+            subdir = base / f"dir_{i}"
+            subdir.mkdir()
+            create_nested(subdir, current_depth + 1)
+
+    create_nested(temp_dir, 0)
+
+    total_dirs = sum(1 for _ in temp_dir.rglob("*") if _.is_dir())
+
+    purger = AsyncEFSPurger(
+        root_path=str(temp_dir),
+        max_age_days=30,
+        remove_empty_dirs=True,
+        max_concurrency_deletion=200,
+        memory_limit_mb=800,
+        max_empty_dirs_to_delete=0,
+        dry_run=False,
+    )
+
+    await purger.scan_directory(temp_dir)
+
+    process = psutil.Process(os.getpid())
+    memory_before = process.memory_info().rss / 1024 / 1024
+
+    await purger._remove_empty_directories()
+
+    memory_after = process.memory_info().rss / 1024 / 1024
+    memory_increase = memory_after - memory_before
+
+    assert purger.stats["empty_dirs_deleted"] == total_dirs
+    assert memory_increase < 300, f"Cascading deletion caused {memory_increase:.1f}MB increase, expected < 300MB"
+
+
+@pytest.mark.asyncio
+async def test_standalone_empty_dir_purger(temp_dir):
+    """Phase 1 standalone purger deletes empty dirs and keeps non-empty ones."""
+    num_empty = 200
+    num_with_files = 50
+
+    for i in range(num_empty):
+        (temp_dir / f"empty_{i:04d}").mkdir()
+
+    for i in range(num_with_files):
+        d = temp_dir / f"has_files_{i:04d}"
+        d.mkdir()
+        (d / "file.txt").write_text("content")
+
+    purger = AsyncEFSPurger(
+        root_path=str(temp_dir),
+        max_age_days=0,
+        dry_run=False,
+        remove_empty_dirs=True,
+        max_empty_dirs_to_delete=0,
+        memory_limit_mb=800,
+        log_level="INFO",
+    )
+
+    deleted = await purger._purge_empty_directories_standalone()
+
+    assert deleted == num_empty, f"Expected {num_empty} empty dirs deleted, got {deleted}"
+
+    remaining = [d for d in temp_dir.iterdir() if d.is_dir()]
+    assert len(remaining) == num_with_files
+    assert purger.stats["empty_dirs_deleted"] == num_empty
+
+
+# ---------------------------------------------------------------------------
+# Stress tests – original high-scale versions, run on-demand before releases
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.stress
+@pytest.mark.asyncio
+async def test_stress_large_scale_empty_dir_deletion_memory_bounded(temp_dir):
     """
-    # Create a large number of empty directories (10k for CI, but tests the same code path)
-    # For production testing, use 100k+ empty directories
-    num_dirs = 10000  # 10k dirs - enough to test batching and memory safety
+    STRESS: Memory stays bounded when deleting 10k empty directories.
+
+    Verifies the fix for memory explosion when deleting 100k+ empty directories.
+    Before the fix, memory could grow from ~250MB to 1500MB+.
+    """
+    num_dirs = 10000
 
     print(f"\nCreating {num_dirs} empty directories...")
     start_create = time.time()
@@ -38,49 +291,39 @@ async def test_large_scale_empty_dir_deletion_memory_bounded(temp_dir):
     create_time = time.time() - start_create
     print(f"Created {num_dirs} directories in {create_time:.2f}s")
 
-    # Use high concurrency to test queue+semaphore memory bounds
-    # With queue+semaphore, memory is bounded by semaphore_limit, not total dirs
     purger = AsyncEFSPurger(
         root_path=str(temp_dir),
         max_age_days=30,
         remove_empty_dirs=True,
-        max_concurrency_deletion=1000,  # High concurrency
+        max_concurrency_deletion=1000,
         max_concurrent_subdirs=1000,
-        memory_limit_mb=800,  # Set memory limit
-        max_empty_dirs_to_delete=0,  # Unlimited for this test
+        memory_limit_mb=800,
+        max_empty_dirs_to_delete=0,
         dry_run=False,
     )
 
-    # Get initial memory
     process = psutil.Process(os.getpid())
-    initial_memory = process.memory_info().rss / 1024 / 1024  # MB
-
+    initial_memory = process.memory_info().rss / 1024 / 1024
     print(f"Initial memory: {initial_memory:.1f}MB")
 
-    # Scan directories
     await purger.scan_directory(temp_dir)
 
-    # Get memory after scanning
     memory_after_scan = process.memory_info().rss / 1024 / 1024
     print(f"Memory after scan: {memory_after_scan:.1f}MB")
 
-    # Delete empty directories and monitor memory
     deletion_start = time.time()
-
     peak_memory = memory_after_scan
     memory_samples = []
 
-    # Monitor memory during deletion
     async def monitor_memory():
         nonlocal peak_memory
         while True:
-            current_memory = process.memory_info().rss / 1024 / 1024
-            peak_memory = max(peak_memory, current_memory)
-            memory_samples.append(current_memory)
-            await asyncio.sleep(0.1)  # Sample every 100ms
+            current = process.memory_info().rss / 1024 / 1024
+            peak_memory = max(peak_memory, current)
+            memory_samples.append(current)
+            await asyncio.sleep(0.1)
 
     monitor_task = asyncio.create_task(monitor_memory())
-
     try:
         await purger._remove_empty_directories()
     finally:
@@ -98,56 +341,38 @@ async def test_large_scale_empty_dir_deletion_memory_bounded(temp_dir):
     print(f"Deletion took: {deletion_time:.2f}s")
     print(f"Memory increase: {peak_memory - initial_memory:.1f}MB")
 
-    # Verify all directories were deleted
     assert purger.stats["empty_dirs_deleted"] == num_dirs
 
-    # Memory should stay bounded - the original bug showed 250MB -> 1559MB (1309MB increase)
-    # With queue+semaphore approach, memory is bounded by semaphore_limit * memory_per_task
-    # We expect < 300MB increase even with 10k directories (much better than 1309MB)
     memory_increase = peak_memory - initial_memory
     assert memory_increase < 300, (
         f"Memory increase ({memory_increase:.1f}MB) should be bounded. "
-        f"Original bug showed 1309MB increase. Peak: {peak_memory:.1f}MB, Initial: {initial_memory:.1f}MB. "
-        f"With queue+semaphore, memory should be bounded by semaphore limit."
+        f"Original bug showed 1309MB increase. Peak: {peak_memory:.1f}MB, Initial: {initial_memory:.1f}MB."
     )
-
-    # Peak memory should not exceed memory limit significantly
-    # Allow some overhead (150% of limit) for safety
     assert peak_memory < purger.memory_limit_mb * 1.5, (
-        f"Peak memory ({peak_memory:.1f}MB) exceeded memory limit ({purger.memory_limit_mb}MB) by too much"
+        f"Peak memory ({peak_memory:.1f}MB) exceeded limit ({purger.memory_limit_mb}MB) by too much"
     )
 
 
+@pytest.mark.stress
 @pytest.mark.asyncio
-async def test_empty_dir_deletion_queue_memory_bounded(temp_dir):
-    """
-    Test that queue-based deletion keeps memory bounded.
-
-    This test verifies that with high concurrency, the queue+semaphore approach
-    keeps memory bounded by semaphore limit, not by total directories.
-    Memory should stay bounded even with many directories.
-    """
-    # Create many directories to test queue-based processing
-    # With queue+semaphore, memory is bounded by semaphore limit, not total dirs
+async def test_stress_queue_memory_bounded(temp_dir):
+    """STRESS: Queue-based deletion keeps memory bounded with 5k dirs."""
     num_dirs = 5000
     for i in range(num_dirs):
         (temp_dir / f"empty_{i:04d}").mkdir()
 
-    # Use high concurrency - queue size = semaphore_limit + 100
-    # Memory should be bounded by semaphore_limit * memory_per_task
     purger = AsyncEFSPurger(
         root_path=str(temp_dir),
         max_age_days=30,
         remove_empty_dirs=True,
-        max_concurrency_deletion=1000,  # High concurrency
-        max_empty_dirs_to_delete=0,  # Unlimited for this test
+        max_concurrency_deletion=1000,
+        max_empty_dirs_to_delete=0,
         memory_limit_mb=800,
         dry_run=False,
     )
 
     await purger.scan_directory(temp_dir)
 
-    # Monitor memory to verify queue approach prevents explosion
     process = psutil.Process(os.getpid())
     memory_before = process.memory_info().rss / 1024 / 1024
 
@@ -158,51 +383,31 @@ async def test_empty_dir_deletion_queue_memory_bounded(temp_dir):
     memory_after = process.memory_info().rss / 1024 / 1024
     memory_increase = memory_after - memory_before
 
-    # Verify all directories were deleted
     assert purger.stats["empty_dirs_deleted"] == num_dirs
-
-    # Memory increase should be small with queue+semaphore approach
-    # Memory is bounded by semaphore_limit, not total directories
-    assert memory_increase < 200, (
-        f"Memory increase ({memory_increase:.1f}MB) suggests queue approach isn't working. "
-        f"Expected small increase with queue+semaphore pattern (memory bounded by semaphore limit)."
-    )
-
-    assert deletion_time < 30, f"Deletion should complete in reasonable time, took {deletion_time:.2f}s"
+    assert memory_increase < 200, f"Memory increase ({memory_increase:.1f}MB) suggests queue approach isn't working."
+    assert deletion_time < 30, f"Deletion took {deletion_time:.2f}s"
 
 
+@pytest.mark.stress
 @pytest.mark.asyncio
-async def test_empty_dir_deletion_memory_pressure_checks(temp_dir):
-    """Test that memory pressure checks are triggered during empty directory deletion.
-
-    With queue+semaphore approach, memory checks happen in the producer before adding
-    directories to the queue. This prevents memory growth by stopping queue feeding
-    when memory is high.
-
-    Note: With the two-pass architecture, Phase 1 (standalone purge) runs before scanning,
-    so directories found during scan are only those that became empty after file purging.
-    """
-    # Create many empty directories - enough to trigger multiple memory checks
-    # Producer checks memory before adding each directory to queue
+async def test_stress_memory_pressure_checks(temp_dir):
+    """STRESS: Memory pressure checks triggered with 5k dirs."""
     num_dirs = 5000
     for i in range(num_dirs):
         (temp_dir / f"empty_{i:04d}").mkdir()
 
-    # Set a low memory limit to increase chance of back-pressure
-    # But we're mainly testing that checks are called, not that back-pressure triggers
     purger = AsyncEFSPurger(
         root_path=str(temp_dir),
         max_age_days=30,
         remove_empty_dirs=True,
         max_concurrency_deletion=1000,
-        memory_limit_mb=200,  # Low limit
-        max_empty_dirs_to_delete=0,  # Unlimited for this test
+        memory_limit_mb=200,
+        max_empty_dirs_to_delete=0,
         dry_run=False,
     )
 
     await purger.scan_directory(temp_dir)
 
-    # Mock check_memory_pressure to track calls and return values
     check_calls = []
     check_results = []
     original_check = purger.check_memory_pressure
@@ -217,97 +422,20 @@ async def test_empty_dir_deletion_memory_pressure_checks(temp_dir):
 
     await purger._remove_empty_directories()
 
-    # Verify deletion completed successfully
     assert purger.stats["empty_dirs_deleted"] == num_dirs
-
-    # Memory checks should be called in producer before adding directories to queue
-    # Producer checks memory before each directory, so we expect many checks
-    # (at least one per directory, but may be fewer if rate limit or memory stops it early)
-    # With 5000 dirs, we expect at least 1000+ checks (producer checks before each add)
-    expected_min_calls = min(num_dirs // 5, 1000)  # Conservative estimate
+    expected_min_calls = min(num_dirs // 5, 1000)
     assert len(check_calls) >= expected_min_calls, (
-        f"Memory checks should be called many times in producer "
-        f"(before adding directories to queue), but was called {len(check_calls)} times"
+        f"Expected >= {expected_min_calls} memory checks, got {len(check_calls)}"
     )
-
-    # Verify check_memory_pressure returns tuple (bool, float)
-    assert all(isinstance(result, tuple) and len(result) == 2 for result in check_results), (
-        "check_memory_pressure should return tuple (bool, float)"
-    )
-    assert all(isinstance(result[0], bool) and isinstance(result[1], (int, float)) for result in check_results), (
-        "check_memory_pressure should return tuple (bool, float)"
-    )
+    assert all(isinstance(r, tuple) and len(r) == 2 for r in check_results)
 
 
+@pytest.mark.stress
 @pytest.mark.asyncio
-async def test_memory_checks_in_producer(temp_dir):
-    """
-    Test that memory checks happen in producer before adding to queue.
-
-    With queue+semaphore approach, memory checks happen in the producer
-    before adding directories to the queue. This prevents memory growth
-    by stopping queue feeding when memory is high.
-    """
-    # Create enough directories to test producer memory checks
-    num_dirs = 2000
-    for i in range(num_dirs):
-        (temp_dir / f"empty_{i:04d}").mkdir()
-
-    purger = AsyncEFSPurger(
-        root_path=str(temp_dir),
-        max_age_days=30,
-        remove_empty_dirs=True,
-        max_concurrency_deletion=1000,
-        memory_limit_mb=500,
-        max_empty_dirs_to_delete=0,
-        dry_run=False,
-    )
-
-    await purger.scan_directory(temp_dir)
-
-    # Track memory check calls
-    check_count = [0]
-    check_timings = []
-    original_check = purger.check_memory_pressure
-
-    async def tracked_check():
-        check_count[0] += 1
-        check_timings.append(time.time())
-        return await original_check()
-
-    purger.check_memory_pressure = tracked_check
-
-    await purger._remove_empty_directories()
-
-    # Verify deletion completed
-    assert purger.stats["empty_dirs_deleted"] == num_dirs
-
-    # Verify memory checks happened in producer
-    # Producer checks memory before adding each directory to queue
-    # So we expect many checks (at least hundreds for 2000 dirs)
-    assert check_count[0] > 100, (
-        f"Memory checks should be called many times in producer "
-        f"(before adding directories to queue), but was called {check_count[0]} times"
-    )
-
-    # Verify checks happen throughout the process (not just at start)
-    # Check timings should span the deletion process
-    if len(check_timings) > 1:
-        check_duration = check_timings[-1] - check_timings[0]
-        assert check_duration > 0, "Memory checks should happen throughout the deletion process"
-
-
-@pytest.mark.asyncio
-async def test_cascading_deletion_memory_bounded(temp_dir):
-    """Test that cascading deletion doesn't cause memory explosion.
-
-    With incremental processing, some directories may be deleted during scanning,
-    so we check total deleted count across both incremental and final passes.
-    """
-    # Create deeply nested empty directory structure
-    # This tests cascading deletion which can cause memory spikes
+async def test_stress_cascading_deletion_memory_bounded(temp_dir):
+    """STRESS: Cascading deletion with 11k+ nested directories."""
     depth = 5
-    width = 10  # 10^5 = 100k directories (but we'll create less for CI)
+    width = 10
 
     def create_nested(base, current_depth):
         if current_depth >= depth:
@@ -319,7 +447,6 @@ async def test_cascading_deletion_memory_bounded(temp_dir):
 
     create_nested(temp_dir, 0)
 
-    # Count total directories
     total_dirs = sum(1 for _ in temp_dir.rglob("*") if _.is_dir())
     print(f"Created {total_dirs} nested directories")
 
@@ -335,7 +462,6 @@ async def test_cascading_deletion_memory_bounded(temp_dir):
 
     await purger.scan_directory(temp_dir)
 
-    # Monitor memory during cascading deletion
     process = psutil.Process(os.getpid())
     memory_before = process.memory_info().rss / 1024 / 1024
 
@@ -344,60 +470,5 @@ async def test_cascading_deletion_memory_bounded(temp_dir):
     memory_after = process.memory_info().rss / 1024 / 1024
     memory_increase = memory_after - memory_before
 
-    # Total deleted from Phase 3 (post-scan cleanup)
-    total_deleted = purger.stats["empty_dirs_deleted"]
-    print(f"Total deleted (Phase 3): {total_deleted}")
-
-    # Verify all directories were deleted
-    assert total_deleted == total_dirs, (
-        f"Expected {total_dirs} directories to be deleted, but {total_deleted} were deleted"
-    )
-
-    # Memory increase should be bounded even with cascading deletion
-    assert memory_increase < 300, (
-        f"Cascading deletion caused memory increase of {memory_increase:.1f}MB, which exceeds expected bound of 300MB"
-    )
-
-
-@pytest.mark.asyncio
-async def test_standalone_empty_dir_purger(temp_dir):
-    """
-    Test the standalone empty directory purger (Phase 1).
-
-    This verifies the two-pass approach: Phase 1 discovers and deletes empty
-    directories using an efficient iterative BFS + bottom-up walker, without
-    the overhead of the full recursive scanning infrastructure.
-    """
-    # Create a mix of empty and non-empty directories
-    num_empty = 200
-    num_with_files = 50
-
-    for i in range(num_empty):
-        (temp_dir / f"empty_{i:04d}").mkdir()
-
-    for i in range(num_with_files):
-        d = temp_dir / f"has_files_{i:04d}"
-        d.mkdir()
-        (d / "file.txt").write_text("content")
-
-    purger = AsyncEFSPurger(
-        root_path=str(temp_dir),
-        max_age_days=0,
-        dry_run=False,
-        remove_empty_dirs=True,
-        max_empty_dirs_to_delete=0,  # Unlimited
-        memory_limit_mb=800,
-        log_level="INFO",
-    )
-
-    deleted = await purger._purge_empty_directories_standalone()
-
-    # All empty dirs should be deleted
-    assert deleted == num_empty, f"Expected {num_empty} empty dirs deleted, got {deleted}"
-
-    # Non-empty dirs should still exist
-    remaining = [d for d in temp_dir.iterdir() if d.is_dir()]
-    assert len(remaining) == num_with_files, f"Expected {num_with_files} non-empty dirs remaining, got {len(remaining)}"
-
-    # Stats should be updated
-    assert purger.stats["empty_dirs_deleted"] == num_empty
+    assert purger.stats["empty_dirs_deleted"] == total_dirs
+    assert memory_increase < 300, f"Cascading deletion caused {memory_increase:.1f}MB increase, expected < 300MB"

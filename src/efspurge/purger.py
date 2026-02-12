@@ -647,6 +647,26 @@ class AsyncEFSPurger:
         self.memory_warning_interval = 60  # Only warn once per minute
         self.memory_check_lock = asyncio.Lock()  # Prevent concurrent checks
 
+    def close(self) -> None:
+        """Shut down the scandir ThreadPoolExecutor.
+
+        Call this when you're done with the purger to release threads.
+        Also called automatically by ``async with AsyncEFSPurger(...)``.
+        The ``purge()`` method calls this internally, so you only need to
+        call it when using lower-level methods like
+        ``_purge_empty_directories_standalone()`` or ``scan_directory()``
+        directly.
+        """
+        if hasattr(self, "scandir_executor") and self.scandir_executor is not None:
+            self.scandir_executor.shutdown(wait=False)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
     async def update_stats(self, **kwargs) -> None:
         """Thread-safe update of statistics."""
         async with self.stats_lock:
@@ -2393,8 +2413,7 @@ class AsyncEFSPurger:
                 await _log_scandir_diagnostics(self, self.scandir_executor)
 
             # Shutdown custom executor for directory scanning
-            if hasattr(self, "scandir_executor"):
-                self.scandir_executor.shutdown(wait=False)
+            self.close()
 
         # Log one final progress update if we haven't logged recently
         elapsed = time.time() - self.stats.get("start_time", time.time())

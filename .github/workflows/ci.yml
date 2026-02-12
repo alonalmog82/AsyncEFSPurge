@@ -61,7 +61,7 @@ jobs:
     
     - name: Run tests with pytest
       run: |
-        pytest --cov=efspurge --cov-report=xml --cov-report=term-missing
+        pytest -m "not stress" --cov=efspurge --cov-report=xml --cov-report=term-missing
     
     - name: Run integration tests
       run: |

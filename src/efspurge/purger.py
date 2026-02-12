@@ -417,6 +417,7 @@ class AsyncEFSPurger:
         max_empty_dirs_to_delete: int = 500,
         max_concurrent_subdirs: int = 100,
         max_discovery_dirs: int = 0,
+        max_concurrent_discovery: int = 20,
     ):
         """
         Initialize the async EFS purger.
@@ -435,6 +436,7 @@ class AsyncEFSPurger:
             max_empty_dirs_to_delete: Maximum empty directories to delete per run (0 = unlimited, default: 500)
             max_concurrent_subdirs: Maximum subdirectories to scan concurrently (lower = less memory, default: 100)
             max_discovery_dirs: Maximum directories to discover in Phase 1a (0 = use automatic limit based on memory)
+            max_concurrent_discovery: Maximum concurrent directory scans during Phase 1a discovery (default: 20)
 
         Raises:
             ValueError: If invalid parameters are provided
@@ -536,6 +538,7 @@ class AsyncEFSPurger:
         self.remove_empty_dirs = remove_empty_dirs
         self.max_empty_dirs_to_delete = max_empty_dirs_to_delete
         self.max_concurrent_subdirs = max_concurrent_subdirs
+        self.max_concurrent_discovery = max(1, max_concurrent_discovery)
 
         # Compute discovery limit: if explicitly set use that, otherwise derive from memory budget.
         # Each Path object is ~400-600 bytes, so we allow roughly 60% of the memory budget for paths.
@@ -1387,18 +1390,27 @@ class AsyncEFSPurger:
                 "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
                 "memory_limit_mb": self.memory_limit_mb,
                 "max_discovery_dirs": self.max_discovery_dirs,
+                "max_concurrent_discovery": self.max_concurrent_discovery,
             },
         )
 
-        # Phase A: Discover all directories using iterative BFS, bucketed by depth.
+        # Phase A: Discover all directories using parallel BFS, bucketed by depth.
         # Each directory is placed into a bucket keyed by its depth (number of path
         # components). This avoids a costly sort later and enables level-by-level
         # freeing during deletion.
+        #
+        # Multiple worker coroutines scan directories concurrently to overlap EFS/NFS
+        # latency. On high-latency filesystems like EFS, sequential scanning is limited
+        # to ~1 dir/sec; with N workers we can achieve ~N dirs/sec.
         dirs_by_depth: defaultdict[int, list[Path]] = defaultdict(list)
-        dirs_to_visit: deque[Path] = deque([self.root_path])
+        discovery_queue: asyncio.Queue[Path] = asyncio.Queue()
+        discovery_queue.put_nowait(self.root_path)
         discovery_errors = 0
         total_dirs_discovered = 0
         root_depth = len(self.root_path.parts)
+        # pending_dirs tracks dirs enqueued but not yet fully processed.
+        # When it reaches 0 all reachable directories have been scanned.
+        pending_dirs = 1  # root is already in the queue
 
         log_with_context(
             self.logger,
@@ -1408,6 +1420,7 @@ class AsyncEFSPurger:
                 "root_path": str(self.root_path),
                 "memory_limit_mb": self.memory_limit_mb,
                 "max_discovery_dirs": self.max_discovery_dirs,
+                "max_concurrent_discovery": self.max_concurrent_discovery,
                 "initial_memory_mb": round(get_memory_usage_mb(), 1),
             },
         )
@@ -1415,151 +1428,197 @@ class AsyncEFSPurger:
         self._discovery_active = True
         self._discovery_dirs_found = 0
         self._discovery_current_dir = str(self.root_path)
-        self._discovery_queue_size = len(dirs_to_visit)
+        self._discovery_queue_size = 1
         self._discovery_entries_scanned = 0
 
         memory_abort = False
         discovery_limit_reached = False
-        while dirs_to_visit and not memory_abort and not discovery_limit_reached:
-            # Check directory count limit
-            if self.max_discovery_dirs > 0 and total_dirs_discovered >= self.max_discovery_dirs:
-                log_with_context(
-                    self.logger,
-                    "info",
-                    "Discovery directory count limit reached, proceeding with partial tree",
-                    {
-                        "max_discovery_dirs": self.max_discovery_dirs,
-                        "dirs_discovered": total_dirs_discovered,
-                        "dirs_remaining_in_queue": len(dirs_to_visit),
-                        "memory_mb": round(get_memory_usage_mb(), 1),
-                    },
-                )
-                discovery_limit_reached = True
-                break
+        discovery_done = asyncio.Event()
+        # Track last milestone for periodic progress logging
+        last_progress_milestone = 0
 
-            # Check memory pressure during discovery
-            if self.memory_limit_mb > 0:
-                memory_mb = get_memory_usage_mb()
-                memory_percent = memory_mb / self.memory_limit_mb
-                if memory_percent > 0.90:
-                    # At 90%+, pause discovery briefly and GC
-                    gc.collect()
-                    await asyncio.sleep(0.5)
-                    memory_mb = get_memory_usage_mb()
-                    memory_percent = memory_mb / self.memory_limit_mb
-                    if memory_percent > 0.95:
+        async def _discovery_worker(worker_id: int) -> None:
+            """Worker coroutine that scans directories from the queue."""
+            nonlocal total_dirs_discovered, discovery_errors, memory_abort
+            nonlocal discovery_limit_reached, pending_dirs, last_progress_milestone
+            nonlocal dirs_by_depth
+
+            while not discovery_done.is_set():
+                # Check termination conditions
+                if memory_abort or discovery_limit_reached:
+                    break
+
+                # Check directory count limit
+                if self.max_discovery_dirs > 0 and total_dirs_discovered >= self.max_discovery_dirs:
+                    if not discovery_limit_reached:
+                        discovery_limit_reached = True
                         log_with_context(
                             self.logger,
-                            "warning",
-                            "Memory critical during directory discovery, proceeding with partial tree",
+                            "info",
+                            "Discovery directory count limit reached, proceeding with partial tree",
                             {
+                                "max_discovery_dirs": self.max_discovery_dirs,
                                 "dirs_discovered": total_dirs_discovered,
-                                "dirs_remaining_in_queue": len(dirs_to_visit),
-                                "memory_mb": round(memory_mb, 1),
-                                "memory_percent": round(memory_percent * 100, 1),
+                                "dirs_remaining_in_queue": discovery_queue.qsize(),
+                                "memory_mb": round(get_memory_usage_mb(), 1),
                             },
                         )
+                        discovery_done.set()
+                    break
+
+                # Try to get a directory from the queue
+                try:
+                    current_dir = discovery_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    if discovery_done.is_set():
                         break
+                    # Wait briefly for new work
+                    await asyncio.sleep(0.05)
+                    continue
 
-            current_dir = dirs_to_visit.popleft()
-            self._discovery_current_dir = str(current_dir)
-            self._discovery_dirs_found = total_dirs_discovered
-            self._discovery_queue_size = len(dirs_to_visit)
-
-            try:
-                # Use batched scandir to avoid blocking the event loop for a long
-                # time when a single directory has 100K+ entries (common on EFS).
-                # Between batches we can check memory and abort early.
-                subdirs_added = 0
-                batches_processed = 0
-                entries_in_dir = 0
-                async for batch in async_scandir_batched(current_dir, self.scandir_executor):
-                    batches_processed += 1
-                    entries_in_dir += len(batch)
-                    self._discovery_entries_scanned += len(batch)
-                    for entry in batch:
-                        try:
-                            if entry.is_dir(follow_symlinks=False):
-                                entry_path = Path(entry.path)
-                                depth = len(entry_path.parts) - root_depth
-                                dirs_by_depth[depth].append(entry_path)
-                                dirs_to_visit.append(entry_path)
-                                total_dirs_discovered += 1
-                                subdirs_added += 1
-                        except OSError:
-                            discovery_errors += 1
-
-                    # Update discovery state for progress monitor visibility
-                    self._discovery_dirs_found = total_dirs_discovered
-                    self._discovery_queue_size = len(dirs_to_visit)
-
-                    # Check memory between batches unconditionally (every 10 batches
-                    # = every ~50,000 entries to limit overhead). This catches memory
-                    # growth even in flat directories with no subdirectories, which
-                    # was previously missed when the check required subdirs_added > 0.
-                    if self.memory_limit_mb > 0 and batches_processed % 10 == 0:
+                # Check memory pressure before scanning
+                if self.memory_limit_mb > 0:
+                    memory_mb = get_memory_usage_mb()
+                    memory_percent = memory_mb / self.memory_limit_mb
+                    if memory_percent > 0.90:
+                        gc.collect()
+                        await asyncio.sleep(0.5)
                         memory_mb = get_memory_usage_mb()
                         memory_percent = memory_mb / self.memory_limit_mb
-                        if memory_percent > 0.90:
-                            gc.collect()
-                            await asyncio.sleep(0.1)
+                        if memory_percent > 0.95:
+                            log_with_context(
+                                self.logger,
+                                "warning",
+                                "Memory critical during directory discovery, proceeding with partial tree",
+                                {
+                                    "worker_id": worker_id,
+                                    "dirs_discovered": total_dirs_discovered,
+                                    "dirs_remaining_in_queue": discovery_queue.qsize(),
+                                    "memory_mb": round(memory_mb, 1),
+                                    "memory_percent": round(memory_percent * 100, 1),
+                                },
+                            )
+                            memory_abort = True
+                            discovery_done.set()
+                            # Put the dir back since we didn't process it
+                            pending_dirs -= 1
+                            if pending_dirs <= 0:
+                                discovery_done.set()
+                            break
+
+                # Update progress monitoring state
+                self._discovery_current_dir = str(current_dir)
+                self._discovery_dirs_found = total_dirs_discovered
+                self._discovery_queue_size = discovery_queue.qsize()
+
+                try:
+                    # Use batched scandir to avoid blocking the event loop for a long
+                    # time when a single directory has 100K+ entries (common on EFS).
+                    subdirs_added = 0
+                    batches_processed = 0
+                    entries_in_dir = 0
+                    async for batch in async_scandir_batched(current_dir, self.scandir_executor):
+                        if memory_abort or discovery_limit_reached:
+                            break
+
+                        batches_processed += 1
+                        entries_in_dir += len(batch)
+                        self._discovery_entries_scanned += len(batch)
+                        for entry in batch:
+                            try:
+                                if entry.is_dir(follow_symlinks=False):
+                                    entry_path = Path(entry.path)
+                                    depth = len(entry_path.parts) - root_depth
+                                    dirs_by_depth[depth].append(entry_path)
+                                    pending_dirs += 1
+                                    discovery_queue.put_nowait(entry_path)
+                                    total_dirs_discovered += 1
+                                    subdirs_added += 1
+                            except OSError:
+                                discovery_errors += 1
+
+                        # Update discovery state for progress monitor visibility
+                        self._discovery_dirs_found = total_dirs_discovered
+                        self._discovery_queue_size = discovery_queue.qsize()
+
+                        # Check memory between batches (every 10 batches = ~50,000 entries)
+                        if self.memory_limit_mb > 0 and batches_processed % 10 == 0:
                             memory_mb = get_memory_usage_mb()
                             memory_percent = memory_mb / self.memory_limit_mb
-                            if memory_percent > 0.95:
-                                log_with_context(
-                                    self.logger,
-                                    "warning",
-                                    "Memory critical during large directory scan, aborting discovery",
-                                    {
-                                        "current_dir": str(current_dir),
-                                        "entries_scanned_in_dir": entries_in_dir,
-                                        "subdirs_in_this_dir": subdirs_added,
-                                        "dirs_discovered": total_dirs_discovered,
-                                        "dirs_remaining_in_queue": len(dirs_to_visit),
-                                        "memory_mb": round(memory_mb, 1),
-                                        "memory_percent": round(memory_percent * 100, 1),
-                                    },
-                                )
-                                memory_abort = True
-                                break
+                            if memory_percent > 0.90:
+                                gc.collect()
+                                await asyncio.sleep(0.1)
+                                memory_mb = get_memory_usage_mb()
+                                memory_percent = memory_mb / self.memory_limit_mb
+                                if memory_percent > 0.95:
+                                    log_with_context(
+                                        self.logger,
+                                        "warning",
+                                        "Memory critical during large directory scan, aborting discovery",
+                                        {
+                                            "worker_id": worker_id,
+                                            "current_dir": str(current_dir),
+                                            "entries_scanned_in_dir": entries_in_dir,
+                                            "subdirs_in_this_dir": subdirs_added,
+                                            "dirs_discovered": total_dirs_discovered,
+                                            "dirs_remaining_in_queue": discovery_queue.qsize(),
+                                            "memory_mb": round(memory_mb, 1),
+                                            "memory_percent": round(memory_percent * 100, 1),
+                                        },
+                                    )
+                                    memory_abort = True
+                                    discovery_done.set()
+                                    break
 
-                await self.update_stats(dirs_scanned=1)
-                self.rate_tracker.record("removing_empty_dirs", "dirs", 1)
+                    await self.update_stats(dirs_scanned=1)
+                    self.rate_tracker.record("removing_empty_dirs", "dirs", 1)
 
-            except PermissionError:
-                discovery_errors += 1
-                self.logger.debug(f"Permission denied during discovery: {current_dir}")
-            except FileNotFoundError:
-                pass  # Directory was deleted concurrently
-            except OSError as e:
-                discovery_errors += 1
-                self.logger.debug(f"Error scanning {current_dir}: {e}")
+                except PermissionError:
+                    discovery_errors += 1
+                    self.logger.debug(f"Permission denied during discovery: {current_dir}")
+                except FileNotFoundError:
+                    pass  # Directory was deleted concurrently
+                except OSError as e:
+                    discovery_errors += 1
+                    self.logger.debug(f"Error scanning {current_dir}: {e}")
 
-            # Log progress periodically during discovery
-            if total_dirs_discovered % 50000 == 0 and total_dirs_discovered > 0:
-                memory_mb = get_memory_usage_mb() if self.memory_limit_mb > 0 else 0
-                memory_percent = (memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
-                log_with_context(
-                    self.logger,
-                    "info",
-                    "Directory discovery progress",
-                    {
-                        "dirs_discovered": total_dirs_discovered,
-                        "dirs_remaining_in_queue": len(dirs_to_visit),
-                        "depth_levels": len(dirs_by_depth),
-                        "memory_mb": round(memory_mb, 1),
-                        "memory_percent": round(memory_percent, 1),
-                        "memory_limit_mb": self.memory_limit_mb,
-                        "discovery_errors": discovery_errors,
-                    },
-                )
+                # Mark this directory as fully processed
+                pending_dirs -= 1
+                if pending_dirs <= 0:
+                    discovery_done.set()
+
+                # Log progress periodically during discovery (every 50,000 dirs)
+                current_milestone = (total_dirs_discovered // 50000) * 50000
+                if current_milestone > last_progress_milestone and total_dirs_discovered > 0:
+                    last_progress_milestone = current_milestone
+                    memory_mb = get_memory_usage_mb() if self.memory_limit_mb > 0 else 0
+                    memory_percent = (memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
+                    log_with_context(
+                        self.logger,
+                        "info",
+                        "Directory discovery progress",
+                        {
+                            "dirs_discovered": total_dirs_discovered,
+                            "dirs_remaining_in_queue": discovery_queue.qsize(),
+                            "depth_levels": len(dirs_by_depth),
+                            "memory_mb": round(memory_mb, 1),
+                            "memory_percent": round(memory_percent, 1),
+                            "memory_limit_mb": self.memory_limit_mb,
+                            "discovery_errors": discovery_errors,
+                            "active_workers": self.max_concurrent_discovery,
+                        },
+                    )
+
+        # Launch parallel discovery workers
+        num_workers = self.max_concurrent_discovery
+        workers = [asyncio.create_task(_discovery_worker(i)) for i in range(num_workers)]
+
+        # Wait for all workers to complete
+        await asyncio.gather(*workers, return_exceptions=True)
 
         # Discovery complete - clear state so progress monitor stops reporting discovery
         self._discovery_active = False
         self._discovery_current_dir = None
-
-        # Free the BFS queue now that discovery is complete
-        del dirs_to_visit
 
         max_depth = max(dirs_by_depth.keys()) if dirs_by_depth else 0
 
@@ -1572,6 +1631,7 @@ class AsyncEFSPurger:
                 "depth_levels": len(dirs_by_depth),
                 "max_depth": max_depth,
                 "discovery_errors": discovery_errors,
+                "concurrent_workers": self.max_concurrent_discovery,
                 "memory_mb": round(get_memory_usage_mb(), 1),
             },
         )
@@ -2367,6 +2427,7 @@ class AsyncEFSPurger:
                 "max_concurrent_subdirs": self.max_concurrent_subdirs,
                 "remove_empty_dirs": self.remove_empty_dirs,
                 "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
+                "max_concurrent_discovery": self.max_concurrent_discovery,
                 "scandir_executor_threads": self.scandir_executor._max_workers,
             },
         )
@@ -2533,6 +2594,7 @@ async def async_main(
     max_empty_dirs_to_delete: int = 500,
     max_concurrent_subdirs: int = 100,
     max_discovery_dirs: int = 0,
+    max_concurrent_discovery: int = 20,
 ) -> dict:
     """
     Async entry point for the purger.
@@ -2551,6 +2613,7 @@ async def async_main(
         max_empty_dirs_to_delete: Maximum empty directories to delete per run (0 = unlimited, default: 500)
         max_concurrent_subdirs: Maximum subdirectories to scan concurrently (lower = less memory, default: 100)
         max_discovery_dirs: Maximum directories to discover in Phase 1a (0 = auto based on memory)
+        max_concurrent_discovery: Maximum concurrent directory scans during Phase 1a discovery (default: 20)
 
     Returns:
         Operation statistics
@@ -2569,6 +2632,7 @@ async def async_main(
         max_empty_dirs_to_delete=max_empty_dirs_to_delete,
         max_concurrent_subdirs=max_concurrent_subdirs,
         max_discovery_dirs=max_discovery_dirs,
+        max_concurrent_discovery=max_concurrent_discovery,
     )
 
     return await purger.purge()

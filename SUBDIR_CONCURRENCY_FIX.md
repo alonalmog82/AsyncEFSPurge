@@ -1,5 +1,7 @@
 # Subdirectory Concurrency Fix
 
+> **⚠️ HISTORICAL (pre-v2.0):** This document describes the recursive `scan_directory()` + `_process_subdirs_with_constant_concurrency()` approach and the `--max-concurrent-subdirs` parameter, all of which were removed in v2.0. Phase 2 now uses a flat BFS queue + worker pool. See [CHANGELOG.md](CHANGELOG.md) for details.
+
 ## Problem
 
 The application was getting stuck on large directories (e.g., `/data/api_files` and `/data/api_files/mariadb`) with 0% concurrency utilization, even though only 2 active directories were being scanned.

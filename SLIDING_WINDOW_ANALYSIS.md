@@ -1,5 +1,7 @@
 # 🔍 Sliding Window Logic Analysis
 
+> **⚠️ HISTORICAL (pre-v2.0):** This analysis covers the old recursive `scan_directory()` code path which was removed in v2.0. See [CHANGELOG.md](CHANGELOG.md) for the current BFS queue architecture.
+
 ## Current Implementation Review
 
 ### Code Flow (lines 290-329)

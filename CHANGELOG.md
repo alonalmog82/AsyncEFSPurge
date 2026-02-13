@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-02-13
+
+### Changed
+- **BREAKING: Phase 2 rewritten to BFS queue + worker pool** — replaces the recursive `scan_directory()` + `_process_subdirs_with_constant_concurrency()` approach with the same flat BFS pattern used by Phase 1a discovery. Each worker pulls directories from a shared `asyncio.Queue`, scans entries via `async_scandir_batched()` (streaming), processes files in batches, and pushes discovered subdirectories back onto the queue. Workers drain the queue naturally and exit cleanly.
+- **Removed `--max-concurrent-subdirs` CLI flag** and `EFSPURGE_MAX_CONCURRENT_SUBDIRS` environment variable. Phase 2 now uses the same worker count as Phase 1a (`--max-concurrent-discovery`, default: 20).
+- **Removed `scan_directory()` method** — replaced by internal `_scan_and_purge_files()`.
+- **Removed `_process_subdirs_with_constant_concurrency()` method** and `subdir_semaphore`.
+- Thread pool sizing now scales with `max_concurrent_discovery` instead of `max_concurrent_subdirs`.
+
+### Fixed
+- **Root directory hang eliminated**: Phase 2 now uses `async_scandir_batched()` to stream directory entries instead of `list(os.scandir())`. Directories with 700K+ entries no longer cause 30+ minute hangs.
+- **Unawaited coroutine warning eliminated**: Worker `finally` blocks properly close any coroutines remaining in `file_task_buffer` on exception or cancellation, preventing `RuntimeWarning: coroutine 'AsyncEFSPurger.process_file' was never awaited`.
+- **10K iteration limit removed**: The previous `_process_subdirs_with_constant_concurrency` had a hard break at 10,000 iterations that silently abandoned subdirectories. The BFS queue approach has no iteration limit — work completes when the queue drains.
+- **Phase 1b timeout for stuck directories**: `asyncio.gather` replaced with `asyncio.wait(..., timeout=120)` during bottom-up empty directory deletion. Timed-out operations are cancelled and skipped with a warning, preventing indefinite hangs.
+- **Memory growth during hangs**: `gc.collect()` is now triggered during stuck detection in the progress reporter to prevent memory creep during stalls.
+
+### Testing
+- Rewrote `test_subdir_concurrency.py` to test BFS worker pool behavior
+- Updated all tests referencing removed `scan_directory()` and `max_concurrent_subdirs` APIs
+- 170 tests passing
+
 ## [1.15.4] - 2026-02-12
 
 ### Fixed

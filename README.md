@@ -91,7 +91,7 @@ options:
   --max-concurrency-deletion N  Maximum concurrent file deletion (remove) operations (default: 1000)
   --memory-limit-mb MB      Soft memory limit in MB, triggers back-pressure (default: 800)
   --task-batch-size N       Maximum tasks to create at once, prevents OOM (default: 5000)
-  --max-concurrent-subdirs N  Maximum subdirectories to scan concurrently (default: 100)
+  --max-concurrent-discovery N  Maximum concurrent scan workers for Phase 1a and Phase 2 (default: 20)
   --max-discovery-dirs N    Maximum directories to discover in Phase 1a (0 = auto based on memory limit)
   --dry-run                 Don't actually delete files, just report what would be deleted
   --remove-empty-dirs       Remove empty directories (two-pass: Phase 1 before scan, Phase 3 after scan)
@@ -144,7 +144,7 @@ efspurge /mnt/efs --max-age-days 30 --remove-empty-dirs --max-empty-dirs-to-dele
 ```bash
 # Use max-age-days=0 to skip file processing entirely - only delete empty directories
 # This avoids expensive os.stat() calls on files and is much faster for deep directory structures
-efspurge /mnt/efs --max-age-days 0 --remove-empty-dirs --max-concurrent-subdirs 20
+efspurge /mnt/efs --max-age-days 0 --remove-empty-dirs
 ```
 
 ## Deployment
@@ -457,7 +457,7 @@ ruff format .
 - `EFSPURGE_TASK_BATCH_SIZE=N` - Maximum tasks to create at once, prevents OOM (default: 5000)
 - `EFSPURGE_REMOVE_EMPTY_DIRS=1` - Enable empty directory removal (same as `--remove-empty-dirs` flag)
 - `EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE=N` - Maximum empty directories to delete per run (0 = unlimited, default: 500)
-- `EFSPURGE_MAX_CONCURRENT_SUBDIRS=N` - Maximum subdirectories to scan concurrently (default: 100, lower for deep trees)
+- `EFSPURGE_MAX_CONCURRENT_DISCOVERY=N` - Maximum concurrent scan workers for directory traversal (default: 20)
 - `EFSPURGE_MAX_DISCOVERY_DIRS=N` - Maximum directories to discover in Phase 1a (0 = auto based on memory limit)
 - `EFSPURGE_MAX_CONCURRENCY=N` - [DEPRECATED] Maximum concurrent operations (use `EFSPURGE_MAX_CONCURRENCY_SCANNING`/`EFSPURGE_MAX_CONCURRENCY_DELETION`)
 - `EFSPURGE_MAX_CONCURRENCY_SCANNING=N` - Maximum concurrent file scanning operations (default: 1000)
@@ -516,48 +516,25 @@ The `--max-concurrency-scanning` and `--max-concurrency-deletion` parameters sho
 
 Start with defaults and increase if you're not saturating network/IOPS. See [CONCURRENCY_TUNING.md](CONCURRENCY_TUNING.md) for detailed guidance.
 
-### Tuning Memory for Deep Directory Trees
+### Architecture: BFS Queue Scanning (v2.0+)
 
-The `--max-concurrent-subdirs` parameter controls how many subdirectories are scanned concurrently at each level of the directory tree. **Default: 100.**
+Starting with v2.0, both Phase 1a (empty directory discovery) and Phase 2 (file scanning) use a flat BFS queue with persistent worker coroutines. This eliminates the recursive coroutine explosion that caused OOM on deep directory trees in earlier versions.
 
-**Why This Matters:**
+**How It Works:**
+- A shared `asyncio.Queue` holds directories to scan
+- N worker coroutines (controlled by `--max-concurrent-discovery`, default: 20) pull directories from the queue
+- Each worker uses `async_scandir_batched()` to stream directory entries without blocking
+- Discovered subdirectories are pushed back onto the queue
+- Workers exit when the queue is fully drained
 
-On deep directory trees, concurrent subdirectory scanning creates a recursive explosion of coroutines:
+**Benefits over previous recursive approach:**
+- No recursive coroutine explosion on deep trees
+- No artificial iteration limits that silently skip directories
+- Clean shutdown with no unawaited coroutines
+- Streaming scandir prevents hangs on directories with 100K+ entries
+- Memory bounded by queue frontier (much smaller than total directory count)
 
-```
-Level 1: 100 concurrent scans
-Level 2: 100 × 100 = 10,000 pending coroutines
-Level 3: 100 × 100 × 100 = 1,000,000 pending coroutines
-→ Memory explodes before any files are processed!
-```
-
-**When to Reduce This Value:**
-
-- Pod getting OOM killed despite low `--max-concurrency`
-- Memory usage spikes during directory traversal (before file processing)
-- Deep directory hierarchies (many nested folders)
-- Memory-constrained environments (small Kubernetes pods)
-
-**Recommended Settings by Environment:**
-
-| Environment | `--max-concurrent-subdirs` | Notes |
-|-------------|---------------------------|-------|
-| **Default** | 100 | Good for most use cases |
-| **Memory-constrained (512Mi-1Gi pod)** | 10-20 | Prevents recursive explosion |
-| **Very deep trees (10+ levels)** | 5-10 | Keeps memory bounded |
-| **Large memory (4Gi+ pod)** | 100-200 | Can handle more parallelism |
-
-**Example for memory-constrained environments:**
-```bash
-efspurge /data \
-  --max-age-days 30 \
-  --max-concurrency=100 \
-  --task-batch-size=500 \
-  --max-concurrent-subdirs=10 \
-  --memory-limit-mb=400
-```
-
-**Environment Variable:** `EFSPURGE_MAX_CONCURRENT_SUBDIRS`
+**Environment Variable:** `EFSPURGE_MAX_CONCURRENT_DISCOVERY`
 
 ## Troubleshooting
 
@@ -573,9 +550,9 @@ docker run --rm -v /mnt/efs:/data:rw efspurge:latest /data --max-age-days 30
 **For deep directory trees (memory explodes during traversal):**
 
 ```bash
-# Reduce concurrent subdirectory scanning
+# Reduce scan workers and batch sizes
 efspurge /data --max-age-days 30 \
-  --max-concurrent-subdirs=10 \
+  --max-concurrent-discovery=10 \
   --max-concurrency-scanning=100 \
   --max-concurrency-deletion=100 \
   --task-batch-size=500
@@ -600,7 +577,7 @@ You can identify this pattern in the logs when Phase 1a progress reports show:
 - `current_directory` staying the same across multiple progress intervals
 - `entries_scanned` approximately equal to `dirs_discovered` (all entries are subdirectories)
 
-**Protections (v1.15.3+):**
+**Protections (v2.0+):**
 - Memory checks every 10 batches (~50K entries) abort discovery if memory exceeds 95% after GC
 - The outer BFS loop checks memory between directories and aborts at 95%
 - `max_discovery_dirs` caps total directories discovered (auto-calculated from `--memory-limit-mb`)
@@ -617,7 +594,7 @@ efspurge /data --max-age-days 30 --remove-empty-dirs \
   --max-empty-dirs-to-delete 0
 ```
 
-**Key insight:** If memory spikes with `dirs_scanned` but `files_scanned=0`, the problem is `--max-concurrent-subdirs` (directory traversal), not file processing.
+**Key insight:** If memory spikes with `dirs_scanned` but `files_scanned=0`, try reducing `--max-concurrent-discovery` (directory traversal workers) or `--memory-limit-mb`.
 
 ### Slow Performance
 
@@ -627,37 +604,13 @@ efspurge /data --max-age-days 30 --remove-empty-dirs \
 4. Check filesystem IOPS limits (AWS EFS scales with size)
 5. Use `--log-level WARNING` to reduce logging overhead
 
-#### Directory Scanning Performance (v1.11.0+)
+#### Directory Scanning Performance (v2.0+)
 
-**Status:** ✅ **Fixed in v1.11.0+**
+**Status:** ✅ **Redesigned in v2.0**
 
-Starting with v1.11.0, AsyncEFSPurge automatically uses a custom ThreadPoolExecutor for directory scanning that scales with your `--max-concurrent-subdirs` setting. This eliminates the previous bottleneck where directory scanning was limited to ~250-300 dirs/sec.
+Starting with v2.0, directory scanning uses a BFS queue with `async_scandir_batched()` streaming and a custom ThreadPoolExecutor. The thread pool scales with `--max-concurrent-discovery` (default: 20 workers × 5 = 100 threads, capped at 200).
 
-**How It Works:**
-- **v1.10.0 and earlier**: Used Python's default ThreadPoolExecutor (~32 threads), limiting directory scanning to ~250-300 dirs/sec regardless of `--max-concurrent-subdirs`
-- **v1.11.0+**: Automatically creates a custom ThreadPoolExecutor with 100-500 threads based on `--max-concurrent-subdirs`
-  - `max_concurrent_subdirs < 500`: 100-200 threads
-  - `max_concurrent_subdirs 500-999`: 150-300 threads  
-  - `max_concurrent_subdirs >= 1000`: 200-500 threads
-
-**Expected Performance:**
-- **Before (v1.10.0)**: ~280 dirs/sec with `--max-concurrent-subdirs=4000`
-- **After (v1.11.0+)**: 500-1000+ dirs/sec with `--max-concurrent-subdirs=4000` (2-5x improvement)
-
-**Thread Count Scaling:**
-The executor thread count is shown in the startup log as `scandir_executor_threads`. It scales intelligently:
-- Scales with `max_concurrent_subdirs` to better utilize high concurrency settings
-- Capped at 500 threads to avoid excessive context switching overhead
-- Automatically cleaned up on completion
-
-**Note:** This improvement only affects directory scanning (`dirs_scanned` rate). File processing (`files_scanned` rate) scales independently with `--max-concurrency-scanning` and was not affected by this bottleneck.
-
-**Trade-offs:**
-- ✅ Higher directory scanning throughput (2-5x improvement)
-- ✅ Better utilization of `--max-concurrent-subdirs` parameter
-- ✅ Automatic scaling - no code changes needed
-- ⚠️ Increased memory usage (each thread uses ~8MB stack space, so 400 threads ≈ 3.2GB)
-- ⚠️ More context switching overhead (diminishing returns beyond ~500 threads)
+**Performance:** Directory scanning throughput is primarily bounded by filesystem latency (EFS: ~1-5ms per scandir call). With 20 workers overlapping I/O, expect 500-2000+ dirs/sec on EFS.
 
 ## License
 
@@ -672,6 +625,16 @@ MIT License - see [LICENSE](LICENSE) file for details.
 Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests.
 
 ## Changelog
+
+### Version 2.0.0 (2026-02-13)
+- **BREAKING**: Phase 2 rewritten to BFS queue + worker pool (same pattern as Phase 1a)
+- **Removed**: `--max-concurrent-subdirs` flag and `EFSPURGE_MAX_CONCURRENT_SUBDIRS` env var
+- **Fixed**: Root directory hang (37 min) on large directories with 700K+ entries
+- **Fixed**: Unawaited `process_file` coroutines on shutdown
+- **Fixed**: 10K iteration limit silently abandoning subdirectories
+- **Fixed**: Phase 1b hang on stuck directories (now times out after 120s)
+- **Fixed**: Memory growth during stalls (GC triggered on stuck detection)
+- See [CHANGELOG.md](CHANGELOG.md) for detailed changelog
 
 ### Version 1.15.4 (2026-02-12)
 - **Hotfix**: Memory abort during Phase 1a discovery now fires unconditionally (every 10 batches), fixing OOM in flat directories with millions of files and no subdirectories

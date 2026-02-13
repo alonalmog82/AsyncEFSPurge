@@ -153,7 +153,7 @@ async def test_permission_denied_on_directory_during_scan(temp_dir):
         assert purger.stats["files_scanned"] >= 1
     finally:
         # Restore permissions for cleanup
-        os.chmod(temp_dir / "restricted", 0o755)
+        os.chmod(temp_dir / "restricted", 0o700)
 
 
 # ---------------------------------------------------------------------------

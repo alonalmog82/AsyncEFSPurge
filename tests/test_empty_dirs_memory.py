@@ -40,7 +40,6 @@ async def test_empty_dir_deletion_memory_bounded(temp_dir):
         max_age_days=30,
         remove_empty_dirs=True,
         max_concurrency_deletion=200,
-        max_concurrent_subdirs=200,
         memory_limit_mb=800,
         max_empty_dirs_to_delete=0,
         dry_run=False,
@@ -48,9 +47,6 @@ async def test_empty_dir_deletion_memory_bounded(temp_dir):
 
     process = psutil.Process(os.getpid())
     initial_memory = process.memory_info().rss / 1024 / 1024
-
-    await purger.scan_directory(temp_dir)
-
     peak_memory = initial_memory
 
     async def monitor_memory():
@@ -62,7 +58,7 @@ async def test_empty_dir_deletion_memory_bounded(temp_dir):
 
     monitor_task = asyncio.create_task(monitor_memory())
     try:
-        await purger._remove_empty_directories()
+        await purger._purge_empty_directories_standalone()
     finally:
         monitor_task.cancel()
         try:
@@ -96,7 +92,9 @@ async def test_empty_dir_deletion_queue_memory_bounded(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
+    # Populate empty_dirs for queue-based _remove_empty_directories
+    for i in range(num_dirs):
+        purger.empty_dirs.add(temp_dir / f"empty_{i:04d}")
 
     process = psutil.Process(os.getpid())
     memory_before = process.memory_info().rss / 1024 / 1024
@@ -130,7 +128,9 @@ async def test_empty_dir_deletion_memory_pressure_checks(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
+    # Populate empty_dirs for _remove_empty_directories (tests producer memory checks)
+    for i in range(num_dirs):
+        purger.empty_dirs.add(temp_dir / f"empty_{i:04d}")
 
     check_calls = []
     check_results = []
@@ -171,7 +171,9 @@ async def test_memory_checks_in_producer(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
+    # Populate empty_dirs for _remove_empty_directories (tests producer memory checks)
+    for i in range(num_dirs):
+        purger.empty_dirs.add(temp_dir / f"empty_{i:04d}")
 
     check_count = [0]
     check_timings = []
@@ -221,12 +223,10 @@ async def test_cascading_deletion_memory_bounded(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
-
     process = psutil.Process(os.getpid())
     memory_before = process.memory_info().rss / 1024 / 1024
 
-    await purger._remove_empty_directories()
+    await purger.purge()
 
     memory_after = process.memory_info().rss / 1024 / 1024
     memory_increase = memory_after - memory_before
@@ -296,7 +296,6 @@ async def test_stress_large_scale_empty_dir_deletion_memory_bounded(temp_dir):
         max_age_days=30,
         remove_empty_dirs=True,
         max_concurrency_deletion=1000,
-        max_concurrent_subdirs=1000,
         memory_limit_mb=800,
         max_empty_dirs_to_delete=0,
         dry_run=False,
@@ -306,7 +305,9 @@ async def test_stress_large_scale_empty_dir_deletion_memory_bounded(temp_dir):
     initial_memory = process.memory_info().rss / 1024 / 1024
     print(f"Initial memory: {initial_memory:.1f}MB")
 
-    await purger.scan_directory(temp_dir)
+    # Populate empty_dirs for _remove_empty_directories (stress test of queue-based deletion)
+    for i in range(num_dirs):
+        purger.empty_dirs.add(temp_dir / f"empty_{i:06d}")
 
     memory_after_scan = process.memory_info().rss / 1024 / 1024
     print(f"Memory after scan: {memory_after_scan:.1f}MB")
@@ -371,7 +372,8 @@ async def test_stress_queue_memory_bounded(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
+    for i in range(num_dirs):
+        purger.empty_dirs.add(temp_dir / f"empty_{i:04d}")
 
     process = psutil.Process(os.getpid())
     memory_before = process.memory_info().rss / 1024 / 1024
@@ -406,7 +408,8 @@ async def test_stress_memory_pressure_checks(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
+    for i in range(num_dirs):
+        purger.empty_dirs.add(temp_dir / f"empty_{i:04d}")
 
     check_calls = []
     check_results = []
@@ -460,12 +463,10 @@ async def test_stress_cascading_deletion_memory_bounded(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
-
     process = psutil.Process(os.getpid())
     memory_before = process.memory_info().rss / 1024 / 1024
 
-    await purger._remove_empty_directories()
+    await purger.purge()
 
     memory_after = process.memory_info().rss / 1024 / 1024
     memory_increase = memory_after - memory_before

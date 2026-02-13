@@ -16,7 +16,7 @@ if str(src_path) not in sys.path:
 # Executor cleanup: ensure no ThreadPoolExecutor threads leak between tests.
 #
 # AsyncEFSPurger creates a ThreadPoolExecutor in __init__ but only shuts it
-# down inside purge().  Tests that call lower-level methods (scan_directory,
+# down inside purge().  Tests that call lower-level methods (_scan_and_purge_files,
 # _purge_empty_directories_standalone, _remove_empty_directories) skip that
 # cleanup, leaving non-daemon threads alive.  At process exit Python's atexit
 # handler joins them, which can block indefinitely if any thread is stuck.

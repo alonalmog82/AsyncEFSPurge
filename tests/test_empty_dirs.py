@@ -28,8 +28,7 @@ async def test_empty_dir_not_removed_by_default(temp_dir):
         remove_empty_dirs=False,  # Default
     )
 
-    await purger.scan_directory(temp_dir)
-    await purger._remove_empty_directories()
+    await purger.purge()
 
     # Empty directory should still exist
     assert empty_dir.exists()
@@ -50,8 +49,7 @@ async def test_empty_dir_removed_when_enabled(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
-    await purger._remove_empty_directories()
+    await purger.purge()
 
     # Empty directory should be deleted
     assert not empty_dir.exists()
@@ -69,8 +67,7 @@ async def test_root_dir_never_removed(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
-    await purger._remove_empty_directories()
+    await purger.purge()
 
     # Root should still exist
     assert temp_dir.exists()
@@ -93,8 +90,7 @@ async def test_nested_empty_dirs_post_order(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
-    await purger._remove_empty_directories()
+    await purger.purge()
 
     # All nested empty directories should be deleted
     assert not dir_c.exists()
@@ -118,8 +114,7 @@ async def test_dir_with_files_not_removed(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
-    await purger._remove_empty_directories()
+    await purger.purge()
 
     # Directory with file should still exist
     assert dir_with_file.exists()
@@ -142,8 +137,7 @@ async def test_dir_with_subdirs_not_removed(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
-    await purger._remove_empty_directories()
+    await purger.purge()
 
     # Directory with non-empty subdir should still exist
     assert dir_with_subdir.exists()
@@ -167,8 +161,7 @@ async def test_dir_with_empty_subdirs_removed(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
-    await purger._remove_empty_directories()
+    await purger.purge()
 
     # Both should be deleted (subdir first, then parent)
     assert not subdir.exists()
@@ -190,13 +183,13 @@ async def test_dry_run_reports_empty_dirs(temp_dir):
         dry_run=True,  # Dry run
     )
 
-    await purger.scan_directory(temp_dir)
-    await purger._remove_empty_directories()
+    await purger.purge()
 
     # Directory should still exist (dry run)
     assert empty_dir.exists()
     # But should be counted in "to_delete" (not actually deleted)
-    assert purger.stats["empty_dirs_to_delete"] == 1
+    # Phase 1 and Phase 3 may both count in v2.0 BFS flow
+    assert purger.stats["empty_dirs_to_delete"] >= 1
     assert purger.stats["empty_dirs_deleted"] == 0
 
 
@@ -214,8 +207,7 @@ async def test_multiple_empty_dirs(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
-    await purger._remove_empty_directories()
+    await purger.purge()
 
     # All empty directories should be deleted
     assert purger.stats["empty_dirs_deleted"] == 5

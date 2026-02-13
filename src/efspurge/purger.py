@@ -415,7 +415,6 @@ class AsyncEFSPurger:
         task_batch_size: int = 5000,
         remove_empty_dirs: bool = False,
         max_empty_dirs_to_delete: int = 500,
-        max_concurrent_subdirs: int = 100,
         max_discovery_dirs: int = 0,
         max_concurrent_discovery: int = 20,
     ):
@@ -434,9 +433,8 @@ class AsyncEFSPurger:
             task_batch_size: Maximum tasks to create at once (prevents OOM)
             remove_empty_dirs: If True, remove empty directories after scanning (post-order)
             max_empty_dirs_to_delete: Maximum empty directories to delete per run (0 = unlimited, default: 500)
-            max_concurrent_subdirs: Maximum subdirectories to scan concurrently (lower = less memory, default: 100)
             max_discovery_dirs: Maximum directories to discover in Phase 1a (0 = use automatic limit based on memory)
-            max_concurrent_discovery: Maximum concurrent directory scans during Phase 1a discovery (default: 20)
+            max_concurrent_discovery: Maximum concurrent directory/file scan workers (default: 20)
 
         Raises:
             ValueError: If invalid parameters are provided
@@ -487,9 +485,6 @@ class AsyncEFSPurger:
         if max_empty_dirs_to_delete < 0:
             raise ValueError(f"max_empty_dirs_to_delete must be >= 0, got {max_empty_dirs_to_delete}")
 
-        if max_concurrent_subdirs < 1:
-            raise ValueError(f"max_concurrent_subdirs must be >= 1, got {max_concurrent_subdirs}")
-
         # Ensure root_path is absolute
         root_path_obj = Path(root_path)
         if not root_path_obj.is_absolute():
@@ -537,7 +532,6 @@ class AsyncEFSPurger:
         self.task_batch_size = task_batch_size
         self.remove_empty_dirs = remove_empty_dirs
         self.max_empty_dirs_to_delete = max_empty_dirs_to_delete
-        self.max_concurrent_subdirs = max_concurrent_subdirs
         self.max_concurrent_discovery = max(1, max_concurrent_discovery)
 
         # Compute discovery limit: if explicitly set use that, otherwise derive from memory budget.
@@ -606,8 +600,6 @@ class AsyncEFSPurger:
         # Concurrency control - separate semaphores for scanning and deletion
         self.scanning_semaphore = asyncio.Semaphore(max_concurrency_scanning)
         self.deletion_semaphore = asyncio.Semaphore(max_concurrency_deletion)
-        # Semaphore for subdirectory scanning to maintain constant concurrency
-        self.subdir_semaphore = asyncio.Semaphore(max_concurrent_subdirs)
         self.stats_lock = asyncio.Lock()
 
         # Note: Incremental batch processing during scanning has been removed.
@@ -616,13 +608,8 @@ class AsyncEFSPurger:
         # Custom ThreadPoolExecutor for directory scanning to bypass default thread pool limit
         # Default executor has ~32 threads, limiting directory scanning throughput to ~250-300 dirs/sec
         # Custom executor allows scaling to 200-500 threads for 2-5x improvement
-        # Thread count scales with max_concurrent_subdirs but is capped to avoid excessive overhead
-        if max_concurrent_subdirs >= 1000:
-            scandir_threads = min(500, max(200, max_concurrent_subdirs // 10))
-        elif max_concurrent_subdirs >= 500:
-            scandir_threads = min(300, max(150, max_concurrent_subdirs // 8))
-        else:
-            scandir_threads = min(200, max(100, max_concurrent_subdirs // 5))
+        # Thread count scales with worker count but is capped to avoid excessive overhead
+        scandir_threads = min(200, max(100, self.max_concurrent_discovery * 5))
 
         self.scandir_executor = ThreadPoolExecutor(max_workers=scandir_threads, thread_name_prefix="efspurge-scandir")
 
@@ -657,7 +644,7 @@ class AsyncEFSPurger:
         Also called automatically by ``async with AsyncEFSPurger(...)``.
         The ``purge()`` method calls this internally, so you only need to
         call it when using lower-level methods like
-        ``_purge_empty_directories_standalone()`` or ``scan_directory()``
+        ``_purge_empty_directories_standalone()`` or ``_scan_and_purge_files()``
         directly.
         """
         if hasattr(self, "scandir_executor") and self.scandir_executor is not None:
@@ -1385,7 +1372,6 @@ class AsyncEFSPurger:
             "Phase 1: Starting standalone empty directory purge",
             {
                 "root_path": str(self.root_path),
-                "max_concurrent_subdirs": self.max_concurrent_subdirs,
                 "max_concurrency_deletion": self.max_concurrency_deletion,
                 "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
                 "memory_limit_mb": self.memory_limit_mb,
@@ -1842,8 +1828,27 @@ class AsyncEFSPurger:
                 i = batch_end
 
                 # Process batch concurrently (semaphore limits actual concurrency)
+                # Use asyncio.wait with timeout to prevent Phase 1b hangs (Issue 3):
+                # Previously, a few directories at depth 1 stalled for ~5 minutes
+                # because asyncio.gather waited indefinitely on slow EFS operations.
                 tasks = [asyncio.create_task(check_and_delete_if_empty(d)) for d in batch]
-                await asyncio.gather(*tasks, return_exceptions=True)
+                if tasks:
+                    done, pending_tasks = await asyncio.wait(tasks, timeout=120.0)
+
+                    if pending_tasks:
+                        timed_out = len(pending_tasks)
+                        for t in pending_tasks:
+                            t.cancel()
+                        await asyncio.gather(*pending_tasks, return_exceptions=True)
+                        log_with_context(
+                            self.logger,
+                            "warning",
+                            f"Phase 1b: {timed_out} directory operations timed out after 120s, skipping",
+                            {"timed_out": timed_out, "batch_size": len(batch), "depth": current_depth},
+                        )
+                        async with deleted_lock:
+                            deletion_errors += timed_out
+                        await self.update_stats(errors=timed_out)
 
                 # Free batch reference
                 del batch
@@ -1928,218 +1933,204 @@ class AsyncEFSPurger:
 
         self.logger.debug(f"Processed batch of {len(file_tasks)} files")
 
-    async def _process_subdirs_with_constant_concurrency(self, subdirs: list[Path]) -> None:
+    async def _scan_and_purge_files(self) -> None:
         """
-        Process subdirectories with constant concurrency using a hybrid approach.
+        Phase 2: Scan the directory tree and purge old files using BFS queue + worker pool.
 
-        This method maintains high concurrency utilization while preventing memory explosion:
-        - Uses semaphore to limit concurrent execution (maintains constant concurrency)
-        - Creates tasks on-demand as slots become available (prevents memory explosion)
-        - As tasks complete, new ones start immediately (high utilization)
+        Uses the same flat BFS pattern as Phase 1a discovery, extended to also
+        process files. This replaces the previous recursive scan_directory() approach
+        which had issues with:
+        - Blocking scandir for large directories (37-min hang on 700K+ entries)
+        - 10K iteration limit silently abandoning subdirectories
+        - Unawaited coroutines on shutdown/cancellation
+        - Recursive coroutine stack causing memory growth
 
-        Key benefits:
-        - Never creates more than max_concurrent_subdirs tasks at once
-        - Maintains constant concurrency (no idle slots waiting for slow directories)
-        - Prevents recursive memory explosion in deep directory trees
-
-        IMPORTANT: Before modifying this method or scan_directory's subdirectory processing,
-        test with 80×80×80 directory structure (518,481 dirs) to ensure no deadlock or
-        memory issues. See test_deep_directory_tree_memory_safety for details.
-
-        Args:
-            subdirs: List of subdirectory paths to process
+        Architecture:
+        - One shared asyncio.Queue holds directories to scan
+        - N worker coroutines pull directories and process them
+        - Each worker uses async_scandir_batched() for non-blocking streaming
+        - Files are batched and processed via _process_file_batch()
+        - Discovered subdirectories are pushed back onto the queue
+        - Workers exit when queue is drained (tracked via pending_dirs counter)
         """
-        if not subdirs:
-            return
+        scan_queue: asyncio.Queue[Path] = asyncio.Queue()
+        scan_queue.put_nowait(self.root_path)
+        pending_dirs = 1  # root is in the queue
+        pending_lock = asyncio.Lock()
+        scan_done = asyncio.Event()
 
-        # Use a queue to track remaining subdirectories
-        remaining_subdirs = list(subdirs)
-        active_tasks: list[asyncio.Task] = []
-
-        async def scan_with_semaphore(subdir: Path) -> None:
-            """Scan a subdirectory with semaphore control."""
-            async with self.subdir_semaphore:
-                await self.scan_directory(subdir)
-
-        # Process subdirectories maintaining constant concurrency
-        # We create tasks on-demand as slots become available, never exceeding max_concurrent_subdirs
-        iterations = 0
-        while remaining_subdirs or active_tasks:
-            iterations += 1
-
-            # Start new tasks up to the concurrency limit
-            # The semaphore ensures only max_concurrent_subdirs run concurrently,
-            # but we can have a few more tasks waiting (bounded by max_concurrent_subdirs)
-            while len(active_tasks) < self.max_concurrent_subdirs and remaining_subdirs:
-                subdir = remaining_subdirs.pop(0)
-                task = asyncio.create_task(scan_with_semaphore(subdir))
-                active_tasks.append(task)
-
-            # Wait for at least one task to complete before starting more
-            # This ensures we maintain constant concurrency without creating all tasks upfront
-            if active_tasks:
-                done, pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
-
-                # Remove completed tasks and check for exceptions
-                for task in done:
-                    active_tasks.remove(task)
-                    # Check for exceptions (scan_directory handles its own, but log unexpected ones)
-                    try:
-                        await task
-                    except Exception as e:
-                        # scan_directory should handle all exceptions, but log unexpected ones
-                        log_with_context(
-                            self.logger,
-                            "error",
-                            "Unexpected exception in subdirectory scan",
-                            {"error": str(e), "error_type": type(e).__name__},
-                        )
-
-            # Debug: Log if we're stuck in a loop (shouldn't happen, but helps diagnose)
-            if iterations > 10000:
-                self.logger.warning(
-                    f"Warning: _process_subdirs_with_constant_concurrency has run {iterations} iterations. "
-                    f"Remaining subdirs: {len(remaining_subdirs)}, Active tasks: {len(active_tasks)}"
-                )
-                break
-
-    async def scan_directory(self, directory: Path) -> None:
-        """
-        Recursively scan a directory and process files using TRUE STREAMING.
-
-        This implementation uses a sliding window approach:
-        - Accumulates files into a buffer
-        - Processes and frees buffer when it reaches batch_size
-        - Never holds all files in memory at once
-        - Much lower memory footprint
-
-        Args:
-            directory: Directory path to scan
-        """
-        # Track this directory as actively being scanned (for stuck detection diagnostics)
-        async with self.active_directories_lock:
-            self.active_directories.add(directory)
-
+        # Normalize root path once for Phase 3 empty-dir checks
         try:
-            await self.update_stats(dirs_scanned=1)
-            # Record sample for rate tracking
-            self.rate_tracker.record(self.current_phase, "dirs", 1)
+            root_resolved = self.root_path.resolve()
+        except (OSError, RuntimeError):
+            root_resolved = self.root_path
 
-            # Scan directory entries
-            entries = await async_scandir(directory, self.scandir_executor, self)
+        num_workers = self.max_concurrent_discovery
 
-            # STREAMING: Use buffer instead of accumulating all tasks
-            file_task_buffer = []
-            subdirs = []
+        log_with_context(
+            self.logger,
+            "info",
+            "Phase 2: Starting BFS file scan with worker pool",
+            {
+                "root_path": str(self.root_path),
+                "num_workers": num_workers,
+                "task_batch_size": self.task_batch_size,
+                "max_concurrency_scanning": self.max_concurrency_scanning,
+                "max_concurrency_deletion": self.max_concurrency_deletion,
+            },
+        )
 
-            for entry in entries:
-                entry_path = Path(entry.path)
+        async def _scan_worker(worker_id: int) -> None:
+            """Worker that scans directories from queue and processes files."""
+            nonlocal pending_dirs
+
+            while not scan_done.is_set():
+                # Get next directory from queue
+                try:
+                    directory = await asyncio.wait_for(scan_queue.get(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    if scan_done.is_set():
+                        break
+                    continue
+
+                # Track this directory as active (for stuck detection diagnostics)
+                async with self.active_directories_lock:
+                    self.active_directories.add(directory)
+
+                file_task_buffer: list = []
 
                 try:
-                    # Check if entry is a symlink (don't follow)
-                    is_symlink = await aiofiles.os.path.islink(entry_path)
-                    if is_symlink:
-                        await self.update_stats(symlinks_skipped=1)
-                        self.logger.debug(f"Skipping symlink: {entry_path}")
-                        continue
+                    await self.update_stats(dirs_scanned=1)
+                    self.rate_tracker.record(self.current_phase, "dirs", 1)
 
-                    # Handle files with streaming buffer
-                    if entry.is_file(follow_symlinks=False):
-                        # Skip file processing entirely when max_age_days=0 (empty dir deletion only)
-                        # This avoids expensive os.stat() calls when we only want to delete empty directories
-                        if self.max_age_days > 0:
-                            file_task_buffer.append(self.process_file(entry_path))
+                    # Track scandir diagnostics (DEBUG level only)
+                    scan_start_time = time.time() if self.logger.isEnabledFor(logging.DEBUG) else None
 
-                            # STREAMING: Process and clear buffer when it reaches batch size
-                            if len(file_task_buffer) >= self.task_batch_size:
+                    # Scan directory entries using batched scandir (streaming, non-blocking)
+                    # This prevents the 37-min hang that occurred with list(os.scandir())
+                    # on directories with 700K+ entries.
+                    async for batch in async_scandir_batched(directory, self.scandir_executor):
+                        # Check memory pressure between batches
+                        await self.check_memory_pressure()
+
+                        for entry in batch:
+                            entry_path = Path(entry.path)
+                            try:
+                                # Check if entry is a symlink (don't follow)
+                                is_symlink = await aiofiles.os.path.islink(entry_path)
+                                if is_symlink:
+                                    await self.update_stats(symlinks_skipped=1)
+                                    self.logger.debug(f"Skipping symlink: {entry_path}")
+                                    continue
+
+                                # Handle files with streaming buffer
+                                if entry.is_file(follow_symlinks=False):
+                                    # Skip file processing when max_age_days=0 (empty dir deletion only)
+                                    if self.max_age_days > 0:
+                                        file_task_buffer.append(self.process_file(entry_path))
+
+                                        # Flush buffer when it reaches batch size
+                                        if len(file_task_buffer) >= self.task_batch_size:
+                                            try:
+                                                await self._process_file_batch(file_task_buffer)
+                                            finally:
+                                                file_task_buffer.clear()
+
+                                elif entry.is_dir(follow_symlinks=False):
+                                    # Push subdirectory onto queue for another worker to process
+                                    async with pending_lock:
+                                        pending_dirs += 1
+                                    scan_queue.put_nowait(entry_path)
+
+                                else:
+                                    # Special file types: sockets, FIFOs, block/char devices, etc.
+                                    await self.update_stats(special_files_skipped=1)
+                                    self.logger.debug(f"Skipping special file: {entry_path}")
+
+                            except OSError as e:
+                                log_with_context(
+                                    self.logger,
+                                    "warning",
+                                    "Error checking entry",
+                                    {"path": str(entry_path), "error": str(e)},
+                                )
+                                await self.update_stats(errors=1)
+
+                    # Record scandir diagnostics (DEBUG level only)
+                    if scan_start_time is not None:
+                        scan_elapsed = time.time() - scan_start_time
+                        async with self.scandir_lock:
+                            self.scandir_call_count += 1
+                            self.scandir_total_time += scan_elapsed
+
+                    # Flush remaining file buffer after scanning all entries
+                    if file_task_buffer:
+                        try:
+                            await self._process_file_batch(file_task_buffer)
+                        finally:
+                            file_task_buffer.clear()
+
+                    # Phase 3 prep: check if directory became empty after processing
+                    if self.remove_empty_dirs and self.max_age_days > 0:
+                        try:
+                            is_empty = await async_is_dir_empty(directory, self.scandir_executor)
+                            if is_empty:
                                 try:
-                                    await self._process_file_batch(file_task_buffer)
-                                finally:
-                                    file_task_buffer.clear()  # Always clear, even on exception
-                        # else: max_age_days == 0, skip file processing (no os.stat calls)
+                                    dir_resolved = directory.resolve()
+                                except (OSError, RuntimeError):
+                                    dir_resolved = directory
+                                if dir_resolved != root_resolved:
+                                    self.empty_dirs.add(directory)
+                        except (FileNotFoundError, PermissionError, OSError):
+                            pass  # Directory gone or inaccessible
 
-                    elif entry.is_dir(follow_symlinks=False):
-                        subdirs.append(entry_path)
-
-                    else:
-                        # Special file types: sockets, FIFOs, block/char devices, etc.
-                        # These are skipped and counted separately
-                        await self.update_stats(special_files_skipped=1)
-                        self.logger.debug(f"Skipping special file: {entry_path}")
-
-                except OSError as e:
+                except PermissionError as e:
                     log_with_context(
                         self.logger,
                         "warning",
-                        "Error checking entry",
-                        {"path": str(entry_path), "error": str(e)},
+                        "Permission denied for directory",
+                        {"directory": str(directory), "error": str(e)},
                     )
                     await self.update_stats(errors=1)
-
-            # STREAMING: Process any remaining files in buffer
-            if file_task_buffer:
-                try:
-                    await self._process_file_batch(file_task_buffer)
+                except Exception as e:
+                    log_with_context(
+                        self.logger,
+                        "error",
+                        "Error scanning directory",
+                        {"directory": str(directory), "error": str(e), "error_type": type(e).__name__},
+                    )
+                    await self.update_stats(errors=1)
                 finally:
-                    file_task_buffer.clear()  # Always clear, even on exception
+                    # Close any unawaited coroutines remaining in buffer (Issue 2 fix)
+                    # After successful flush, buffer is empty so this is a no-op.
+                    # After exception, this prevents RuntimeWarning about unawaited coroutines.
+                    for coro in file_task_buffer:
+                        coro.close()
+                    file_task_buffer.clear()
 
-            # Process subdirectories using hybrid approach:
-            # - Semaphore maintains constant concurrency (prevents idle slots)
-            # - Tasks created in batches (prevents memory explosion)
-            # - As tasks complete, new ones start immediately (high utilization)
-            # Note: If we're already holding the semaphore (recursive call), process directly
-            # to avoid deadlock. Otherwise use the semaphore-controlled approach.
-            if subdirs:
-                await self.check_memory_pressure()  # Ignore return value for subdir processing
-                # Check if semaphore is available (not held by current task)
-                # If semaphore value equals limit, we're not holding it
-                if self.subdir_semaphore._value == self.max_concurrent_subdirs:
-                    # Not holding semaphore - use controlled concurrency
-                    await self._process_subdirs_with_constant_concurrency(subdirs)
-                else:
-                    # Already holding semaphore (recursive call) - process directly without semaphore
-                    # to avoid deadlock. Process sequentially to avoid creating too many tasks.
-                    for subdir in subdirs:
-                        await self.scan_directory(subdir)
+                    # Remove from active directories
+                    async with self.active_directories_lock:
+                        self.active_directories.discard(directory)
 
-            # Phase 3 prep: After all subdirs processed, check if this directory is now empty
-            # (it may have become empty because we purged all its files in this scan).
-            # Just add to the set - actual deletion happens in _remove_empty_directories().
-            if self.remove_empty_dirs and self.max_age_days > 0:
-                try:
-                    post_entries = await async_scandir(directory, self.scandir_executor, self)
-                    if len(post_entries) == 0:
-                        try:
-                            dir_resolved = directory.resolve()
-                            root_resolved = self.root_path.resolve()
-                        except (OSError, RuntimeError):
-                            dir_resolved = directory
-                            root_resolved = self.root_path
-                        if dir_resolved != root_resolved:
-                            self.empty_dirs.add(directory)
-                except (FileNotFoundError, PermissionError, OSError):
-                    pass  # Directory gone or inaccessible
+                    # Decrement pending counter; when zero, all work is done
+                    async with pending_lock:
+                        pending_dirs -= 1
+                        if pending_dirs == 0:
+                            scan_done.set()
 
-        except PermissionError as e:
-            log_with_context(
-                self.logger,
-                "warning",
-                "Permission denied for directory",
-                {"directory": str(directory), "error": str(e)},
-            )
-            await self.update_stats(errors=1)
-        except Exception as e:
-            log_with_context(
-                self.logger,
-                "error",
-                "Error scanning directory",
-                {"directory": str(directory), "error": str(e), "error_type": type(e).__name__},
-            )
-            await self.update_stats(errors=1)
+        # Launch workers
+        workers = [asyncio.create_task(_scan_worker(i)) for i in range(num_workers)]
+
+        # Wait for all workers to complete
+        try:
+            await asyncio.gather(*workers)
         finally:
-            # Remove from active directories when done (success or failure)
-            async with self.active_directories_lock:
-                self.active_directories.discard(directory)
+            # Ensure clean shutdown: signal workers and cancel any still running
+            scan_done.set()
+            for w in workers:
+                if not w.done():
+                    w.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
 
     async def _background_progress_reporter(self) -> None:
         """
@@ -2330,6 +2321,8 @@ class AsyncEFSPurger:
                     self.stuck_detection_count += 1
 
                     if self.stuck_detection_count >= 2:
+                        # Force GC during stalls to prevent memory creep (Issue 4)
+                        gc.collect()
                         log_with_context(
                             self.logger,
                             "warning",
@@ -2357,6 +2350,8 @@ class AsyncEFSPurger:
 
                     # After 2 consecutive checks with no progress (60+ seconds), warn user
                     if self.stuck_detection_count >= 2:
+                        # Force GC during stalls to prevent memory creep (Issue 4)
+                        gc.collect()
                         async with self.active_directories_lock:
                             active_dirs_copy = list(self.active_directories)
 
@@ -2424,7 +2419,6 @@ class AsyncEFSPurger:
                 "progress_interval_seconds": self.progress_interval,
                 "memory_limit_mb": self.memory_limit_mb,
                 "task_batch_size": self.task_batch_size,
-                "max_concurrent_subdirs": self.max_concurrent_subdirs,
                 "remove_empty_dirs": self.remove_empty_dirs,
                 "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
                 "max_concurrent_discovery": self.max_concurrent_discovery,
@@ -2448,10 +2442,10 @@ class AsyncEFSPurger:
             if self.remove_empty_dirs:
                 await self._purge_empty_directories_standalone()
 
-            # Phase 2: Scan and purge files
+            # Phase 2: Scan and purge files (BFS queue + worker pool)
             self.current_phase = "scanning"
             self.rate_tracker.set_phase_start("scanning")
-            await self.scan_directory(self.root_path)
+            await self._scan_and_purge_files()
 
             # Mark scanning phase as complete (for accurate overall rate calculation)
             self.scanning_end_time = time.time()
@@ -2592,7 +2586,6 @@ async def async_main(
     task_batch_size: int = 5000,
     remove_empty_dirs: bool = False,
     max_empty_dirs_to_delete: int = 500,
-    max_concurrent_subdirs: int = 100,
     max_discovery_dirs: int = 0,
     max_concurrent_discovery: int = 20,
 ) -> dict:
@@ -2611,9 +2604,8 @@ async def async_main(
         task_batch_size: Maximum tasks to create at once
         remove_empty_dirs: If True, remove empty directories after scanning
         max_empty_dirs_to_delete: Maximum empty directories to delete per run (0 = unlimited, default: 500)
-        max_concurrent_subdirs: Maximum subdirectories to scan concurrently (lower = less memory, default: 100)
         max_discovery_dirs: Maximum directories to discover in Phase 1a (0 = auto based on memory)
-        max_concurrent_discovery: Maximum concurrent directory scans during Phase 1a discovery (default: 20)
+        max_concurrent_discovery: Maximum concurrent directory/file scan workers (default: 20)
 
     Returns:
         Operation statistics
@@ -2630,7 +2622,6 @@ async def async_main(
         task_batch_size=task_batch_size,
         remove_empty_dirs=remove_empty_dirs,
         max_empty_dirs_to_delete=max_empty_dirs_to_delete,
-        max_concurrent_subdirs=max_concurrent_subdirs,
         max_discovery_dirs=max_discovery_dirs,
         max_concurrent_discovery=max_concurrent_discovery,
     )

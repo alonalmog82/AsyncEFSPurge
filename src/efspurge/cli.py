@@ -114,13 +114,6 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--max-concurrent-subdirs",
-        type=int,
-        default=int(os.getenv("EFSPURGE_MAX_CONCURRENT_SUBDIRS", "100")),
-        help="Maximum subdirectories to scan concurrently (lower = less memory, default: 100)",
-    )
-
-    parser.add_argument(
         "--max-discovery-dirs",
         type=int,
         default=int(os.getenv("EFSPURGE_MAX_DISCOVERY_DIRS", "0")),
@@ -175,7 +168,6 @@ def main() -> None:
                 task_batch_size=args.task_batch_size,
                 remove_empty_dirs=args.remove_empty_dirs,
                 max_empty_dirs_to_delete=args.max_empty_dirs_to_delete,
-                max_concurrent_subdirs=args.max_concurrent_subdirs,
                 max_discovery_dirs=args.max_discovery_dirs,
                 max_concurrent_discovery=args.max_concurrent_discovery,
             )

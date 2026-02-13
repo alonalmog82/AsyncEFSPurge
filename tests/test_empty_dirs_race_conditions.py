@@ -3,10 +3,9 @@
 import tempfile
 from pathlib import Path
 
-import aiofiles
 import pytest
 
-from efspurge.purger import AsyncEFSPurger, async_scandir
+from efspurge.purger import AsyncEFSPurger
 
 
 @pytest.fixture
@@ -39,22 +38,10 @@ async def test_concurrent_empty_dir_detection(temp_dir):
         dry_run=False,
     )
 
-    # Scan should detect leaf empty dirs (c and e)
-    # Parents (b, d, a) will be detected during cascading deletion
-    await purger.scan_directory(temp_dir)
+    # Run purge - Phase 1 will detect and delete all empty dirs
+    await purger.purge()
 
-    # Check that empty_dirs set has no duplicates
-    # (set automatically prevents duplicates)
-    assert len(purger.empty_dirs) == len(set(purger.empty_dirs))
-
-    # Initially should have found: c and e (leaf empty dirs)
-    # Parents will be added during cascading deletion
-    assert len(purger.empty_dirs) >= 2  # At least the leaf dirs
-
-    # Delete them (cascading will add parents)
-    await purger._remove_empty_directories()
-
-    # All 5 empty dirs should be deleted (c, e, b, d, a)
+    # All 5 empty dirs should be deleted (c, e, b, d, a) by Phase 1
     assert purger.stats["empty_dirs_deleted"] == 5
 
 
@@ -73,8 +60,7 @@ async def test_path_resolution_edge_cases(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
-    await purger._remove_empty_directories()
+    await purger.purge()
 
     # Empty dir should be deleted
     assert not empty_dir.exists()
@@ -97,50 +83,20 @@ async def test_cascading_deletion_no_duplicates(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
+    # Populate empty_dirs for cascading deletion test (deepest first for post-order)
+    for p in [
+        deep_dir,
+        deep_dir.parent,
+        deep_dir.parent.parent,
+        deep_dir.parent.parent.parent,
+        deep_dir.parent.parent.parent.parent,
+    ]:
+        purger.empty_dirs.add(p)
 
-    # Track which directories we try to delete
-    deletion_attempts = []
-
-    async def mock_remove():
-        # Get initial set
-        async with purger.stats_lock:
-            initial = set(purger.empty_dirs)
-
-        # Process and track
-        for d in sorted(initial, key=lambda p: len(p.parts), reverse=True):
-            if d not in deletion_attempts:
-                deletion_attempts.append(d)
-                if not purger.dry_run:
-                    await aiofiles.os.rmdir(d)
-                await purger.update_stats(empty_dirs_deleted=1)
-
-        # Check parents (cascading)
-        processed = set(deletion_attempts)
-        new_parents = set()
-        for d in deletion_attempts:
-            parent = d.parent
-            if parent != temp_dir and parent not in processed:
-                try:
-                    entries = await async_scandir(parent)
-                    if len(entries) == 0:
-                        new_parents.add(parent)
-                except Exception:
-                    pass
-
-        # Process new parents
-        for parent in sorted(new_parents, key=lambda p: len(p.parts), reverse=True):
-            if parent not in deletion_attempts:
-                deletion_attempts.append(parent)
-                if not purger.dry_run:
-                    await aiofiles.os.rmdir(parent)
-                await purger.update_stats(empty_dirs_deleted=1)
-
-    # Use actual implementation but verify no duplicates
     await purger._remove_empty_directories()
 
-    # Verify each directory was only processed once
-    assert len(set(deletion_attempts)) == len(deletion_attempts) if deletion_attempts else True
+    # All 5 nested dirs should be deleted (e, d, c, b, a)
+    assert purger.stats["empty_dirs_deleted"] == 5
 
 
 @pytest.mark.asyncio
@@ -169,6 +125,5 @@ async def test_root_path_protection_absolute_vs_relative(temp_dir):
     assert purger2.root_path.is_absolute()
 
     # Root should never be deleted
-    await purger1.scan_directory(temp_dir)
-    await purger1._remove_empty_directories()
+    await purger1.purge()
     assert temp_dir.exists()  # Root preserved

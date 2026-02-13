@@ -30,7 +30,7 @@ async def test_exactly_batch_size_files(temp_dir):
         task_batch_size=batch_size,
     )
 
-    await purger.scan_directory(temp_dir)
+    await purger._scan_and_purge_files()
 
     # All files should be processed
     assert purger.stats["files_scanned"] == batch_size
@@ -51,7 +51,7 @@ async def test_batch_size_plus_one_files(temp_dir):
         task_batch_size=batch_size,
     )
 
-    await purger.scan_directory(temp_dir)
+    await purger._scan_and_purge_files()
 
     # All files should be processed
     assert purger.stats["files_scanned"] == batch_size + 1
@@ -73,7 +73,7 @@ async def test_multiple_batches(temp_dir):
         task_batch_size=batch_size,
     )
 
-    await purger.scan_directory(temp_dir)
+    await purger._scan_and_purge_files()
 
     # All files should be processed
     assert purger.stats["files_scanned"] == total_files
@@ -95,7 +95,7 @@ async def test_smaller_than_batch_size(temp_dir):
         task_batch_size=batch_size,
     )
 
-    await purger.scan_directory(temp_dir)
+    await purger._scan_and_purge_files()
 
     # All files should be processed in remaining buffer
     assert purger.stats["files_scanned"] == file_count
@@ -129,7 +129,7 @@ async def test_buffer_cleared_after_processing(temp_dir):
 
     purger._process_file_batch = mock_process
 
-    await purger.scan_directory(temp_dir)
+    await purger._scan_and_purge_files()
 
     # Should see batches of exactly batch_size (except possibly last)
     assert len(batch_sizes_seen) >= 2  # At least 2 batches
@@ -158,7 +158,7 @@ async def test_mixed_files_and_directories(temp_dir):
         task_batch_size=batch_size,
     )
 
-    await purger.scan_directory(temp_dir)
+    await purger._scan_and_purge_files()
 
     # Should process all files (15 in root + 5 in subdirs)
     assert purger.stats["files_scanned"] == 20

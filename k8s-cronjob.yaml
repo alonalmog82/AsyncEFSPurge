@@ -32,7 +32,7 @@ spec:
           
           containers:
           - name: efspurge
-            image: ghcr.io/alonalmog82/asyncefspurge:1.14.3
+            image: ghcr.io/alonalmog82/asyncefspurge:2.0.0
             imagePullPolicy: IfNotPresent
             
             args:
@@ -86,8 +86,6 @@ spec:
               value: "1000"
             - name: EFSPURGE_MAX_CONCURRENCY_DELETION
               value: "1000"
-            - name: EFSPURGE_MAX_CONCURRENT_SUBDIRS
-              value: "100"
             # Empty directory cleanup
             - name: EFSPURGE_REMOVE_EMPTY_DIRS
               value: "1"  # Enable empty directory cleanup

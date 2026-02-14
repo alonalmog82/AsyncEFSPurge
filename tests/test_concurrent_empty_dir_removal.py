@@ -32,21 +32,19 @@ async def test_concurrent_empty_dir_deletion(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
-
-    # Measure total deletion time
+    # Measure total purge time (Phase 1 deletes empty dirs)
     start_time = time.time()
-    await purger._remove_empty_directories()
+    await purger.purge()
     total_time = time.time() - start_time
 
     # Verify all directories were deleted
     assert purger.stats["empty_dirs_deleted"] == num_dirs
 
-    # Concurrent deletion should complete quickly
-    # Sequential would take much longer (50 * ~0.001s = 0.05s minimum)
-    # Concurrent should be much faster (closer to ~0.01s)
-    # This is a sanity check - exact timing depends on system
-    assert total_time < 1.0, f"Concurrent deletion should be fast. Took {total_time:.3f}s for {num_dirs} directories."
+    # Concurrent deletion should complete in reasonable time
+    # purge() runs Phase 1 (empty dirs) + Phase 2 (BFS scan) + Phase 3; allow 3s for CI variability
+    assert total_time < 3.0, (
+        f"Purge should complete in reasonable time. Took {total_time:.3f}s for {num_dirs} directories."
+    )
 
 
 @pytest.mark.asyncio
@@ -66,8 +64,7 @@ async def test_concurrent_deletion_respects_semaphore(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
-    await purger._remove_empty_directories()
+    await purger.purge()
 
     # Verify all directories were deleted
     assert purger.stats["empty_dirs_deleted"] == num_dirs
@@ -100,8 +97,7 @@ async def test_concurrent_cascading_deletion(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
-    await purger._remove_empty_directories()
+    await purger.purge()
 
     # Should delete: 5 nested (e, d, c, b, a) + 10 flat = 15 total
     assert purger.stats["empty_dirs_deleted"] == 15
@@ -129,8 +125,7 @@ async def test_concurrent_deletion_no_duplicates(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
-    await purger._remove_empty_directories()
+    await purger.purge()
 
     # Verify all directories were deleted exactly once
     assert purger.stats["empty_dirs_deleted"] == num_dirs
@@ -161,8 +156,7 @@ async def test_concurrent_deletion_rate_limit(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
-    await purger._remove_empty_directories()
+    await purger.purge()
 
     # Should only delete up to rate limit
     assert purger.stats["empty_dirs_deleted"] == rate_limit
@@ -188,7 +182,9 @@ async def test_concurrent_deletion_handles_already_deleted(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
+    # Manually populate empty_dirs (simulating what scan would have done)
+    for i in range(20):
+        purger.empty_dirs.add(temp_dir / f"empty_{i}")
 
     # Manually delete some directories to simulate race condition
     import aiofiles
@@ -219,7 +215,9 @@ async def test_concurrent_deletion_handles_populated_dirs(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
+    # Manually populate empty_dirs (simulating what scan would have done)
+    for i in range(20):
+        purger.empty_dirs.add(temp_dir / f"empty_{i}")
 
     # Add files to some directories to simulate them being populated
     for i in range(5):

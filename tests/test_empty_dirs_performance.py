@@ -40,7 +40,7 @@ async def test_no_redundant_scandir_checks(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
+    await purger._scan_and_purge_files()
 
     # Track scandir calls during deletion
     scandir_calls = []
@@ -110,7 +110,7 @@ async def test_semaphore_released_early(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
+    await purger._scan_and_purge_files()
 
     # Track semaphore acquisitions/releases
     semaphore_acquires = []
@@ -162,7 +162,7 @@ async def test_memory_pressure_stops_queue_feeding(temp_dir):
     # Note: Incremental processing has been removed in favor of two-pass approach
     # Phase 1 (standalone) handles empty dirs, Phase 3 handles post-scan cleanup
 
-    await purger.scan_directory(temp_dir)
+    await purger._scan_and_purge_files()
 
     # Track memory checks in producer
     memory_check_results = []
@@ -203,7 +203,7 @@ async def test_queue_processing_with_memory_checks(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
+    await purger._scan_and_purge_files()
 
     # Track memory check results in producer
     memory_check_results = []

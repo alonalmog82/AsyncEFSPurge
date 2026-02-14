@@ -1,5 +1,7 @@
 # 🚀 Scalability Improvements for High-Scale EFS Deletion
 
+> **⚠️ HISTORICAL (pre-v2.0):** This document describes the original recursive scanning architecture. In v2.0, Phase 2 was rewritten to use a flat BFS queue + worker pool, eliminating the issues discussed here. See [CHANGELOG.md](CHANGELOG.md) for details.
+
 ## Overview
 
 This document describes critical scalability improvements made to AsyncEFSPurge to handle truly massive datasets (10M+ files) on AWS EFS.

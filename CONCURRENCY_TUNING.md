@@ -1,5 +1,7 @@
 # Concurrency Tuning Guide
 
+> **⚠️ PARTIALLY OUTDATED (pre-v2.0):** References to `--max-concurrent-subdirs` and recursive subdirectory scanning are no longer applicable. In v2.0, Phase 2 uses a BFS queue + worker pool controlled by `--max-concurrent-discovery`. The scanning and deletion concurrency sections are still relevant.
+
 This guide helps you tune `--max-concurrency-scanning`, `--max-concurrency-deletion`, and other parallelism parameters using the enhanced rate metrics and concurrency utilization data logged by AsyncEFSPurge.
 
 **Note:** `--max-concurrency` is deprecated but still works. It sets both scanning and deletion to the same value. Use separate parameters for better control.

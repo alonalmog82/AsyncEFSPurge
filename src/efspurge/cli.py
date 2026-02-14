@@ -2,11 +2,14 @@
 
 import argparse
 import asyncio
+import logging
 import os
 import sys
 
 from . import __version__
 from .purger import async_main
+
+logger = logging.getLogger("efspurge")
 
 
 def parse_args() -> argparse.Namespace:
@@ -114,13 +117,6 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--max-concurrent-subdirs",
-        type=int,
-        default=int(os.getenv("EFSPURGE_MAX_CONCURRENT_SUBDIRS", "100")),
-        help="Maximum subdirectories to scan concurrently (lower = less memory, default: 100)",
-    )
-
-    parser.add_argument(
         "--max-discovery-dirs",
         type=int,
         default=int(os.getenv("EFSPURGE_MAX_DISCOVERY_DIRS", "0")),
@@ -132,6 +128,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.getenv("EFSPURGE_MAX_CONCURRENT_DISCOVERY", "20")),
         help="Maximum directories to scan concurrently during Phase 1a discovery (default: 20)",
+    )
+
+    parser.add_argument(
+        "--no-uvloop",
+        action="store_true",
+        default=os.getenv("EFSPURGE_UVLOOP", "true").lower() in ("0", "false", "no"),
+        help=(
+            "Disable uvloop and use the default asyncio event loop. "
+            "uvloop is enabled by default on Linux/macOS for better I/O performance. "
+            "Set EFSPURGE_UVLOOP=false to disable via environment variable. "
+            "Has no effect on Windows where uvloop is not available."
+        ),
     )
 
     parser.add_argument(
@@ -160,6 +168,17 @@ def main() -> None:
             stacklevel=2,
         )
 
+    # Determine event loop factory: use uvloop by default on Linux/macOS
+    loop_factory = None
+    if not args.no_uvloop:
+        try:
+            import uvloop
+
+            loop_factory = uvloop.new_event_loop
+        except ImportError:
+            # uvloop not installed (e.g. Windows, or minimal install)
+            pass
+
     try:
         # Run the async purger
         asyncio.run(
@@ -175,10 +194,10 @@ def main() -> None:
                 task_batch_size=args.task_batch_size,
                 remove_empty_dirs=args.remove_empty_dirs,
                 max_empty_dirs_to_delete=args.max_empty_dirs_to_delete,
-                max_concurrent_subdirs=args.max_concurrent_subdirs,
                 max_discovery_dirs=args.max_discovery_dirs,
                 max_concurrent_discovery=args.max_concurrent_discovery,
-            )
+            ),
+            loop_factory=loop_factory,
         )
 
         # Exit with success

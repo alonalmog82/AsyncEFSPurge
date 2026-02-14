@@ -28,7 +28,6 @@ async def test_diagnostics_not_logged_at_info_level(temp_dir, caplog):
         max_age_days=30,
         dry_run=True,
         log_level="INFO",
-        max_concurrent_subdirs=100,
     )
 
     await purger.purge()
@@ -53,7 +52,6 @@ async def test_diagnostics_logged_at_debug_level(temp_dir, caplog):
         max_age_days=30,
         dry_run=True,
         log_level="DEBUG",
-        max_concurrent_subdirs=100,
     )
 
     await purger.purge()
@@ -96,7 +94,6 @@ async def test_diagnostics_metrics_accumulate(temp_dir, caplog):
         max_age_days=30,
         dry_run=True,
         log_level="DEBUG",
-        max_concurrent_subdirs=100,
     )
 
     # Set a shorter diagnostics interval to potentially get multiple logs
@@ -136,7 +133,6 @@ async def test_diagnostics_dont_break_normal_operation(temp_dir):
         max_age_days=30,
         dry_run=True,
         log_level="DEBUG",  # Enable diagnostics
-        max_concurrent_subdirs=100,
     )
 
     # Run purge - should complete without errors
@@ -165,7 +161,6 @@ async def test_diagnostics_initialized_correctly(temp_dir):
         max_age_days=30,
         dry_run=True,
         log_level="DEBUG",
-        max_concurrent_subdirs=100,
     )
 
     # Verify diagnostics are initialized

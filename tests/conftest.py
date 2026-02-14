@@ -1,5 +1,6 @@
 """Pytest configuration to ensure tests use local source code."""
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -13,10 +14,43 @@ if str(src_path) not in sys.path:
 
 
 # ---------------------------------------------------------------------------
+# Event loop policy: use uvloop by default (matches production behavior).
+#
+# All async tests run on uvloop (Linux/macOS) to match the Docker/K8s
+# production environment. On Windows, falls back to the default asyncio
+# policy since uvloop is not available there.
+#
+# The test_default_asyncio_loop_sanity test overrides this to explicitly
+# verify compatibility with the standard asyncio event loop.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session")
+def event_loop_policy():
+    """Use uvloop for all async tests, matching production default."""
+    try:
+        import uvloop
+
+        return uvloop.EventLoopPolicy()
+    except ImportError:
+        return asyncio.DefaultEventLoopPolicy()
+
+
+def pytest_report_header():
+    """Display which event loop policy tests will use in the pytest header."""
+    try:
+        import uvloop
+
+        return [f"event loop: uvloop {uvloop.__version__} (production default)"]
+    except ImportError:
+        return ["event loop: default asyncio (uvloop not available)"]
+
+
+# ---------------------------------------------------------------------------
 # Executor cleanup: ensure no ThreadPoolExecutor threads leak between tests.
 #
 # AsyncEFSPurger creates a ThreadPoolExecutor in __init__ but only shuts it
-# down inside purge().  Tests that call lower-level methods (scan_directory,
+# down inside purge().  Tests that call lower-level methods (_scan_and_purge_files,
 # _purge_empty_directories_standalone, _remove_empty_directories) skip that
 # cleanup, leaving non-daemon threads alive.  At process exit Python's atexit
 # handler joins them, which can block indefinitely if any thread is stuck.

@@ -48,7 +48,7 @@ async def test_two_pass_order_empty_dirs_before_scan(temp_dir):
 
     # Monkey-patch to track phase transitions
     original_standalone = purger._purge_empty_directories_standalone
-    original_scan = purger.scan_directory
+    original_scan = purger._scan_and_purge_files
 
     async def tracked_standalone():
         phase_order.append("phase1_start")
@@ -56,13 +56,12 @@ async def test_two_pass_order_empty_dirs_before_scan(temp_dir):
         phase_order.append("phase1_end")
         return result
 
-    async def tracked_scan(directory):
-        if directory == purger.root_path:
-            phase_order.append("phase2_start")
-        return await original_scan(directory)
+    async def tracked_scan():
+        phase_order.append("phase2_start")
+        return await original_scan()
 
     purger._purge_empty_directories_standalone = tracked_standalone
-    purger.scan_directory = tracked_scan
+    purger._scan_and_purge_files = tracked_scan
 
     await purger.purge()
 
@@ -77,7 +76,7 @@ async def test_standalone_purge_no_recursive_coroutine_overhead(temp_dir):
     Test that the standalone purger uses iterative BFS, not recursive coroutines.
 
     The standalone purger should discover directories iteratively (bounded memory),
-    not create recursive scan_directory coroutines (unbounded memory).
+    not create recursive _scan_and_purge_files coroutines (unbounded memory).
     """
     # Create a wide+deep structure
     for i in range(20):
@@ -95,23 +94,23 @@ async def test_standalone_purge_no_recursive_coroutine_overhead(temp_dir):
         memory_limit_mb=800,
     )
 
-    # Track that scan_directory is NOT called during Phase 1
-    scan_directory_calls = []
-    original_scan = purger.scan_directory
+    # Track that _scan_and_purge_files is NOT called during Phase 1
+    scan_calls = []
+    original_scan = purger._scan_and_purge_files
 
-    async def tracked_scan(directory):
-        scan_directory_calls.append(directory)
-        return await original_scan(directory)
+    async def tracked_scan():
+        scan_calls.append(1)
+        return await original_scan()
 
-    purger.scan_directory = tracked_scan
+    purger._scan_and_purge_files = tracked_scan
 
     # Run only Phase 1
     deleted = await purger._purge_empty_directories_standalone()
 
-    # Phase 1 should NOT use scan_directory
-    assert len(scan_directory_calls) == 0, (
-        f"Standalone purger should not call scan_directory, but it was called "
-        f"{len(scan_directory_calls)} times. It should use iterative BFS instead."
+    # Phase 1 should NOT use _scan_and_purge_files (it uses its own BFS discovery)
+    assert len(scan_calls) == 0, (
+        f"Standalone purger should not call _scan_and_purge_files, but it was called "
+        f"{len(scan_calls)} times. It should use iterative BFS instead."
     )
 
     # Should have deleted at least the leaf directories (200 = 20 * 10)

@@ -65,7 +65,7 @@ async def test_symlink_skipped(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
+    await purger._scan_and_purge_files()
 
     # Symlink should be skipped, real file should be processed
     assert purger.stats["symlinks_skipped"] == 1
@@ -89,7 +89,7 @@ async def test_permission_denied(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
+    await purger._scan_and_purge_files()
 
     # Should handle gracefully, increment errors
     assert purger.stats["errors"] >= 0  # Might be 0 on Windows
@@ -103,7 +103,7 @@ async def test_empty_directory(temp_dir):
         max_age_days=30,
     )
 
-    await purger.scan_directory(temp_dir)
+    await purger._scan_and_purge_files()
 
     assert purger.stats["dirs_scanned"] == 1
     assert purger.stats["files_scanned"] == 0
@@ -126,7 +126,7 @@ async def test_nested_directories(temp_dir):
         max_age_days=30,
     )
 
-    await purger.scan_directory(temp_dir)
+    await purger._scan_and_purge_files()
 
     assert purger.stats["files_scanned"] == 4
     assert purger.stats["dirs_scanned"] == 4  # root + 3 levels
@@ -145,7 +145,7 @@ async def test_very_large_batch_size(temp_dir):
         task_batch_size=10000,  # Larger than file count
     )
 
-    await purger.scan_directory(temp_dir)
+    await purger._scan_and_purge_files()
 
     # Should process all files
     assert purger.stats["files_scanned"] == 100
@@ -164,7 +164,7 @@ async def test_small_batch_size(temp_dir):
         task_batch_size=10,  # Small batch
     )
 
-    await purger.scan_directory(temp_dir)
+    await purger._scan_and_purge_files()
 
     # Should process all files in multiple batches
     assert purger.stats["files_scanned"] == 100
@@ -185,7 +185,7 @@ async def test_dry_run_no_deletion(temp_dir):
         dry_run=True,
     )
 
-    await purger.scan_directory(temp_dir)
+    await purger._scan_and_purge_files()
 
     # File should still exist
     assert old_file.exists()
@@ -212,7 +212,7 @@ async def test_actual_deletion(temp_dir):
         dry_run=False,
     )
 
-    await purger.scan_directory(temp_dir)
+    await purger._scan_and_purge_files()
 
     # Old file should be deleted, new file should remain
     assert not old_file.exists()
@@ -234,7 +234,7 @@ async def test_concurrent_file_processing(temp_dir):
         max_concurrency_deletion=10,
     )
 
-    await purger.scan_directory(temp_dir)
+    await purger._scan_and_purge_files()
 
     assert purger.stats["files_scanned"] == 50
 
@@ -294,7 +294,7 @@ async def test_memory_limit_zero(temp_dir):
         memory_limit_mb=0,  # Disabled
     )
 
-    await purger.scan_directory(temp_dir)
+    await purger._scan_and_purge_files()
 
     # Should work without memory checks
     assert purger.stats["files_scanned"] == 10
@@ -364,7 +364,7 @@ async def test_special_files_skipped(temp_dir):
             max_age_days=30,
         )
 
-        await purger.scan_directory(temp_dir)
+        await purger._scan_and_purge_files()
 
         # Regular file should be scanned, socket should be skipped
         assert purger.stats["files_scanned"] == 1
@@ -391,7 +391,7 @@ async def test_fifo_skipped(temp_dir):
             max_age_days=30,
         )
 
-        await purger.scan_directory(temp_dir)
+        await purger._scan_and_purge_files()
 
         # Regular file should be scanned, FIFO should be skipped
         assert purger.stats["files_scanned"] == 1

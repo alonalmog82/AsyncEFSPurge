@@ -1,5 +1,7 @@
 # Incremental Empty Directory Processing Thrashing Fix (v1.14.1)
 
+> **⚠️ HISTORICAL (pre-v2.0):** Incremental empty directory processing was replaced by the two-pass architecture in v1.15.0. This document is retained for historical context only.
+
 ## Overview
 
 This hotfix addresses critical race conditions and thrashing issues in the incremental empty directory processing feature introduced in v1.14.0. These issues were identified in production logs showing thousands of rapid-fire trigger messages and micro-batch processing.

@@ -1,5 +1,6 @@
 """Pytest configuration to ensure tests use local source code."""
 
+import asyncio
 import sys
 from pathlib import Path
 
@@ -10,6 +11,38 @@ import pytest
 src_path = Path(__file__).parent.parent / "src"
 if str(src_path) not in sys.path:
     sys.path.insert(0, str(src_path))
+
+
+# ---------------------------------------------------------------------------
+# Event loop policy: use uvloop by default (matches production behavior).
+#
+# All async tests run on uvloop (Linux/macOS) to match the Docker/K8s
+# production environment. On Windows, falls back to the default asyncio
+# policy since uvloop is not available there.
+#
+# The test_default_asyncio_loop_sanity test overrides this to explicitly
+# verify compatibility with the standard asyncio event loop.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def event_loop_policy():
+    """Use uvloop for all async tests, matching production default."""
+    try:
+        import uvloop
+
+        return uvloop.EventLoopPolicy()
+    except ImportError:
+        return asyncio.DefaultEventLoopPolicy()
+
+
+def pytest_report_header():
+    """Display which event loop policy tests will use in the pytest header."""
+    try:
+        import uvloop
+
+        return [f"event loop: uvloop {uvloop.__version__} (production default)"]
+    except ImportError:
+        return ["event loop: default asyncio (uvloop not available)"]
 
 
 # ---------------------------------------------------------------------------

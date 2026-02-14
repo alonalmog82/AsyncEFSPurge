@@ -207,22 +207,26 @@ async def test_gc_collect_called_during_stuck_detection(temp_dir):
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def event_loop_policy():
+    """Override session-level uvloop policy for this test only — use default asyncio."""
+    return asyncio.DefaultEventLoopPolicy()
+
+
 @pytest.mark.asyncio
-async def test_default_asyncio_loop_sanity(temp_dir):
+async def test_default_asyncio_loop_sanity(event_loop_policy, temp_dir):
     """Sanity test: verify purge works with the default asyncio event loop (no uvloop).
 
-    This test ensures the application remains compatible with the standard
-    asyncio event loop. Since our Docker image (Python 3.14) and CI both
-    default to uvloop, this test explicitly runs on the built-in loop to
-    catch any accidental uvloop-specific dependencies.
+    This test overrides the session-level uvloop event_loop_policy fixture
+    to force the standard asyncio event loop, verifying Windows compatibility
+    and ensuring no accidental uvloop-only dependencies exist in the codebase.
     """
-    # Verify we are NOT running on uvloop (pytest uses the default loop)
+    # Verify we are running on the default asyncio loop, not uvloop
     loop = asyncio.get_running_loop()
-    loop_type = type(loop).__name__
-    # Accept any non-uvloop loop (e.g. _UnixSelectorEventLoop, ProactorEventLoop)
+    loop_name = type(loop).__module__ + "." + type(loop).__name__
     assert "uvloop" not in type(loop).__module__, (
-        f"Expected default asyncio loop but got {loop_type} from {type(loop).__module__}. "
-        "Ensure pytest is not configured to use uvloop."
+        f"Expected default asyncio loop but got {loop_name}. "
+        "The event_loop_policy fixture should have forced the default policy."
     )
 
     # Create a simple directory structure
@@ -231,7 +235,7 @@ async def test_default_asyncio_loop_sanity(temp_dir):
         (temp_dir / "subdir" / f"file_{i}.txt").write_text(f"content {i}")
 
     # Run a basic purge (dry run) — exercises scan, stat, and directory traversal
-    # Use a very small max_age_days so all files qualify; max_age_days=0 skips file processing
+    # Use a very small max_age_days so all files qualify; max_age_days=0 skips scanning
     purger = AsyncEFSPurger(
         root_path=str(temp_dir),
         max_age_days=0.00001,  # ~0.86 seconds — all files are "old"
@@ -245,3 +249,6 @@ async def test_default_asyncio_loop_sanity(temp_dir):
     assert stats["files_purged"] == 0  # dry run — no actual deletions
     assert stats["dirs_scanned"] >= 1
     assert stats["errors"] == 0
+
+    # Confirm which loop was used (visible in test output with -v -s)
+    print(f"\n  [SANITY] Verified purge on default asyncio loop: {loop_name}")

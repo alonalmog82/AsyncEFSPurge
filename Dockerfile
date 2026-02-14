@@ -51,6 +51,8 @@ USER efspurge
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
+# uvloop is enabled by default; set to "false" to use default asyncio event loop
+ENV EFSPURGE_UVLOOP=true
 
 # Default command shows help
 ENTRYPOINT ["efspurge"]

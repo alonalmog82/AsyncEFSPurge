@@ -2403,6 +2403,10 @@ class AsyncEFSPurger:
         start_time = time.time()
         mode = "DRY RUN" if self.dry_run else "PURGE"
 
+        # Detect event loop type for startup log
+        loop = asyncio.get_running_loop()
+        event_loop_type = type(loop).__module__ + "." + type(loop).__name__
+
         log_with_context(
             self.logger,
             "info",
@@ -2423,6 +2427,7 @@ class AsyncEFSPurger:
                 "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
                 "max_concurrent_discovery": self.max_concurrent_discovery,
                 "scandir_executor_threads": self.scandir_executor._max_workers,
+                "event_loop": event_loop_type,
             },
         )
 

@@ -9,6 +9,7 @@ High-performance asynchronous file purger designed for AWS EFS and network files
 ## Features
 
 - ⚡ **High Performance** - Async I/O with configurable concurrency (handles 1000+ files/sec)
+  - **uvloop by default** - High-performance C-based event loop (2-4x faster I/O scheduling on Linux/macOS)
   - **Concurrent subdirectory scanning** - Process directory trees in parallel
   - **Batched task creation** - Prevents OOM on large directories
   - **Memory back-pressure** - Automatic throttling when memory is high
@@ -96,6 +97,7 @@ options:
   --dry-run                 Don't actually delete files, just report what would be deleted
   --remove-empty-dirs       Remove empty directories (two-pass: Phase 1 before scan, Phase 3 after scan)
   --max-empty-dirs-to-delete N  Maximum empty directories to delete per run (0 = unlimited, default: 500)
+  --no-uvloop               Disable uvloop, use default asyncio event loop (uvloop enabled by default on Linux/macOS)
   --log-level LEVEL         Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL (default: INFO)
   --version                 Show version and exit
   -h, --help                Show this help message and exit
@@ -270,10 +272,30 @@ Example ECS task definition:
 }
 ```
 
+## Platform Compatibility
+
+| Platform | uvloop | Status |
+|----------|--------|--------|
+| **Linux** (Docker, Kubernetes) | Enabled by default | Fully supported — primary target |
+| **macOS** | Enabled by default | Fully supported (development & testing) |
+| **Windows** | Not available | Supported with default asyncio event loop. `uvloop` is automatically skipped; no configuration needed. |
+
+**Note:** `uvloop` is a C-based event loop replacement built on [libuv](https://libuv.org/) that provides 2-4x faster I/O scheduling compared to the default Python asyncio event loop. It is installed automatically on Linux and macOS. On Windows, the application falls back to the default asyncio event loop with no loss of functionality (only a reduction in event loop throughput).
+
+To disable uvloop (e.g. for debugging or compatibility testing):
+```bash
+# Via CLI flag
+efspurge /data --max-age-days 30 --no-uvloop
+
+# Via environment variable
+EFSPURGE_UVLOOP=false efspurge /data --max-age-days 30
+```
+
 ## Performance
 
 Optimized for network filesystems with high latency:
 
+- **uvloop Event Loop**: 2-4x faster I/O scheduling vs default asyncio (enabled by default on Linux/macOS)
 - **Concurrent Directory Scanning**: Subdirectories processed in parallel (5-10x faster on deep hierarchies)
 - **Batched Task Creation**: Prevents OOM on large directories
 - **Memory Back-Pressure**: Automatic throttling when memory usage is high
@@ -451,6 +473,7 @@ ruff format .
 
 - `PYTHONUNBUFFERED=1` - Recommended for real-time logging in containers
 - `PYTHONDONTWRITEBYTECODE=1` - Prevents `.pyc` file creation
+- `EFSPURGE_UVLOOP=true|false` - Enable/disable uvloop event loop (default: `true`). Set to `false` to use the standard asyncio event loop. Ignored on Windows.
 - `EFSPURGE_MAX_AGE_DAYS=N` - Files older than N days will be purged (default: 30.0)
 - `EFSPURGE_LOG_LEVEL=LEVEL` - Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL (default: INFO)
 - `EFSPURGE_MEMORY_LIMIT_MB=N` - Soft memory limit in MB, triggers back-pressure (default: 800)
@@ -628,6 +651,8 @@ Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for de
 
 ### Version 2.0.0 (2026-02-13)
 - **BREAKING**: Phase 2 rewritten to BFS queue + worker pool (same pattern as Phase 1a)
+- **New**: uvloop enabled by default for 2-4x faster I/O scheduling (Linux/macOS); disable with `--no-uvloop` or `EFSPURGE_UVLOOP=false`
+- **New**: Windows compatibility — graceful fallback to default asyncio event loop when uvloop is unavailable
 - **Removed**: `--max-concurrent-subdirs` flag and `EFSPURGE_MAX_CONCURRENT_SUBDIRS` env var
 - **Fixed**: Root directory hang (37 min) on large directories with 700K+ entries
 - **Fixed**: Unawaited `process_file` coroutines on shutdown

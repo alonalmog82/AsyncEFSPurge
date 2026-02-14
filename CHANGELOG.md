@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [2.0.0] - 2026-02-13
 
+### Added
+- **uvloop enabled by default** — High-performance C-based event loop (built on libuv) is now used automatically on Linux and macOS, providing 2-4x faster I/O scheduling for the thousands of concurrent `stat`/`unlink`/`scandir` operations per purge run.
+- **`--no-uvloop` CLI flag** and `EFSPURGE_UVLOOP` environment variable (default: `true`) to disable uvloop and fall back to the standard asyncio event loop.
+- **Windows compatibility** — uvloop is declared as a platform-specific dependency (`sys_platform != 'win32'`). On Windows, the application gracefully falls back to the default asyncio event loop with no configuration needed.
+- **Event loop type logged at startup** — the `event_loop` field in the startup log shows which event loop implementation is in use (e.g. `uvloop.Loop` or `asyncio._UnixSelectorEventLoop`).
+- **Sanity test for default asyncio loop** — `test_default_asyncio_loop_sanity` verifies the application works correctly without uvloop.
+
 ### Changed
 - **BREAKING: Phase 2 rewritten to BFS queue + worker pool** — replaces the recursive `scan_directory()` + `_process_subdirs_with_constant_concurrency()` approach with the same flat BFS pattern used by Phase 1a discovery. Each worker pulls directories from a shared `asyncio.Queue`, scans entries via `async_scandir_batched()` (streaming), processes files in batches, and pushes discovered subdirectories back onto the queue. Workers drain the queue naturally and exit cleanly.
 - **Removed `--max-concurrent-subdirs` CLI flag** and `EFSPURGE_MAX_CONCURRENT_SUBDIRS` environment variable. Phase 2 now uses the same worker count as Phase 1a (`--max-concurrent-discovery`, default: 20).

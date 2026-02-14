@@ -2,11 +2,14 @@
 
 import argparse
 import asyncio
+import logging
 import os
 import sys
 
 from . import __version__
 from .purger import async_main
+
+logger = logging.getLogger("efspurge")
 
 
 def parse_args() -> argparse.Namespace:
@@ -128,6 +131,18 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--no-uvloop",
+        action="store_true",
+        default=os.getenv("EFSPURGE_UVLOOP", "true").lower() in ("0", "false", "no"),
+        help=(
+            "Disable uvloop and use the default asyncio event loop. "
+            "uvloop is enabled by default on Linux/macOS for better I/O performance. "
+            "Set EFSPURGE_UVLOOP=false to disable via environment variable. "
+            "Has no effect on Windows where uvloop is not available."
+        ),
+    )
+
+    parser.add_argument(
         "--version",
         action="version",
         version=f"efspurge {__version__}",
@@ -153,6 +168,17 @@ def main() -> None:
             stacklevel=2,
         )
 
+    # Determine event loop factory: use uvloop by default on Linux/macOS
+    loop_factory = None
+    if not args.no_uvloop:
+        try:
+            import uvloop
+
+            loop_factory = uvloop.new_event_loop
+        except ImportError:
+            # uvloop not installed (e.g. Windows, or minimal install)
+            pass
+
     try:
         # Run the async purger
         asyncio.run(
@@ -170,7 +196,8 @@ def main() -> None:
                 max_empty_dirs_to_delete=args.max_empty_dirs_to_delete,
                 max_discovery_dirs=args.max_discovery_dirs,
                 max_concurrent_discovery=args.max_concurrent_discovery,
-            )
+            ),
+            loop_factory=loop_factory,
         )
 
         # Exit with success

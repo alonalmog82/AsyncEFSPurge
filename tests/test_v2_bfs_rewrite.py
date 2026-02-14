@@ -200,3 +200,48 @@ async def test_gc_collect_called_during_stuck_detection(temp_dir):
                 pass
 
         assert mock_gc.called, "gc.collect should be called when stuck detection triggers (stuck_detection_count >= 2)"
+
+
+# ---------------------------------------------------------------------------
+# test_default_asyncio_loop_sanity
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_default_asyncio_loop_sanity(temp_dir):
+    """Sanity test: verify purge works with the default asyncio event loop (no uvloop).
+
+    This test ensures the application remains compatible with the standard
+    asyncio event loop. Since our Docker image (Python 3.14) and CI both
+    default to uvloop, this test explicitly runs on the built-in loop to
+    catch any accidental uvloop-specific dependencies.
+    """
+    # Verify we are NOT running on uvloop (pytest uses the default loop)
+    loop = asyncio.get_running_loop()
+    loop_type = type(loop).__name__
+    # Accept any non-uvloop loop (e.g. _UnixSelectorEventLoop, ProactorEventLoop)
+    assert "uvloop" not in type(loop).__module__, (
+        f"Expected default asyncio loop but got {loop_type} from {type(loop).__module__}. "
+        "Ensure pytest is not configured to use uvloop."
+    )
+
+    # Create a simple directory structure
+    (temp_dir / "subdir").mkdir()
+    for i in range(5):
+        (temp_dir / "subdir" / f"file_{i}.txt").write_text(f"content {i}")
+
+    # Run a basic purge (dry run) — exercises scan, stat, and directory traversal
+    # Use a very small max_age_days so all files qualify; max_age_days=0 skips file processing
+    purger = AsyncEFSPurger(
+        root_path=str(temp_dir),
+        max_age_days=0.00001,  # ~0.86 seconds — all files are "old"
+        dry_run=True,
+    )
+
+    stats = await purger.purge()
+
+    # Basic assertions: scan completed, files were found
+    assert stats["files_scanned"] == 5
+    assert stats["files_purged"] == 0  # dry run — no actual deletions
+    assert stats["dirs_scanned"] >= 1
+    assert stats["errors"] == 0

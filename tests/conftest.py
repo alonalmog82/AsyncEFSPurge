@@ -24,6 +24,7 @@ if str(src_path) not in sys.path:
 # verify compatibility with the standard asyncio event loop.
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="session")
 def event_loop_policy():
     """Use uvloop for all async tests, matching production default."""

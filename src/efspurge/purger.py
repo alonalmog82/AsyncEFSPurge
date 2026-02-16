@@ -200,6 +200,21 @@ async def async_scandir_batched(
         await future
 
 
+async def _queue_put_yield_on_full(queue: asyncio.Queue, item) -> None:
+    """Put item on queue, yielding to event loop when full to avoid deadlock.
+
+    When the queue has maxsize, blocking put() can deadlock (all workers blocked
+    on put, none calling get). This uses put_nowait + yield so other workers can
+    drain the queue while this one waits.
+    """
+    while True:
+        try:
+            queue.put_nowait(item)
+            return
+        except asyncio.QueueFull:
+            await asyncio.sleep(0)
+
+
 async def _log_scandir_diagnostics(purger_instance, executor, current_time=None):
     """Helper function to log scandir executor diagnostics (DEBUG level only)."""
     if not purger_instance.logger.isEnabledFor(logging.DEBUG):
@@ -1527,7 +1542,7 @@ class AsyncEFSPurger:
                                     depth = len(entry_path.parts) - root_depth
                                     dirs_by_depth[depth].append(entry_path)
                                     pending_dirs += 1
-                                    await discovery_queue.put(entry_path)
+                                    await _queue_put_yield_on_full(discovery_queue, entry_path)
                                     total_dirs_discovered += 1
                                     subdirs_added += 1
                             except OSError:
@@ -2054,7 +2069,7 @@ class AsyncEFSPurger:
                                     # Push subdirectory onto queue for another worker to process
                                     async with pending_lock:
                                         pending_dirs += 1
-                                    await scan_queue.put(entry_path)
+                                    await _queue_put_yield_on_full(scan_queue, entry_path)
 
                                 else:
                                     # Special file types: sockets, FIFOs, block/char devices, etc.

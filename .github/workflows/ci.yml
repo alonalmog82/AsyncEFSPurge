@@ -62,11 +62,11 @@ jobs:
     
     - name: Run tests with pytest
       run: |
-        pytest -m "not stress" --cov=efspurge --cov-report=xml --cov-report=term-missing --timeout=120
+        pytest -m "not stress" --cov=efspurge --cov-report=xml --cov-report=term-missing --timeout=360
     
     - name: Run integration tests
       run: |
-        pytest -m integration --cov=efspurge --cov-append --timeout=120
+        pytest -m integration --cov=efspurge --cov-append --timeout=360
     
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v5

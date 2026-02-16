@@ -94,6 +94,7 @@ options:
   --task-batch-size N       Maximum tasks to create at once, prevents OOM (default: 5000)
   --max-concurrent-discovery N  Maximum concurrent scan workers for Phase 1a and Phase 2 (default: 20)
   --max-discovery-dirs N    Maximum directories to discover in Phase 1a (0 = auto based on memory limit)
+  --queue-maxsize N         Maximum size of Phase 1a and Phase 2 directory queues (0 = unbounded, default: 10000)
   --dry-run                 Don't actually delete files, just report what would be deleted
   --remove-empty-dirs       Remove empty directories (two-pass: Phase 1 before scan, Phase 3 after scan)
   --max-empty-dirs-to-delete N  Maximum empty directories to delete per run (0 = unlimited, default: 500)
@@ -482,6 +483,7 @@ ruff format .
 - `EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE=N` - Maximum empty directories to delete per run (0 = unlimited, default: 500)
 - `EFSPURGE_MAX_CONCURRENT_DISCOVERY=N` - Maximum concurrent scan workers for directory traversal (default: 20)
 - `EFSPURGE_MAX_DISCOVERY_DIRS=N` - Maximum directories to discover in Phase 1a (0 = auto based on memory limit)
+- `EFSPURGE_QUEUE_MAXSIZE=N` - Maximum size of Phase 1a and Phase 2 directory queues (0 = unbounded, default: 10000)
 - `EFSPURGE_MAX_CONCURRENCY=N` - [DEPRECATED] Maximum concurrent operations (use `EFSPURGE_MAX_CONCURRENCY_SCANNING`/`EFSPURGE_MAX_CONCURRENCY_DELETION`)
 - `EFSPURGE_MAX_CONCURRENCY_SCANNING=N` - Maximum concurrent file scanning operations (default: 1000)
 - `EFSPURGE_MAX_CONCURRENCY_DELETION=N` - Maximum concurrent file deletion operations (default: 1000)
@@ -544,7 +546,7 @@ Start with defaults and increase if you're not saturating network/IOPS. See [CON
 Starting with v2.0, both Phase 1a (empty directory discovery) and Phase 2 (file scanning) use a flat BFS queue with persistent worker coroutines. This eliminates the recursive coroutine explosion that caused OOM on deep directory trees in earlier versions.
 
 **How It Works:**
-- A shared `asyncio.Queue` holds directories to scan
+- A shared `asyncio.Queue` holds directories to scan (bounded by `--queue-maxsize` when > 0)
 - N worker coroutines (controlled by `--max-concurrent-discovery`, default: 20) pull directories from the queue
 - Each worker uses `async_scandir_batched()` to stream directory entries without blocking
 - Discovered subdirectories are pushed back onto the queue
@@ -557,7 +559,9 @@ Starting with v2.0, both Phase 1a (empty directory discovery) and Phase 2 (file 
 - Streaming scandir prevents hangs on directories with 100K+ entries
 - Memory bounded by queue frontier (much smaller than total directory count)
 
-**Environment Variable:** `EFSPURGE_MAX_CONCURRENT_DISCOVERY`
+**Environment Variables:** `EFSPURGE_MAX_CONCURRENT_DISCOVERY`, `EFSPURGE_QUEUE_MAXSIZE`
+
+The `--queue-maxsize` parameter (default: 10000) bounds the directory queues in Phase 1a and Phase 2. When discovery outpaces processing, producers block when the queue is full, preventing unbounded memory growth and OOM.
 
 ## Troubleshooting
 
@@ -579,6 +583,9 @@ efspurge /data --max-age-days 30 \
   --max-concurrency-scanning=100 \
   --max-concurrency-deletion=100 \
   --task-batch-size=500
+
+# Bound directory queue to prevent discovery from outpacing processing (memory growth)
+efspurge /data --max-age-days 30 --queue-maxsize=5000
 ```
 
 **For large flat directories (millions of files):**
@@ -648,6 +655,11 @@ MIT License - see [LICENSE](LICENSE) file for details.
 Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests.
 
 ## Changelog
+
+### Version 2.0.1 (2026-02-16)
+- **Hotfix**: Add `--queue-maxsize` (default: 10000) to bound Phase 1a and Phase 2 directory queues
+- **Fixed**: Memory growth when discovery outpaces processing (producers now block when queue full)
+- See [CHANGELOG.md](CHANGELOG.md) for details
 
 ### Version 2.0.0 (2026-02-13)
 - **BREAKING**: Phase 2 rewritten to BFS queue + worker pool (same pattern as Phase 1a)

@@ -131,6 +131,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--queue-maxsize",
+        type=int,
+        default=int(os.getenv("EFSPURGE_QUEUE_MAXSIZE", "10000")),
+        help=(
+            "Max size of Phase 1a/2 directory queues (0 = unbounded, default: 10000). "
+            "Bounds memory when discovery outpaces processing."
+        ),
+    )
+
+    parser.add_argument(
         "--no-uvloop",
         action="store_true",
         default=os.getenv("EFSPURGE_UVLOOP", "true").lower() in ("0", "false", "no"),
@@ -196,6 +206,7 @@ def main() -> None:
                 max_empty_dirs_to_delete=args.max_empty_dirs_to_delete,
                 max_discovery_dirs=args.max_discovery_dirs,
                 max_concurrent_discovery=args.max_concurrent_discovery,
+                queue_maxsize=args.queue_maxsize,
             ),
             loop_factory=loop_factory,
         )

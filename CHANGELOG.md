@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2026-02-16
+
+### Added
+- **`--queue-maxsize` parameter** — Bounds the Phase 1a and Phase 2 directory queues (default: 10000). When discovery outpaces processing, producers block when the queue is full, preventing unbounded memory growth and OOM. Use `0` for unbounded (backward compatible).
+- **`EFSPURGE_QUEUE_MAXSIZE` environment variable** — Same as `--queue-maxsize`.
+
+### Fixed
+- **Memory growth when discovery outpaces processing** — Phase 1a and Phase 2 previously used unbounded `asyncio.Queue()` for directories. On wide directory trees, discovery could outpace processing, causing memory to exceed limits (~159% of configured limit) and throughput drops. The new bounded queue provides back-pressure: workers block when the queue is full until consumers drain it.
+
+### Testing
+- `test_queue_maxsize_*`: 8 tests for default, explicit value, zero (unbounded), validation, Phase 1a/Phase 2 completion, and CLI/env var plumbing.
+
 ## [2.0.0] - 2026-02-13
 
 ### Added

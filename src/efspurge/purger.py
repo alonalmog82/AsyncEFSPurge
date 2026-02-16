@@ -200,6 +200,21 @@ async def async_scandir_batched(
         await future
 
 
+async def _queue_put_yield_on_full(queue: asyncio.Queue, item) -> None:
+    """Put item on queue, yielding to event loop when full to avoid deadlock.
+
+    When the queue has maxsize, blocking put() can deadlock (all workers blocked
+    on put, none calling get). This uses put_nowait + yield so other workers can
+    drain the queue while this one waits.
+    """
+    while True:
+        try:
+            queue.put_nowait(item)
+            return
+        except asyncio.QueueFull:
+            await asyncio.sleep(0)
+
+
 async def _log_scandir_diagnostics(purger_instance, executor, current_time=None):
     """Helper function to log scandir executor diagnostics (DEBUG level only)."""
     if not purger_instance.logger.isEnabledFor(logging.DEBUG):
@@ -417,6 +432,7 @@ class AsyncEFSPurger:
         max_empty_dirs_to_delete: int = 500,
         max_discovery_dirs: int = 0,
         max_concurrent_discovery: int = 20,
+        queue_maxsize: int = 10000,
     ):
         """
         Initialize the async EFS purger.
@@ -435,6 +451,8 @@ class AsyncEFSPurger:
             max_empty_dirs_to_delete: Maximum empty directories to delete per run (0 = unlimited, default: 500)
             max_discovery_dirs: Maximum directories to discover in Phase 1a (0 = use automatic limit based on memory)
             max_concurrent_discovery: Maximum concurrent directory/file scan workers (default: 20)
+            queue_maxsize: Maximum size of Phase 1a and Phase 2 directory queues (0 = unbounded, default: 10000).
+                Bounds memory when discovery outpaces processing; producers block when full.
 
         Raises:
             ValueError: If invalid parameters are provided
@@ -485,6 +503,9 @@ class AsyncEFSPurger:
         if max_empty_dirs_to_delete < 0:
             raise ValueError(f"max_empty_dirs_to_delete must be >= 0, got {max_empty_dirs_to_delete}")
 
+        if queue_maxsize < 0:
+            raise ValueError(f"queue_maxsize must be >= 0, got {queue_maxsize}")
+
         # Ensure root_path is absolute
         root_path_obj = Path(root_path)
         if not root_path_obj.is_absolute():
@@ -533,6 +554,7 @@ class AsyncEFSPurger:
         self.remove_empty_dirs = remove_empty_dirs
         self.max_empty_dirs_to_delete = max_empty_dirs_to_delete
         self.max_concurrent_discovery = max(1, max_concurrent_discovery)
+        self.queue_maxsize = queue_maxsize
 
         # Compute discovery limit: if explicitly set use that, otherwise derive from memory budget.
         # Each Path object is ~400-600 bytes, so we allow roughly 60% of the memory budget for paths.
@@ -1377,6 +1399,7 @@ class AsyncEFSPurger:
                 "memory_limit_mb": self.memory_limit_mb,
                 "max_discovery_dirs": self.max_discovery_dirs,
                 "max_concurrent_discovery": self.max_concurrent_discovery,
+                "queue_maxsize": self.queue_maxsize,
             },
         )
 
@@ -1389,7 +1412,9 @@ class AsyncEFSPurger:
         # latency. On high-latency filesystems like EFS, sequential scanning is limited
         # to ~1 dir/sec; with N workers we can achieve ~N dirs/sec.
         dirs_by_depth: defaultdict[int, list[Path]] = defaultdict(list)
-        discovery_queue: asyncio.Queue[Path] = asyncio.Queue()
+        discovery_queue: asyncio.Queue[Path] = (
+            asyncio.Queue(maxsize=self.queue_maxsize) if self.queue_maxsize > 0 else asyncio.Queue()
+        )
         discovery_queue.put_nowait(self.root_path)
         discovery_errors = 0
         total_dirs_discovered = 0
@@ -1517,7 +1542,7 @@ class AsyncEFSPurger:
                                     depth = len(entry_path.parts) - root_depth
                                     dirs_by_depth[depth].append(entry_path)
                                     pending_dirs += 1
-                                    discovery_queue.put_nowait(entry_path)
+                                    await _queue_put_yield_on_full(discovery_queue, entry_path)
                                     total_dirs_discovered += 1
                                     subdirs_added += 1
                             except OSError:
@@ -1952,8 +1977,11 @@ class AsyncEFSPurger:
         - Files are batched and processed via _process_file_batch()
         - Discovered subdirectories are pushed back onto the queue
         - Workers exit when queue is drained (tracked via pending_dirs counter)
+        - queue_maxsize bounds memory: producers block when full (back-pressure)
         """
-        scan_queue: asyncio.Queue[Path] = asyncio.Queue()
+        scan_queue: asyncio.Queue[Path] = (
+            asyncio.Queue(maxsize=self.queue_maxsize) if self.queue_maxsize > 0 else asyncio.Queue()
+        )
         scan_queue.put_nowait(self.root_path)
         pending_dirs = 1  # root is in the queue
         pending_lock = asyncio.Lock()
@@ -1974,6 +2002,7 @@ class AsyncEFSPurger:
             {
                 "root_path": str(self.root_path),
                 "num_workers": num_workers,
+                "queue_maxsize": self.queue_maxsize,
                 "task_batch_size": self.task_batch_size,
                 "max_concurrency_scanning": self.max_concurrency_scanning,
                 "max_concurrency_deletion": self.max_concurrency_deletion,
@@ -2040,7 +2069,7 @@ class AsyncEFSPurger:
                                     # Push subdirectory onto queue for another worker to process
                                     async with pending_lock:
                                         pending_dirs += 1
-                                    scan_queue.put_nowait(entry_path)
+                                    await _queue_put_yield_on_full(scan_queue, entry_path)
 
                                 else:
                                     # Special file types: sockets, FIFOs, block/char devices, etc.
@@ -2426,6 +2455,7 @@ class AsyncEFSPurger:
                 "remove_empty_dirs": self.remove_empty_dirs,
                 "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
                 "max_concurrent_discovery": self.max_concurrent_discovery,
+                "queue_maxsize": self.queue_maxsize,
                 "scandir_executor_threads": self.scandir_executor._max_workers,
                 "event_loop": event_loop_type,
             },
@@ -2593,6 +2623,7 @@ async def async_main(
     max_empty_dirs_to_delete: int = 500,
     max_discovery_dirs: int = 0,
     max_concurrent_discovery: int = 20,
+    queue_maxsize: int = 10000,
 ) -> dict:
     """
     Async entry point for the purger.
@@ -2611,6 +2642,7 @@ async def async_main(
         max_empty_dirs_to_delete: Maximum empty directories to delete per run (0 = unlimited, default: 500)
         max_discovery_dirs: Maximum directories to discover in Phase 1a (0 = auto based on memory)
         max_concurrent_discovery: Maximum concurrent directory/file scan workers (default: 20)
+        queue_maxsize: Maximum size of Phase 1a and Phase 2 directory queues (0 = unbounded, default: 10000)
 
     Returns:
         Operation statistics
@@ -2629,6 +2661,7 @@ async def async_main(
         max_empty_dirs_to_delete=max_empty_dirs_to_delete,
         max_discovery_dirs=max_discovery_dirs,
         max_concurrent_discovery=max_concurrent_discovery,
+        queue_maxsize=queue_maxsize,
     )
 
     return await purger.purge()

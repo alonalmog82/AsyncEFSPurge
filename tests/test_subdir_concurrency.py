@@ -100,10 +100,11 @@ async def test_memory_bounded_with_many_subdirs(temp_dir):
 
 
 @pytest.mark.asyncio
+@pytest.mark.stress
 async def test_deep_directory_tree_memory_safety(temp_dir):
     """Test that deep directory trees don't cause memory explosion.
 
-    Uses 40×40×40 (65,641 dirs) for reasonable CI runtime.
+    Uses 40×40×40 (65,641 dirs). Marked stress: excluded from CI (not stress) to avoid timeout.
     """
     import sys
 

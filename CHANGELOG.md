@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.2] - Unreleased
+
+### Fixed
+- **Phase 2 / Phase 1a queue deadlock** — When the directory queue was full and every worker was inside a directory with many subdirs, all workers blocked on `put()` and none could call `get()`, causing a permanent hang (e.g. "POSSIBLE HANG DETECTED", dirs_scanned stuck). Workers now use **per-worker pending lists**: on `QueueFull` they buffer subdirs locally and drain them when they finish the current directory or at the start of the next loop. No worker blocks on put, so at least one can always finish and call get(), breaking the deadlock.
+- Replaced `_queue_put_yield_on_full` (yield loop) with `put_nowait` + `_drain_pending_to_queue` for Phase 1a and Phase 2.
+
+### Testing
+- `test_phase2_no_deadlock_when_queue_smaller_than_subdirs`: 40 subdirs, queue_maxsize=15, 10 workers; asserts completion (would deadlock with blocking put).
+
 ## [2.0.1] - 2026-02-16
 
 ### Added

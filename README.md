@@ -444,6 +444,11 @@ If you're purging files where accidental deletion would be catastrophic, conside
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing, and contribution guidelines.
 
+### Docker snapshots and releases
+
+- **PR snapshots:** For every push to a pull request, a short-lived snapshot image is built and pushed to GHCR. Use it to test the branch before merge: `docker pull ghcr.io/<owner>/asyncefspurge:snapshot-pr-<PR number>` (e.g. `snapshot-pr-33`). Branch-based tags (e.g. `snapshot-fix-phase2-queue-deadlock`) are also available. These images are overwritten on each push and are not retained like release images.
+- **Releases:** When a PR is merged to `main`, a GitHub release is created (tag from `pyproject.toml` version) and the release container is built and pushed to GHCR (same version tag and `latest`).
+
 ### Quick Dev Setup
 
 ```bash
@@ -546,7 +551,7 @@ Start with defaults and increase if you're not saturating network/IOPS. See [CON
 Starting with v2.0, both Phase 1a (empty directory discovery) and Phase 2 (file scanning) use a flat BFS queue with persistent worker coroutines. This eliminates the recursive coroutine explosion that caused OOM on deep directory trees in earlier versions.
 
 **How It Works:**
-- A shared `asyncio.Queue` holds directories to scan (bounded by `--queue-maxsize` when > 0)
+- A shared `asyncio.Queue` holds directories to scan (bounded by `--queue-maxsize` when > 0). When the queue is full, workers buffer subdirs in a per-worker pending list and drain when they finish the current directory, avoiding deadlock (no blocking on put).
 - N worker coroutines (controlled by `--max-concurrent-discovery`, default: 20) pull directories from the queue
 - Each worker uses `async_scandir_batched()` to stream directory entries without blocking
 - Discovered subdirectories are pushed back onto the queue

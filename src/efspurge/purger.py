@@ -200,19 +200,20 @@ async def async_scandir_batched(
         await future
 
 
-async def _queue_put_yield_on_full(queue: asyncio.Queue, item) -> None:
-    """Put item on queue, yielding to event loop when full to avoid deadlock.
+def _drain_pending_to_queue(queue: asyncio.Queue, pending_list: list) -> None:
+    """Put as many items from pending_list onto queue as fit; keep rest in list.
 
-    When the queue has maxsize, blocking put() can deadlock (all workers blocked
-    on put, none calling get). This uses put_nowait + yield so other workers can
-    drain the queue while this one waits.
+    Mutates pending_list: removes items that were successfully put. Call when
+    queue has maxsize to avoid deadlock (workers never block on put).
     """
-    while True:
+    kept = []
+    for item in pending_list:
         try:
             queue.put_nowait(item)
-            return
         except asyncio.QueueFull:
-            await asyncio.sleep(0)
+            kept.append(item)
+    pending_list.clear()
+    pending_list.extend(kept)
 
 
 async def _log_scandir_diagnostics(purger_instance, executor, current_time=None):
@@ -1453,10 +1454,18 @@ class AsyncEFSPurger:
             nonlocal total_dirs_discovered, discovery_errors, memory_abort
             nonlocal discovery_limit_reached, pending_dirs, last_progress_milestone
             nonlocal dirs_by_depth
+            pending_discovery: list[Path] = []  # Per-worker buffer when queue full (avoids deadlock)
 
             while not discovery_done.is_set():
+                # Drain pending into queue so we never block on put (deadlock fix)
+                _drain_pending_to_queue(discovery_queue, pending_discovery)
+                if discovery_done.is_set():
+                    pending_dirs -= len(pending_discovery)
+                    break
+
                 # Check termination conditions
                 if memory_abort or discovery_limit_reached:
+                    pending_dirs -= len(pending_discovery)
                     break
 
                 # Check directory count limit
@@ -1542,7 +1551,10 @@ class AsyncEFSPurger:
                                     depth = len(entry_path.parts) - root_depth
                                     dirs_by_depth[depth].append(entry_path)
                                     pending_dirs += 1
-                                    await _queue_put_yield_on_full(discovery_queue, entry_path)
+                                    try:
+                                        discovery_queue.put_nowait(entry_path)
+                                    except asyncio.QueueFull:
+                                        pending_discovery.append(entry_path)
                                     total_dirs_discovered += 1
                                     subdirs_added += 1
                             except OSError:
@@ -1580,6 +1592,9 @@ class AsyncEFSPurger:
                                     memory_abort = True
                                     discovery_done.set()
                                     break
+
+                    # Drain pending after finishing directory (deadlock fix)
+                    _drain_pending_to_queue(discovery_queue, pending_discovery)
 
                     await self.update_stats(dirs_scanned=1)
                     self.rate_tracker.record("removing_empty_dirs", "dirs", 1)
@@ -2012,8 +2027,16 @@ class AsyncEFSPurger:
         async def _scan_worker(worker_id: int) -> None:
             """Worker that scans directories from queue and processes files."""
             nonlocal pending_dirs
+            pending_subdirs: list[Path] = []  # Per-worker buffer when queue full (avoids deadlock)
 
             while not scan_done.is_set():
+                # Drain pending subdirs into queue so we never block on put (deadlock fix)
+                _drain_pending_to_queue(scan_queue, pending_subdirs)
+                if scan_done.is_set():
+                    async with pending_lock:
+                        pending_dirs -= len(pending_subdirs)
+                    break
+
                 # Get next directory from queue
                 try:
                     directory = await asyncio.wait_for(scan_queue.get(), timeout=1.0)
@@ -2066,10 +2089,13 @@ class AsyncEFSPurger:
                                                 file_task_buffer.clear()
 
                                 elif entry.is_dir(follow_symlinks=False):
-                                    # Push subdirectory onto queue for another worker to process
+                                    # Push subdirectory onto queue; buffer if full to avoid deadlock
                                     async with pending_lock:
                                         pending_dirs += 1
-                                    await _queue_put_yield_on_full(scan_queue, entry_path)
+                                    try:
+                                        scan_queue.put_nowait(entry_path)
+                                    except asyncio.QueueFull:
+                                        pending_subdirs.append(entry_path)
 
                                 else:
                                     # Special file types: sockets, FIFOs, block/char devices, etc.
@@ -2112,6 +2138,9 @@ class AsyncEFSPurger:
                                     self.empty_dirs.add(directory)
                         except (FileNotFoundError, PermissionError, OSError):
                             pass  # Directory gone or inaccessible
+
+                    # Drain pending subdirs after finishing directory (deadlock fix)
+                    _drain_pending_to_queue(scan_queue, pending_subdirs)
 
                 except PermissionError as e:
                     log_with_context(

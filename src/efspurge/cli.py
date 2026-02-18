@@ -141,6 +141,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--max-entries-per-dir",
+        type=int,
+        default=int(os.getenv("EFSPURGE_MAX_ENTRIES_PER_DIR", "0")),
+        help=(
+            "Cap entries processed per directory in Phase 1a (0 = no limit, default: 0). "
+            "When set (e.g. 50000), huge directories are re-queued and scanned in chunks to avoid stalling workers."
+        ),
+    )
+
+    parser.add_argument(
         "--no-uvloop",
         action="store_true",
         default=os.getenv("EFSPURGE_UVLOOP", "true").lower() in ("0", "false", "no"),
@@ -207,6 +217,7 @@ def main() -> None:
                 max_discovery_dirs=args.max_discovery_dirs,
                 max_concurrent_discovery=args.max_concurrent_discovery,
                 queue_maxsize=args.queue_maxsize,
+                max_entries_per_dir=args.max_entries_per_dir,
             ),
             loop_factory=loop_factory,
         )

@@ -95,6 +95,7 @@ options:
   --max-concurrent-discovery N  Maximum concurrent scan workers for Phase 1a and Phase 2 (default: 20)
   --max-discovery-dirs N    Maximum directories to discover in Phase 1a (0 = auto based on memory limit)
   --queue-maxsize N         Maximum size of Phase 1a and Phase 2 directory queues (0 = unbounded, default: 10000)
+  --max-entries-per-dir N   Cap entries processed per directory in Phase 1a (0 = no limit). When set (e.g. 50000), huge directories are re-queued and scanned in chunks to avoid stalling workers.
   --dry-run                 Don't actually delete files, just report what would be deleted
   --remove-empty-dirs       Remove empty directories (two-pass: Phase 1 before scan, Phase 3 after scan)
   --max-empty-dirs-to-delete N  Maximum empty directories to delete per run (0 = unlimited, default: 500)
@@ -564,7 +565,7 @@ Starting with v2.0, both Phase 1a (empty directory discovery) and Phase 2 (file 
 - Streaming scandir prevents hangs on directories with 100K+ entries
 - Memory bounded by queue frontier (much smaller than total directory count)
 
-**Environment Variables:** `EFSPURGE_MAX_CONCURRENT_DISCOVERY`, `EFSPURGE_QUEUE_MAXSIZE`
+**Environment Variables:** `EFSPURGE_MAX_CONCURRENT_DISCOVERY`, `EFSPURGE_QUEUE_MAXSIZE`, `EFSPURGE_MAX_ENTRIES_PER_DIR`
 
 The `--queue-maxsize` parameter (default: 10000) bounds the directory queues in Phase 1a and Phase 2. When discovery outpaces processing, producers block when the queue is full, preventing unbounded memory growth and OOM.
 
@@ -617,6 +618,7 @@ You can identify this pattern in the logs when Phase 1a progress reports show:
 - The outer BFS loop checks memory between directories and aborts at 95%
 - `max_discovery_dirs` caps total directories discovered (auto-calculated from `--memory-limit-mb`)
 - After any abort, Phase 1b proceeds with the partial tree already discovered
+- **If Phase 1a discovery stalls** (queue stuck near full, `dirs_per_second` drops to near zero for a long time): set `--max-entries-per-dir 50000` or `EFSPURGE_MAX_ENTRIES_PER_DIR=50000` so very large directories are processed in chunks and re-queued instead of monopolizing a worker.
 
 **Estimating memory usage:**
 At ~2-3 KB per discovered directory, a 4500 MB memory limit allows roughly 1.5-2M directories before the 90% threshold triggers. The auto-calculated `max_discovery_dirs` uses a conservative estimate of 500 bytes per path, so the memory safety checks will typically fire before the discovery cap is reached.

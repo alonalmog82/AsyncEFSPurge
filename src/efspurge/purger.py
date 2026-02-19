@@ -456,7 +456,8 @@ class AsyncEFSPurger:
             queue_maxsize: Maximum size of Phase 1a and Phase 2 directory queues (0 = unbounded, default: 10000).
                 Bounds memory when discovery outpaces processing; producers block when full.
             max_entries_per_dir: Cap entries processed per directory in Phase 1a (0 = no limit). When set (e.g. 50000),
-                a directory is re-queued after this many entries and scanned again later to avoid one huge dir stalling workers.
+                a directory is re-queued after this many entries and scanned again later to avoid one huge dir
+                stalling workers.
 
         Raises:
             ValueError: If invalid parameters are provided
@@ -1574,7 +1575,8 @@ class AsyncEFSPurger:
                             except OSError:
                                 discovery_errors += 1
 
-                        # Per-dir entry cap: re-queue this dir and process another to avoid one huge dir stalling workers
+                        # Per-dir entry cap: re-queue this dir and process another to avoid one huge dir
+                        # stalling workers
                         if self.max_entries_per_dir > 0 and entries_in_dir >= self.max_entries_per_dir:
                             try:
                                 discovery_queue.put_nowait(current_dir)
@@ -1686,6 +1688,9 @@ class AsyncEFSPurger:
                 "memory_mb": round(get_memory_usage_mb(), 1),
             },
         )
+
+        # Free discovery-only state before Phase 1b to reduce memory pressure
+        discovered_dirs.clear()
 
         if not dirs_by_depth:
             log_with_context(self.logger, "info", "No subdirectories found, skipping empty dir purge", {})
@@ -1946,12 +1951,20 @@ class AsyncEFSPurger:
                 },
             )
 
-        # Free any remaining depth levels (e.g. if rate limit stopped us early)
+        # Drain discovery queue so references are released (may have items if discovery aborted early)
+        while True:
+            try:
+                discovery_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        # Free all Phase 1 directory data
         dirs_by_depth.clear()
         del dirs_by_depth
 
-        # Force GC after releasing all directory data
-        gc.collect()
+        # Aggressive GC so Phase 2 starts with lower baseline memory
+        for _ in range(3):
+            gc.collect()
 
         log_with_context(
             self.logger,

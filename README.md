@@ -96,6 +96,8 @@ options:
   --max-discovery-dirs N    Maximum directories to discover in Phase 1a (0 = auto based on memory limit)
   --queue-maxsize N         Maximum size of Phase 1a and Phase 2 directory queues (0 = unbounded, default: 10000)
   --max-entries-per-dir N   Cap entries processed per directory in Phase 1a (0 = no limit). When set (e.g. 50000), huge directories are re-queued and scanned in chunks to avoid stalling workers.
+  --checkpoint-file PATH    Path to save checkpoint when memory is critical (95%%+). Enables graceful exit for resume. Use with --resume to continue.
+  --resume                  Resume Phase 2 from checkpoint file (requires --checkpoint-file). Skips Phase 1.
   --dry-run                 Don't actually delete files, just report what would be deleted
   --remove-empty-dirs       Remove empty directories (two-pass: Phase 1 before scan, Phase 3 after scan)
   --max-empty-dirs-to-delete N  Maximum empty directories to delete per run (0 = unlimited, default: 500)
@@ -632,6 +634,20 @@ efspurge /data --max-age-days 30 --remove-empty-dirs \
 ```
 
 **Key insight:** If memory spikes with `dirs_scanned` but `files_scanned=0`, try reducing `--max-concurrent-discovery` (directory traversal workers) or `--memory-limit-mb`.
+
+### Checkpoint / resume (memory critical exit)
+
+When memory exceeds 95%, the purger can save Phase 2 state to a checkpoint file and exit (exit code 75) so you can resume later instead of OOM-killing the process.
+
+**Environment variables:** `EFSPURGE_CHECKPOINT_FILE`, `EFSPURGE_RESUME`
+
+```bash
+# First run: save checkpoint when memory is critical (95%+)
+efspurge /data --max-age-days 30 --checkpoint-file /tmp/efspurge-cp.json
+
+# Resume from checkpoint (skips Phase 1, continues Phase 2 from pending dirs)
+efspurge /data --max-age-days 30 --checkpoint-file /tmp/efspurge-cp.json --resume
+```
 
 ### Slow Performance
 

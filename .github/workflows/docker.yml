@@ -56,6 +56,20 @@ jobs:
           type=sha
           type=raw,value=latest,enable={{is_default_branch}}
     
+    # When building from main, also tag with version from pyproject.toml so the
+    # image matches the release (Release workflow creates the tag after merge;
+    # we don't get a tag push event, so we add the version tag here).
+    - name: Prepare tags (include version when on main)
+      id: prepare-tags
+      run: |
+        TAGS="${{ steps.meta.outputs.tags }}"
+        if [ "${{ github.ref }}" = "refs/heads/main" ] && [ "${{ github.event_name }}" = "push" ]; then
+          TAGS="${TAGS}"$'\n'"${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}"
+        fi
+        echo "tags<<EOF" >> $GITHUB_OUTPUT
+        echo "$TAGS" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+    
     - name: Build Docker image
       uses: docker/build-push-action@v6
       with:
@@ -101,7 +115,7 @@ jobs:
       with:
         context: .
         push: ${{ github.event_name != 'pull_request' }}
-        tags: ${{ steps.meta.outputs.tags }}
+        tags: ${{ steps.prepare-tags.outputs.tags }}
         labels: ${{ steps.meta.outputs.labels }}
         build-args: |
           VERSION=${{ steps.version.outputs.version }}

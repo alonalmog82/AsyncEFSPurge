@@ -7,7 +7,7 @@ import os
 import sys
 
 from . import __version__
-from .purger import async_main
+from .purger import CheckpointExit, async_main
 
 logger = logging.getLogger("efspurge")
 
@@ -151,6 +151,23 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--checkpoint-file",
+        type=str,
+        default=os.getenv("EFSPURGE_CHECKPOINT_FILE", ""),
+        help=(
+            "Path to save checkpoint when memory is critical (95%%+). "
+            "Enables auto-checkpoint and graceful exit for resume. Use with --resume to continue."
+        ),
+    )
+
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=os.getenv("EFSPURGE_RESUME", "").lower() in ("1", "true", "yes"),
+        help="Resume Phase 2 from checkpoint file (requires --checkpoint-file). Skips Phase 1.",
+    )
+
+    parser.add_argument(
         "--no-uvloop",
         action="store_true",
         default=os.getenv("EFSPURGE_UVLOOP", "true").lower() in ("0", "false", "no"),
@@ -218,6 +235,8 @@ def main() -> None:
                 max_concurrent_discovery=args.max_concurrent_discovery,
                 queue_maxsize=args.queue_maxsize,
                 max_entries_per_dir=args.max_entries_per_dir,
+                checkpoint_file=args.checkpoint_file or None,
+                resume=args.resume,
             ),
             loop_factory=loop_factory,
         )
@@ -225,6 +244,10 @@ def main() -> None:
         # Exit with success
         sys.exit(0)
 
+    except CheckpointExit as e:
+        print(f"\n{e}", file=sys.stderr)
+        print("Run with --resume to continue from checkpoint.", file=sys.stderr)
+        sys.exit(75)  # EX_TEMPFAIL - checkpoint saved, resume suggested
     except KeyboardInterrupt:
         print("\nOperation cancelled by user", file=sys.stderr)
         sys.exit(130)

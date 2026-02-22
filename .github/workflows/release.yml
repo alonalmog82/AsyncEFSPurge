@@ -1,0 +1,56 @@
+# On merge to main: create a GitHub release (tag + notes) and ensure release container is built.
+# The release container is built and pushed by the Docker workflow (docker.yml) on push to main
+# with the version tag from pyproject.toml. This workflow only creates the GitHub release.
+
+name: Release
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Get version from pyproject.toml
+        id: version
+        run: |
+          VERSION=$(python3 -c "import tomllib; f=open('pyproject.toml','rb'); d=tomllib.load(f); print(d['project']['version'])")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check if release already exists
+        id: check
+        run: |
+          if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
+          body: |
+            Release v${{ steps.version.outputs.version }}.
+            See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details.
+            **Container image:** `ghcr.io/${{ github.repository_owner }}/asyncefspurge:${{ steps.version.outputs.version }}`
+          generate_release_notes: true
+          draft: false
+
+      - name: Log when release already exists
+        if: steps.check.outputs.exists == 'true'
+        run: |
+          echo "Release v${{ steps.version.outputs.version }} already exists, skipping."
+          echo "Container image was built by Docker workflow on push to main."

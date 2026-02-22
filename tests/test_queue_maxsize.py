@@ -2,8 +2,8 @@
 
 The queue_maxsize parameter bounds the directory queues used in Phase 1a
 (empty directory discovery) and Phase 2 (file scanning). When discovery
-outpaces processing, producers block when the queue is full, preventing
-unbounded memory growth.
+outpaces processing, workers use per-worker pending lists when the queue is
+full to avoid deadlock (no blocking on put).
 """
 
 import os
@@ -144,3 +144,35 @@ async def test_cli_queue_maxsize_default(temp_dir):
 
             args = parse_args()
             assert args.queue_maxsize == 10000
+
+
+# ---------------------------------------------------------------------------
+# Deadlock fix: queue smaller than (workers × wide directories)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_phase2_no_deadlock_when_queue_smaller_than_subdirs(temp_dir):
+    """Phase 2 completes when queue is smaller than number of subdirs (would deadlock with blocking put).
+
+    Root has 40 subdirs, queue_maxsize=15, 10 workers. Without per-worker pending list
+    all workers would block on put and never finish a directory -> deadlock.
+    """
+    for i in range(40):
+        subdir = temp_dir / f"connector_{i}"
+        subdir.mkdir()
+        (subdir / "file.txt").write_text("content")
+
+    purger = AsyncEFSPurger(
+        root_path=str(temp_dir),
+        max_age_days=30,
+        dry_run=True,
+        queue_maxsize=15,
+        max_concurrent_discovery=10,
+    )
+
+    await purger.purge()
+
+    # Must complete and scan all 40 subdirs + root
+    assert purger.stats["dirs_scanned"] == 41
+    assert purger.stats["files_scanned"] == 40

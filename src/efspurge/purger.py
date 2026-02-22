@@ -13,6 +13,7 @@ from pathlib import Path
 import aiofiles.os
 
 from . import __version__
+from .checkpoint import load_checkpoint, save_checkpoint
 from .logging import log_with_context, setup_logging
 
 # Maximum number of directories to discover in Phase 1a.
@@ -21,6 +22,10 @@ from .logging import log_with_context, setup_logging
 # keeps discovery memory well within a 4.5 GB container budget while
 # still covering the vast majority of real-world directory trees.
 MAX_DISCOVERY_DIRS_DEFAULT = 1_000_000
+
+
+class CheckpointExit(Exception):
+    """Raised when purge exits after saving a checkpoint (memory critical)."""
 
 
 def get_memory_usage_mb() -> float:
@@ -200,19 +205,20 @@ async def async_scandir_batched(
         await future
 
 
-async def _queue_put_yield_on_full(queue: asyncio.Queue, item) -> None:
-    """Put item on queue, yielding to event loop when full to avoid deadlock.
+def _drain_pending_to_queue(queue: asyncio.Queue, pending_list: list) -> None:
+    """Put as many items from pending_list onto queue as fit; keep rest in list.
 
-    When the queue has maxsize, blocking put() can deadlock (all workers blocked
-    on put, none calling get). This uses put_nowait + yield so other workers can
-    drain the queue while this one waits.
+    Mutates pending_list: removes items that were successfully put. Call when
+    queue has maxsize to avoid deadlock (workers never block on put).
     """
-    while True:
+    kept = []
+    for item in pending_list:
         try:
             queue.put_nowait(item)
-            return
         except asyncio.QueueFull:
-            await asyncio.sleep(0)
+            kept.append(item)
+    pending_list.clear()
+    pending_list.extend(kept)
 
 
 async def _log_scandir_diagnostics(purger_instance, executor, current_time=None):
@@ -433,6 +439,9 @@ class AsyncEFSPurger:
         max_discovery_dirs: int = 0,
         max_concurrent_discovery: int = 20,
         queue_maxsize: int = 10000,
+        max_entries_per_dir: int = 0,
+        checkpoint_file: str | Path | None = None,
+        resume: bool = False,
     ):
         """
         Initialize the async EFS purger.
@@ -453,6 +462,11 @@ class AsyncEFSPurger:
             max_concurrent_discovery: Maximum concurrent directory/file scan workers (default: 20)
             queue_maxsize: Maximum size of Phase 1a and Phase 2 directory queues (0 = unbounded, default: 10000).
                 Bounds memory when discovery outpaces processing; producers block when full.
+            max_entries_per_dir: Cap entries processed per directory in Phase 1a (0 = no limit). When set (e.g. 50000),
+                a directory is re-queued after this many entries and scanned again later to avoid one huge dir
+                stalling workers.
+            checkpoint_file: Path to save checkpoint when memory is critical (enables auto-checkpoint on OOM risk).
+            resume: If True, load checkpoint from checkpoint_file and resume Phase 2 from saved state.
 
         Raises:
             ValueError: If invalid parameters are provided
@@ -505,6 +519,8 @@ class AsyncEFSPurger:
 
         if queue_maxsize < 0:
             raise ValueError(f"queue_maxsize must be >= 0, got {queue_maxsize}")
+        if max_entries_per_dir < 0:
+            raise ValueError(f"max_entries_per_dir must be >= 0, got {max_entries_per_dir}")
 
         # Ensure root_path is absolute
         root_path_obj = Path(root_path)
@@ -555,6 +571,9 @@ class AsyncEFSPurger:
         self.max_empty_dirs_to_delete = max_empty_dirs_to_delete
         self.max_concurrent_discovery = max(1, max_concurrent_discovery)
         self.queue_maxsize = queue_maxsize
+        self.max_entries_per_dir = max_entries_per_dir
+        self.checkpoint_file = Path(checkpoint_file) if checkpoint_file else None
+        self.resume = resume
 
         # Compute discovery limit: if explicitly set use that, otherwise derive from memory budget.
         # Each Path object is ~400-600 bytes, so we allow roughly 60% of the memory budget for paths.
@@ -659,6 +678,11 @@ class AsyncEFSPurger:
         self.memory_warning_interval = 60  # Only warn once per minute
         self.memory_check_lock = asyncio.Lock()  # Prevent concurrent checks
 
+        # Checkpoint/resume: when memory critical, save state and exit for resume
+        self._checkpoint_requested = False
+        self._checkpoint_pending: list[Path] = []
+        self._checkpoint_lock = asyncio.Lock()
+
     def close(self) -> None:
         """Shut down the scandir ThreadPoolExecutor.
 
@@ -716,10 +740,30 @@ class AsyncEFSPurger:
 
             if memory_mb > backpressure_threshold_mb:
                 current_time = time.time()
+                memory_percent = (memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
+
+                # At 95%+: request checkpoint and exit to avoid OOM (when checkpoint_file is set)
+                CRITICAL_THRESHOLD_PERCENT = 95
+                if (
+                    self.checkpoint_file
+                    and memory_percent >= CRITICAL_THRESHOLD_PERCENT
+                    and not self._checkpoint_requested
+                ):
+                    self._checkpoint_requested = True
+                    log_with_context(
+                        self.logger,
+                        "warning",
+                        "Memory critical, requesting checkpoint and graceful exit for resume",
+                        {
+                            "memory_mb": round(memory_mb, 1),
+                            "memory_percent": round(memory_percent, 1),
+                            "checkpoint_file": str(self.checkpoint_file),
+                        },
+                    )
+                    return True, memory_mb
 
                 # Only log warning once per interval to avoid spam
                 if current_time - self.last_memory_warning >= self.memory_warning_interval:
-                    memory_percent = (memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
                     self.logger.warning(
                         f"Memory usage ({memory_mb:.1f} MB, {memory_percent:.1f}%) exceeds back-pressure threshold "
                         f"({backpressure_threshold_mb:.1f} MB, {BACKPRESSURE_THRESHOLD * 100:.0f}%), "
@@ -1400,6 +1444,7 @@ class AsyncEFSPurger:
                 "max_discovery_dirs": self.max_discovery_dirs,
                 "max_concurrent_discovery": self.max_concurrent_discovery,
                 "queue_maxsize": self.queue_maxsize,
+                "max_entries_per_dir": self.max_entries_per_dir,
             },
         )
 
@@ -1419,6 +1464,8 @@ class AsyncEFSPurger:
         discovery_errors = 0
         total_dirs_discovered = 0
         root_depth = len(self.root_path.parts)
+        # When max_entries_per_dir is set we may re-queue a directory; discovered_dirs avoids double-counting.
+        discovered_dirs: set[Path] = {self.root_path}
         # pending_dirs tracks dirs enqueued but not yet fully processed.
         # When it reaches 0 all reachable directories have been scanned.
         pending_dirs = 1  # root is already in the queue
@@ -1432,6 +1479,7 @@ class AsyncEFSPurger:
                 "memory_limit_mb": self.memory_limit_mb,
                 "max_discovery_dirs": self.max_discovery_dirs,
                 "max_concurrent_discovery": self.max_concurrent_discovery,
+                "max_entries_per_dir": self.max_entries_per_dir,
                 "initial_memory_mb": round(get_memory_usage_mb(), 1),
             },
         )
@@ -1452,11 +1500,19 @@ class AsyncEFSPurger:
             """Worker coroutine that scans directories from the queue."""
             nonlocal total_dirs_discovered, discovery_errors, memory_abort
             nonlocal discovery_limit_reached, pending_dirs, last_progress_milestone
-            nonlocal dirs_by_depth
+            nonlocal dirs_by_depth, discovered_dirs
+            pending_discovery: list[Path] = []  # Per-worker buffer when queue full (avoids deadlock)
 
             while not discovery_done.is_set():
+                # Drain pending into queue so we never block on put (deadlock fix)
+                _drain_pending_to_queue(discovery_queue, pending_discovery)
+                if discovery_done.is_set():
+                    pending_dirs -= len(pending_discovery)
+                    break
+
                 # Check termination conditions
                 if memory_abort or discovery_limit_reached:
+                    pending_dirs -= len(pending_discovery)
                     break
 
                 # Check directory count limit
@@ -1528,6 +1584,7 @@ class AsyncEFSPurger:
                     subdirs_added = 0
                     batches_processed = 0
                     entries_in_dir = 0
+                    yielded_early = False
                     async for batch in async_scandir_batched(current_dir, self.scandir_executor):
                         if memory_abort or discovery_limit_reached:
                             break
@@ -1539,14 +1596,30 @@ class AsyncEFSPurger:
                             try:
                                 if entry.is_dir(follow_symlinks=False):
                                     entry_path = Path(entry.path)
+                                    if entry_path in discovered_dirs:
+                                        continue
+                                    discovered_dirs.add(entry_path)
                                     depth = len(entry_path.parts) - root_depth
                                     dirs_by_depth[depth].append(entry_path)
                                     pending_dirs += 1
-                                    await _queue_put_yield_on_full(discovery_queue, entry_path)
+                                    try:
+                                        discovery_queue.put_nowait(entry_path)
+                                    except asyncio.QueueFull:
+                                        pending_discovery.append(entry_path)
                                     total_dirs_discovered += 1
                                     subdirs_added += 1
                             except OSError:
                                 discovery_errors += 1
+
+                        # Per-dir entry cap: re-queue this dir and process another to avoid one huge dir
+                        # stalling workers
+                        if self.max_entries_per_dir > 0 and entries_in_dir >= self.max_entries_per_dir:
+                            try:
+                                discovery_queue.put_nowait(current_dir)
+                            except asyncio.QueueFull:
+                                pending_discovery.append(current_dir)
+                            yielded_early = True
+                            break
 
                         # Update discovery state for progress monitor visibility
                         self._discovery_dirs_found = total_dirs_discovered
@@ -1581,8 +1654,12 @@ class AsyncEFSPurger:
                                     discovery_done.set()
                                     break
 
-                    await self.update_stats(dirs_scanned=1)
-                    self.rate_tracker.record("removing_empty_dirs", "dirs", 1)
+                    if not yielded_early:
+                        # Drain pending after finishing directory (deadlock fix)
+                        _drain_pending_to_queue(discovery_queue, pending_discovery)
+
+                        await self.update_stats(dirs_scanned=1)
+                        self.rate_tracker.record("removing_empty_dirs", "dirs", 1)
 
                 except PermissionError:
                     discovery_errors += 1
@@ -1593,10 +1670,11 @@ class AsyncEFSPurger:
                     discovery_errors += 1
                     self.logger.debug(f"Error scanning {current_dir}: {e}")
 
-                # Mark this directory as fully processed
-                pending_dirs -= 1
-                if pending_dirs <= 0:
-                    discovery_done.set()
+                # Mark this directory as fully processed (skip when we re-queued it for later)
+                if not yielded_early:
+                    pending_dirs -= 1
+                    if pending_dirs <= 0:
+                        discovery_done.set()
 
                 # Log progress periodically during discovery (every 50,000 dirs)
                 current_milestone = (total_dirs_discovered // 50000) * 50000
@@ -1646,6 +1724,9 @@ class AsyncEFSPurger:
                 "memory_mb": round(get_memory_usage_mb(), 1),
             },
         )
+
+        # Free discovery-only state before Phase 1b to reduce memory pressure
+        discovered_dirs.clear()
 
         if not dirs_by_depth:
             log_with_context(self.logger, "info", "No subdirectories found, skipping empty dir purge", {})
@@ -1906,12 +1987,20 @@ class AsyncEFSPurger:
                 },
             )
 
-        # Free any remaining depth levels (e.g. if rate limit stopped us early)
+        # Drain discovery queue so references are released (may have items if discovery aborted early)
+        while True:
+            try:
+                discovery_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        # Free all Phase 1 directory data
         dirs_by_depth.clear()
         del dirs_by_depth
 
-        # Force GC after releasing all directory data
-        gc.collect()
+        # Aggressive GC so Phase 2 starts with lower baseline memory
+        for _ in range(3):
+            gc.collect()
 
         log_with_context(
             self.logger,
@@ -1978,14 +2067,48 @@ class AsyncEFSPurger:
         - Discovered subdirectories are pushed back onto the queue
         - Workers exit when queue is drained (tracked via pending_dirs counter)
         - queue_maxsize bounds memory: producers block when full (back-pressure)
+
+        Checkpoint/resume: When memory exceeds 95% and checkpoint_file is set,
+        workers save pending dirs and exit. Main saves checkpoint and raises
+        CheckpointExit. Use --resume to continue from checkpoint.
         """
         scan_queue: asyncio.Queue[Path] = (
             asyncio.Queue(maxsize=self.queue_maxsize) if self.queue_maxsize > 0 else asyncio.Queue()
         )
-        scan_queue.put_nowait(self.root_path)
-        pending_dirs = 1  # root is in the queue
+        pending_dirs = 0
         pending_lock = asyncio.Lock()
         scan_done = asyncio.Event()
+
+        # Resume from checkpoint if requested
+        if self.resume and self.checkpoint_file and self.checkpoint_file.exists():
+            cp = load_checkpoint(self.checkpoint_file)
+            if cp:
+                pending_paths = [Path(p) for p in cp["pending_dirs"]]
+                for p in pending_paths:
+                    try:
+                        scan_queue.put_nowait(p)
+                    except asyncio.QueueFull:
+                        break  # Should not happen with bounded queue
+                pending_dirs = len(pending_paths)
+                # Restore stats for progress reporting
+                for k, v in cp.get("stats", {}).items():
+                    if k in self.stats and isinstance(self.stats[k], (int, float)):
+                        self.stats[k] = v
+                log_with_context(
+                    self.logger,
+                    "info",
+                    "Phase 2: Resuming from checkpoint",
+                    {
+                        "checkpoint_file": str(self.checkpoint_file),
+                        "pending_dirs": pending_dirs,
+                        "files_scanned_so_far": self.stats.get("files_scanned", 0),
+                        "dirs_scanned_so_far": self.stats.get("dirs_scanned", 0),
+                    },
+                )
+        if pending_dirs == 0:
+            # Not resuming or checkpoint invalid - start from root
+            scan_queue.put_nowait(self.root_path)
+            pending_dirs = 1
 
         # Normalize root path once for Phase 3 empty-dir checks
         try:
@@ -2012,8 +2135,26 @@ class AsyncEFSPurger:
         async def _scan_worker(worker_id: int) -> None:
             """Worker that scans directories from queue and processes files."""
             nonlocal pending_dirs
+            pending_subdirs: list[Path] = []  # Per-worker buffer when queue full (avoids deadlock)
+            directory: Path | None = None  # Current dir being processed (for checkpoint)
 
             while not scan_done.is_set():
+                # Checkpoint requested: contribute our pending and exit
+                if self._checkpoint_requested:
+                    async with self._checkpoint_lock:
+                        if directory is not None:
+                            self._checkpoint_pending.append(directory)
+                        self._checkpoint_pending.extend(pending_subdirs)
+                    scan_done.set()
+                    break
+
+                # Drain pending subdirs into queue so we never block on put (deadlock fix)
+                _drain_pending_to_queue(scan_queue, pending_subdirs)
+                if scan_done.is_set():
+                    async with pending_lock:
+                        pending_dirs -= len(pending_subdirs)
+                    break
+
                 # Get next directory from queue
                 try:
                     directory = await asyncio.wait_for(scan_queue.get(), timeout=1.0)
@@ -2039,8 +2180,13 @@ class AsyncEFSPurger:
                     # This prevents the 37-min hang that occurred with list(os.scandir())
                     # on directories with 700K+ entries.
                     async for batch in async_scandir_batched(directory, self.scandir_executor):
-                        # Check memory pressure between batches
+                        # Check memory pressure between batches (may set _checkpoint_requested)
                         await self.check_memory_pressure()
+                        if self._checkpoint_requested:
+                            async with self._checkpoint_lock:
+                                self._checkpoint_pending.append(directory)
+                                self._checkpoint_pending.extend(pending_subdirs)
+                            break
 
                         for entry in batch:
                             entry_path = Path(entry.path)
@@ -2066,10 +2212,13 @@ class AsyncEFSPurger:
                                                 file_task_buffer.clear()
 
                                 elif entry.is_dir(follow_symlinks=False):
-                                    # Push subdirectory onto queue for another worker to process
+                                    # Push subdirectory onto queue; buffer if full to avoid deadlock
                                     async with pending_lock:
                                         pending_dirs += 1
-                                    await _queue_put_yield_on_full(scan_queue, entry_path)
+                                    try:
+                                        scan_queue.put_nowait(entry_path)
+                                    except asyncio.QueueFull:
+                                        pending_subdirs.append(entry_path)
 
                                 else:
                                     # Special file types: sockets, FIFOs, block/char devices, etc.
@@ -2112,6 +2261,9 @@ class AsyncEFSPurger:
                                     self.empty_dirs.add(directory)
                         except (FileNotFoundError, PermissionError, OSError):
                             pass  # Directory gone or inaccessible
+
+                    # Drain pending subdirs after finishing directory (deadlock fix)
+                    _drain_pending_to_queue(scan_queue, pending_subdirs)
 
                 except PermissionError as e:
                     log_with_context(
@@ -2160,6 +2312,41 @@ class AsyncEFSPurger:
                 if not w.done():
                     w.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
+
+        # If checkpoint was requested (memory critical), save and exit for resume
+        if self._checkpoint_requested and self.checkpoint_file:
+            # Collect all pending dirs: queue contents + workers' contributions
+            all_pending: list[Path] = []
+            while True:
+                try:
+                    p = scan_queue.get_nowait()
+                    all_pending.append(p)
+                except asyncio.QueueEmpty:
+                    break
+            async with self._checkpoint_lock:
+                all_pending.extend(self._checkpoint_pending)
+            # Dedupe not needed - BFS can have same dir from different parents, but we'll process
+            # each once; duplicates just mean redundant scans. Keep order for simplicity.
+            save_checkpoint(
+                self.checkpoint_file,
+                str(self.root_path),
+                [str(p) for p in all_pending],
+                dict(self.stats),
+                {
+                    "max_age_days": self.max_age_days,
+                    "root_path": str(self.root_path),
+                },
+            )
+            log_with_context(
+                self.logger,
+                "info",
+                "Checkpoint saved, exit for resume. Run with --resume to continue.",
+                {
+                    "checkpoint_file": str(self.checkpoint_file),
+                    "pending_dirs_count": len(all_pending),
+                },
+            )
+            raise CheckpointExit("Memory critical, checkpoint saved. Run with --resume to continue.")
 
     async def _background_progress_reporter(self) -> None:
         """
@@ -2456,6 +2643,7 @@ class AsyncEFSPurger:
                 "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
                 "max_concurrent_discovery": self.max_concurrent_discovery,
                 "queue_maxsize": self.queue_maxsize,
+                "max_entries_per_dir": self.max_entries_per_dir,
                 "scandir_executor_threads": self.scandir_executor._max_workers,
                 "event_loop": event_loop_type,
             },
@@ -2472,9 +2660,8 @@ class AsyncEFSPurger:
 
         try:
             # Phase 1: Remove empty directories FIRST (standalone, efficient walker)
-            # This runs before file scanning to reduce the directory tree size,
-            # making subsequent file scanning faster and lighter on memory.
-            if self.remove_empty_dirs:
+            # Skip when resuming - we already ran Phase 1 before the checkpoint.
+            if self.remove_empty_dirs and not self.resume:
                 await self._purge_empty_directories_standalone()
 
             # Phase 2: Scan and purge files (BFS queue + worker pool)
@@ -2624,6 +2811,9 @@ async def async_main(
     max_discovery_dirs: int = 0,
     max_concurrent_discovery: int = 20,
     queue_maxsize: int = 10000,
+    max_entries_per_dir: int = 0,
+    checkpoint_file: str | Path | None = None,
+    resume: bool = False,
 ) -> dict:
     """
     Async entry point for the purger.
@@ -2643,6 +2833,9 @@ async def async_main(
         max_discovery_dirs: Maximum directories to discover in Phase 1a (0 = auto based on memory)
         max_concurrent_discovery: Maximum concurrent directory/file scan workers (default: 20)
         queue_maxsize: Maximum size of Phase 1a and Phase 2 directory queues (0 = unbounded, default: 10000)
+        max_entries_per_dir: Cap entries per directory in Phase 1a (0 = no limit) to avoid one huge dir stalling workers
+        checkpoint_file: Path to save checkpoint when memory critical (enables auto-checkpoint)
+        resume: If True, load checkpoint and resume Phase 2 from saved state
 
     Returns:
         Operation statistics
@@ -2662,6 +2855,9 @@ async def async_main(
         max_discovery_dirs=max_discovery_dirs,
         max_concurrent_discovery=max_concurrent_discovery,
         queue_maxsize=queue_maxsize,
+        max_entries_per_dir=max_entries_per_dir,
+        checkpoint_file=checkpoint_file,
+        resume=resume,
     )
 
     return await purger.purge()

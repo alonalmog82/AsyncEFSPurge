@@ -95,6 +95,9 @@ options:
   --max-concurrent-discovery N  Maximum concurrent scan workers for Phase 1a and Phase 2 (default: 20)
   --max-discovery-dirs N    Maximum directories to discover in Phase 1a (0 = auto based on memory limit)
   --queue-maxsize N         Maximum size of Phase 1a and Phase 2 directory queues (0 = unbounded, default: 10000)
+  --max-entries-per-dir N   Cap entries processed per directory in Phase 1a (0 = no limit). When set (e.g. 50000), huge directories are re-queued and scanned in chunks to avoid stalling workers.
+  --checkpoint-file PATH    Path to save checkpoint when memory is critical (95%%+). Enables graceful exit for resume. Use with --resume to continue.
+  --resume                  Resume Phase 2 from checkpoint file (requires --checkpoint-file). Skips Phase 1.
   --dry-run                 Don't actually delete files, just report what would be deleted
   --remove-empty-dirs       Remove empty directories (two-pass: Phase 1 before scan, Phase 3 after scan)
   --max-empty-dirs-to-delete N  Maximum empty directories to delete per run (0 = unlimited, default: 500)
@@ -444,6 +447,11 @@ If you're purging files where accidental deletion would be catastrophic, conside
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing, and contribution guidelines.
 
+### Docker snapshots and releases
+
+- **PR snapshots:** For every push to a pull request, a short-lived snapshot image is built and pushed to GHCR. Use it to test the branch before merge: `docker pull ghcr.io/<owner>/asyncefspurge:snapshot-pr-<PR number>` (e.g. `snapshot-pr-33`). Branch-based tags (e.g. `snapshot-fix-phase2-queue-deadlock`) are also available. These images are overwritten on each push and are not retained like release images.
+- **Releases:** When a PR is merged to `main`, a GitHub release is created (tag from `pyproject.toml` version) and the release container is built and pushed to GHCR (same version tag and `latest`).
+
 ### Quick Dev Setup
 
 ```bash
@@ -546,7 +554,7 @@ Start with defaults and increase if you're not saturating network/IOPS. See [CON
 Starting with v2.0, both Phase 1a (empty directory discovery) and Phase 2 (file scanning) use a flat BFS queue with persistent worker coroutines. This eliminates the recursive coroutine explosion that caused OOM on deep directory trees in earlier versions.
 
 **How It Works:**
-- A shared `asyncio.Queue` holds directories to scan (bounded by `--queue-maxsize` when > 0)
+- A shared `asyncio.Queue` holds directories to scan (bounded by `--queue-maxsize` when > 0). When the queue is full, workers buffer subdirs in a per-worker pending list and drain when they finish the current directory, avoiding deadlock (no blocking on put).
 - N worker coroutines (controlled by `--max-concurrent-discovery`, default: 20) pull directories from the queue
 - Each worker uses `async_scandir_batched()` to stream directory entries without blocking
 - Discovered subdirectories are pushed back onto the queue
@@ -559,7 +567,7 @@ Starting with v2.0, both Phase 1a (empty directory discovery) and Phase 2 (file 
 - Streaming scandir prevents hangs on directories with 100K+ entries
 - Memory bounded by queue frontier (much smaller than total directory count)
 
-**Environment Variables:** `EFSPURGE_MAX_CONCURRENT_DISCOVERY`, `EFSPURGE_QUEUE_MAXSIZE`
+**Environment Variables:** `EFSPURGE_MAX_CONCURRENT_DISCOVERY`, `EFSPURGE_QUEUE_MAXSIZE`, `EFSPURGE_MAX_ENTRIES_PER_DIR`
 
 The `--queue-maxsize` parameter (default: 10000) bounds the directory queues in Phase 1a and Phase 2. When discovery outpaces processing, producers block when the queue is full, preventing unbounded memory growth and OOM.
 
@@ -612,6 +620,7 @@ You can identify this pattern in the logs when Phase 1a progress reports show:
 - The outer BFS loop checks memory between directories and aborts at 95%
 - `max_discovery_dirs` caps total directories discovered (auto-calculated from `--memory-limit-mb`)
 - After any abort, Phase 1b proceeds with the partial tree already discovered
+- **If Phase 1a discovery stalls** (queue stuck near full, `dirs_per_second` drops to near zero for a long time): set `--max-entries-per-dir 50000` or `EFSPURGE_MAX_ENTRIES_PER_DIR=50000` so very large directories are processed in chunks and re-queued instead of monopolizing a worker.
 
 **Estimating memory usage:**
 At ~2-3 KB per discovered directory, a 4500 MB memory limit allows roughly 1.5-2M directories before the 90% threshold triggers. The auto-calculated `max_discovery_dirs` uses a conservative estimate of 500 bytes per path, so the memory safety checks will typically fire before the discovery cap is reached.
@@ -625,6 +634,20 @@ efspurge /data --max-age-days 30 --remove-empty-dirs \
 ```
 
 **Key insight:** If memory spikes with `dirs_scanned` but `files_scanned=0`, try reducing `--max-concurrent-discovery` (directory traversal workers) or `--memory-limit-mb`.
+
+### Checkpoint / resume (memory critical exit)
+
+When memory exceeds 95%, the purger can save Phase 2 state to a checkpoint file and exit (exit code 75) so you can resume later instead of OOM-killing the process.
+
+**Environment variables:** `EFSPURGE_CHECKPOINT_FILE`, `EFSPURGE_RESUME`
+
+```bash
+# First run: save checkpoint when memory is critical (95%+)
+efspurge /data --max-age-days 30 --checkpoint-file /tmp/efspurge-cp.json
+
+# Resume from checkpoint (skips Phase 1, continues Phase 2 from pending dirs)
+efspurge /data --max-age-days 30 --checkpoint-file /tmp/efspurge-cp.json --resume
+```
 
 ### Slow Performance
 

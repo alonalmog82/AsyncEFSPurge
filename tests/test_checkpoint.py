@@ -173,3 +173,76 @@ async def test_cli_resume_env_var(temp_dir):
 
             args = parse_args()
             assert args.resume is True
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint resume with more paths than queue_maxsize (loader task fix)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_resume_completes_when_pending_exceeds_queue_maxsize(temp_dir, tmp_path):
+    """Resume with more pending dirs than queue_maxsize completes (loader task feeds queue)."""
+    # Create 25 subdirs (each with a file). queue_maxsize=10, so we need loader to feed the rest.
+    for i in range(25):
+        subdir = temp_dir / f"dir_{i}"
+        subdir.mkdir()
+        (subdir / "file.txt").write_text("content")
+
+    cp_file = tmp_path / "checkpoint.json"
+    # Simulate checkpoint with 25 pending dirs (root + 25 subdirs)
+    pending_paths = [str(temp_dir)] + [str(temp_dir / f"dir_{i}") for i in range(25)]
+    save_checkpoint(
+        filepath=cp_file,
+        root_path=str(temp_dir),
+        pending_dirs=pending_paths,
+        stats={"files_scanned": 0, "dirs_scanned": 0},
+        config={"max_age_days": 30},
+    )
+
+    purger = AsyncEFSPurger(
+        root_path=str(temp_dir),
+        max_age_days=30,
+        dry_run=True,
+        checkpoint_file=cp_file,
+        resume=True,
+        queue_maxsize=10,  # Smaller than 25
+        max_concurrent_discovery=5,
+    )
+
+    await purger.purge()
+
+    # Must complete without hanging (loader feeds queue when pending > queue_maxsize).
+    # Due to overlap between checkpoint paths and discovered subdirs, we may scan
+    # some dirs twice; the key is we finish and process all files.
+    assert purger.stats["files_scanned"] >= 25
+    assert purger.stats["dirs_scanned"] >= 26
+    # Checkpoint should be removed after successful purge
+    assert not cp_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_file_removed_after_successful_purge(temp_dir, tmp_path):
+    """Checkpoint file is removed when purge completes successfully."""
+    (temp_dir / "file.txt").write_text("content")
+
+    cp_file = tmp_path / "checkpoint.json"
+    save_checkpoint(
+        filepath=cp_file,
+        root_path=str(temp_dir),
+        pending_dirs=[str(temp_dir)],
+        stats={"files_scanned": 0, "dirs_scanned": 0},
+        config={"max_age_days": 30},
+    )
+
+    purger = AsyncEFSPurger(
+        root_path=str(temp_dir),
+        max_age_days=30,
+        dry_run=True,
+        checkpoint_file=cp_file,
+        resume=True,
+    )
+
+    await purger.purge()
+
+    assert not cp_file.exists(), "Checkpoint file should be removed after successful purge"

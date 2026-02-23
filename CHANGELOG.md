@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.3] - Unreleased
+
+### Fixed
+- **Checkpoint resume bug** — When resuming from a checkpoint with more pending directories than `queue_maxsize`, the resume logic previously used `put_nowait()` in a loop and broke on `QueueFull`, losing all paths beyond the first `queue_maxsize`. This caused a permanent hang (workers waiting for work that was never loaded, `active_directories_count: 0`, `pending_dirs` never reaching 0). A loader task now feeds remaining paths into the queue via `await put()`, blocking when full and providing back-pressure as workers drain.
+- **Checkpoint file handling** — The checkpoint file is now removed after a successful purge completion so that a future run with `--resume` won't mistakenly resume from stale state.
+
 ## [2.0.2] - Unreleased
 
 ### Fixed

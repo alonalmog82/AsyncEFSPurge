@@ -2080,15 +2080,22 @@ class AsyncEFSPurger:
         scan_done = asyncio.Event()
 
         # Resume from checkpoint if requested
+        # When checkpoint has more paths than queue_maxsize, we must feed the queue
+        # incrementally via a loader task. Otherwise put_nowait breaks on QueueFull
+        # and we lose the remaining paths, causing a permanent hang.
+        remaining_checkpoint_paths: list[Path] = []
         if self.resume and self.checkpoint_file and self.checkpoint_file.exists():
             cp = load_checkpoint(self.checkpoint_file)
             if cp:
                 pending_paths = [Path(p) for p in cp["pending_dirs"]]
+                loaded_count = 0
                 for p in pending_paths:
                     try:
                         scan_queue.put_nowait(p)
+                        loaded_count += 1
                     except asyncio.QueueFull:
-                        break  # Should not happen with bounded queue
+                        remaining_checkpoint_paths = pending_paths[loaded_count:]
+                        break
                 pending_dirs = len(pending_paths)
                 # Restore stats for progress reporting
                 for k, v in cp.get("stats", {}).items():
@@ -2101,6 +2108,8 @@ class AsyncEFSPurger:
                     {
                         "checkpoint_file": str(self.checkpoint_file),
                         "pending_dirs": pending_dirs,
+                        "loaded_into_queue": loaded_count,
+                        "remaining_to_load": len(remaining_checkpoint_paths),
                         "files_scanned_so_far": self.stats.get("files_scanned", 0),
                         "dirs_scanned_so_far": self.stats.get("dirs_scanned", 0),
                     },
@@ -2299,12 +2308,22 @@ class AsyncEFSPurger:
                         if pending_dirs == 0:
                             scan_done.set()
 
-        # Launch workers
-        workers = [asyncio.create_task(_scan_worker(i)) for i in range(num_workers)]
+        # Loader task: feed remaining checkpoint paths into queue as workers drain it.
+        # Uses await put() which blocks when queue is full, providing back-pressure.
+        async def _checkpoint_loader() -> None:
+            for p in remaining_checkpoint_paths:
+                await scan_queue.put(p)
 
-        # Wait for all workers to complete
+        # Launch workers and optionally the checkpoint loader
+        workers = [asyncio.create_task(_scan_worker(i)) for i in range(num_workers)]
+        loader_task = asyncio.create_task(_checkpoint_loader()) if remaining_checkpoint_paths else None
+
+        # Wait for workers and loader to complete
         try:
-            await asyncio.gather(*workers)
+            if loader_task is not None:
+                await asyncio.gather(*workers, loader_task)
+            else:
+                await asyncio.gather(*workers)
         finally:
             # Ensure clean shutdown: signal workers and cancel any still running
             scan_done.set()
@@ -2677,6 +2696,25 @@ class AsyncEFSPurger:
             # Run the existing post-order deletion to catch these.
             if self.remove_empty_dirs:
                 await self._remove_empty_directories()
+
+            # Purge completed successfully - remove checkpoint file so a future
+            # run with --resume won't mistakenly resume from stale state.
+            if self.checkpoint_file and self.checkpoint_file.exists():
+                try:
+                    self.checkpoint_file.unlink()
+                    log_with_context(
+                        self.logger,
+                        "info",
+                        "Checkpoint file removed after successful purge",
+                        {"checkpoint_file": str(self.checkpoint_file)},
+                    )
+                except OSError as e:
+                    log_with_context(
+                        self.logger,
+                        "warning",
+                        "Could not remove checkpoint file after successful purge",
+                        {"checkpoint_file": str(self.checkpoint_file), "error": str(e)},
+                    )
         finally:
             # Cancel background reporter
             progress_task.cancel()

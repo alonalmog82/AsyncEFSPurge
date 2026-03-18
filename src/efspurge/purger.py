@@ -1021,10 +1021,11 @@ class AsyncEFSPurger:
                     await self.update_stats(errors=1)
                     directory_queue.task_done()
 
-        # Start workers (number limited by semaphore - workers wait for semaphore slots)
-        # Number of workers = semaphore limit ensures we use all available concurrency
-        # Memory bounded by: num_workers * memory_per_task = semaphore_limit * memory_per_task
-        num_workers = self.max_concurrency_deletion
+        # Worker count is capped at max_concurrent_discovery (default: 20), not max_concurrency_deletion.
+        # Each worker calls async_scandir(parent) after rmdir to check for cascading empty parents.
+        # Spawning max_concurrency_deletion (e.g. 4000) workers floods the scandir executor and
+        # causes multi-minute hangs. The deletion_semaphore already caps concurrent rmdir I/O.
+        num_workers = self.max_concurrent_discovery
         workers = [asyncio.create_task(worker()) for _ in range(num_workers)]
 
         # Producer: Feed directories to queue in batches, checking memory/rate limits
@@ -1309,8 +1310,8 @@ class AsyncEFSPurger:
                         await self.update_stats(errors=1)
                         parent_queue.task_done()
 
-            # Start workers (number limited by semaphore)
-            num_workers = self.max_concurrency_deletion
+            # Same cap as first pass: use max_concurrent_discovery, not max_concurrency_deletion.
+            num_workers = self.max_concurrent_discovery
             workers = [asyncio.create_task(parent_worker()) for _ in range(num_workers)]
 
             # Producer: Feed parents to queue
@@ -2309,10 +2310,30 @@ class AsyncEFSPurger:
                             scan_done.set()
 
         # Loader task: feed remaining checkpoint paths into queue as workers drain it.
-        # Uses await put() which blocks when queue is full, providing back-pressure.
+        # When queue is full we sleep briefly and recheck _checkpoint_requested so we don't
+        # block forever when workers have exited (memory-critical path). Paths not yet put
+        # are stored in loader_remaining for inclusion in the checkpoint.
+        loader_remaining: list[Path] = []
+
         async def _checkpoint_loader() -> None:
-            for p in remaining_checkpoint_paths:
-                await scan_queue.put(p)
+            for i, p in enumerate(remaining_checkpoint_paths):
+                if self._checkpoint_requested or scan_done.is_set():
+                    loader_remaining.extend(remaining_checkpoint_paths[i:])
+                    return
+                try:
+                    scan_queue.put_nowait(p)
+                except asyncio.QueueFull:
+                    # Back-pressure: wait and recheck so we can exit when checkpoint requested
+                    while True:
+                        if self._checkpoint_requested or scan_done.is_set():
+                            loader_remaining.extend(remaining_checkpoint_paths[i:])
+                            return
+                        await asyncio.sleep(0.1)
+                        try:
+                            scan_queue.put_nowait(p)
+                            break
+                        except asyncio.QueueFull:
+                            continue
 
         # Launch workers and optionally the checkpoint loader
         workers = [asyncio.create_task(_scan_worker(i)) for i in range(num_workers)]
@@ -2330,11 +2351,15 @@ class AsyncEFSPurger:
             for w in workers:
                 if not w.done():
                     w.cancel()
+            if loader_task is not None and not loader_task.done():
+                loader_task.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
+            if loader_task is not None:
+                await asyncio.gather(loader_task, return_exceptions=True)
 
         # If checkpoint was requested (memory critical), save and exit for resume
         if self._checkpoint_requested and self.checkpoint_file:
-            # Collect all pending dirs: queue contents + workers' contributions
+            # Collect all pending dirs: queue contents + workers' contributions + loader's remainder
             all_pending: list[Path] = []
             while True:
                 try:
@@ -2344,6 +2369,7 @@ class AsyncEFSPurger:
                     break
             async with self._checkpoint_lock:
                 all_pending.extend(self._checkpoint_pending)
+            all_pending.extend(loader_remaining)
             # Dedupe not needed - BFS can have same dir from different parents, but we'll process
             # each once; duplicates just mean redundant scans. Keep order for simplicity.
             save_checkpoint(

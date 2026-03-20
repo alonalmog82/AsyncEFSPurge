@@ -86,9 +86,7 @@ def test_load_phase1a_checkpoint_invalid_json_returns_none(tmp_path):
 def test_load_phase1a_checkpoint_wrong_phase_returns_none(tmp_path):
     """load_phase1a_checkpoint returns None when phase is not phase1a."""
     cp = tmp_path / "cp.json"
-    cp.write_text(
-        json.dumps({"version": CHECKPOINT_VERSION, "phase": "phase2", "pending_dirs": ["/a"]})
-    )
+    cp.write_text(json.dumps({"version": CHECKPOINT_VERSION, "phase": "phase2", "pending_dirs": ["/a"]}))
     assert load_phase1a_checkpoint(cp) is None
 
 

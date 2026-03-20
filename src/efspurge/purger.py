@@ -1772,11 +1772,14 @@ class AsyncEFSPurger:
         # using a loader task (same pattern as Phase 2 checkpoint loader).
         phase1a_loader_task: asyncio.Task | None = None
         if remaining_phase1a_pending:
+
             async def _phase1a_loader() -> None:
                 for p in remaining_phase1a_pending:
                     if memory_abort or discovery_done.is_set():
                         if memory_abort and self.dir_deletion_checkpoint_file:
-                            phase1a_checkpoint_pending.extend(remaining_phase1a_pending[remaining_phase1a_pending.index(p):])
+                            phase1a_checkpoint_pending.extend(
+                                remaining_phase1a_pending[remaining_phase1a_pending.index(p) :]
+                            )
                         return
                     while True:
                         if memory_abort or discovery_done.is_set():

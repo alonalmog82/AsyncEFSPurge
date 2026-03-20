@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.4] - Unreleased
+
+### Fixed
+- **Phase 3 worker count causes multi-minute hangs** — `_remove_empty_directories()` (Phase 3, post-scan empty dir cleanup) used `max_concurrency_deletion` as the number of worker coroutines in both the first pass and each cascading iteration. With values like 4000, this spawned thousands of tasks simultaneously, each calling `async_scandir(parent)` to check whether the parent became empty. The scandir executor only has `scandir_executor_threads` (default: 100) slots, so 3,900+ coroutines queued waiting for executor slots — saturating the thread pool and stalling progress for minutes per iteration. The `deletion_semaphore` already bounds concurrent `rmdir` I/O; worker count is now capped at `max_concurrent_discovery` (default: 20), consistent with Phase 1a/1b.
+- **Checkpoint loader deadlock on memory-critical exit** — When Phase 2 hit the 95% memory threshold while resuming from a checkpoint with remaining paths still being fed by the loader task, the loader blocked forever on `await scan_queue.put()` because all workers had exited (nothing draining the queue). The main coroutine waited on `gather(workers, loader_task)`, which never returned, so the checkpoint-save code was never reached. The process appeared alive (progress reporter kept logging "POSSIBLE HANG DETECTED") but made no progress. The loader now checks `_checkpoint_requested` and `scan_done` before each put, exits early when set, and saves unloaded paths in `loader_remaining` for inclusion in the checkpoint. The `finally` block now also cancels the loader task on any shutdown path.
+
 ## [2.0.3] - 2026-03-13
 
 ### Fixed

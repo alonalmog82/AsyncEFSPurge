@@ -5,7 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.0.4] - Unreleased
+## [2.1.0] - Unreleased
+
+### Added
+- **Phase 1a checkpoint/resume (`--dir-deletion-checkpoint-file` / `EFSPURGE_DIR_DELETION_CHECKPOINT_FILE`)** — When Phase 1a (directory discovery) exhausts memory mid-BFS, it now saves the unscanned BFS frontier to a checkpoint file, runs Phase 1b immediately on whatever empty dirs were found so far, then exits 75. On the next run with `--dir-deletion-resume` / `EFSPURGE_DIR_DELETION_RESUME=1`, discovery resumes from the saved frontier rather than restarting from the root. This enables progressive empty-dir cleanup across arbitrarily large directory trees without requiring the full tree to fit in memory at once. Uses a separate file from the Phase 2 `--checkpoint-file` to avoid conflicts with the daily purge job.
+
+### Fixed
+- **Phase 2 empty dirs lost on checkpoint** — When Phase 2 hit the 95% memory threshold mid-scan and saved a checkpoint, `self.empty_dirs` (directories found to be empty during the scan, used by Phase 3) was not included in the checkpoint. On resume, Phase 3 had no knowledge of dirs that became empty during the previous run. Empty dirs are now saved in the checkpoint under `empty_dirs` and restored on resume, so Phase 3 accumulates all empty dirs across multiple checkpoint/resume cycles.
+
+## [2.0.4] - 2026-03-20
 
 ### Fixed
 - **Phase 3 worker count causes multi-minute hangs** — `_remove_empty_directories()` (Phase 3, post-scan empty dir cleanup) used `max_concurrency_deletion` as the number of worker coroutines in both the first pass and each cascading iteration. With values like 4000, this spawned thousands of tasks simultaneously, each calling `async_scandir(parent)` to check whether the parent became empty. The scandir executor only has `scandir_executor_threads` (default: 100) slots, so 3,900+ coroutines queued waiting for executor slots — saturating the thread pool and stalling progress for minutes per iteration. The `deletion_semaphore` already bounds concurrent `rmdir` I/O; worker count is now capped at `max_concurrent_discovery` (default: 20), consistent with Phase 1a/1b.

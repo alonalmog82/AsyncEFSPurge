@@ -168,6 +168,27 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--dir-deletion-checkpoint-file",
+        type=str,
+        default=os.getenv("EFSPURGE_DIR_DELETION_CHECKPOINT_FILE", ""),
+        help=(
+            "Path to save/load Phase 1a (directory discovery) checkpoint when memory is critical. "
+            "On memory abort: saves BFS frontier, runs Phase 1b on dirs found so far, exits 75. "
+            "Use with --dir-deletion-resume to continue from where discovery stopped."
+        ),
+    )
+
+    parser.add_argument(
+        "--dir-deletion-resume",
+        action="store_true",
+        default=os.getenv("EFSPURGE_DIR_DELETION_RESUME", "").lower() in ("1", "true", "yes"),
+        help=(
+            "Resume Phase 1a directory discovery from checkpoint (requires --dir-deletion-checkpoint-file). "
+            "Restores the BFS frontier and continues scanning from where the previous run stopped."
+        ),
+    )
+
+    parser.add_argument(
         "--no-uvloop",
         action="store_true",
         default=os.getenv("EFSPURGE_UVLOOP", "true").lower() in ("0", "false", "no"),
@@ -237,6 +258,8 @@ def main() -> None:
                 max_entries_per_dir=args.max_entries_per_dir,
                 checkpoint_file=args.checkpoint_file or None,
                 resume=args.resume,
+                dir_deletion_checkpoint_file=args.dir_deletion_checkpoint_file or None,
+                dir_deletion_resume=args.dir_deletion_resume,
             ),
             loop_factory=loop_factory,
         )
@@ -246,7 +269,11 @@ def main() -> None:
 
     except CheckpointExit as e:
         print(f"\n{e}", file=sys.stderr)
-        print("Run with --resume to continue from checkpoint.", file=sys.stderr)
+        print(
+            "Run with --resume to continue Phase 2 from checkpoint, "
+            "or --dir-deletion-resume to continue Phase 1a directory discovery.",
+            file=sys.stderr,
+        )
         sys.exit(75)  # EX_TEMPFAIL - checkpoint saved, resume suggested
     except KeyboardInterrupt:
         print("\nOperation cancelled by user", file=sys.stderr)

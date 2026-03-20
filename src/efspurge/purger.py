@@ -13,7 +13,7 @@ from pathlib import Path
 import aiofiles.os
 
 from . import __version__
-from .checkpoint import load_checkpoint, save_checkpoint
+from .checkpoint import load_checkpoint, load_phase1a_checkpoint, save_checkpoint, save_phase1a_checkpoint
 from .logging import log_with_context, setup_logging
 
 # Maximum number of directories to discover in Phase 1a.
@@ -442,6 +442,8 @@ class AsyncEFSPurger:
         max_entries_per_dir: int = 0,
         checkpoint_file: str | Path | None = None,
         resume: bool = False,
+        dir_deletion_checkpoint_file: str | Path | None = None,
+        dir_deletion_resume: bool = False,
     ):
         """
         Initialize the async EFS purger.
@@ -467,6 +469,9 @@ class AsyncEFSPurger:
                 stalling workers.
             checkpoint_file: Path to save checkpoint when memory is critical (enables auto-checkpoint on OOM risk).
             resume: If True, load checkpoint from checkpoint_file and resume Phase 2 from saved state.
+            dir_deletion_checkpoint_file: Path to save/load Phase 1a BFS frontier checkpoint on memory abort.
+                On abort: saves remaining dirs to scan, runs Phase 1b on dirs found so far, exits 75.
+            dir_deletion_resume: If True, resume Phase 1a discovery from dir_deletion_checkpoint_file.
 
         Raises:
             ValueError: If invalid parameters are provided
@@ -574,6 +579,8 @@ class AsyncEFSPurger:
         self.max_entries_per_dir = max_entries_per_dir
         self.checkpoint_file = Path(checkpoint_file) if checkpoint_file else None
         self.resume = resume
+        self.dir_deletion_checkpoint_file = Path(dir_deletion_checkpoint_file) if dir_deletion_checkpoint_file else None
+        self.dir_deletion_resume = dir_deletion_resume
 
         # Compute discovery limit: if explicitly set use that, otherwise derive from memory budget.
         # Each Path object is ~400-600 bytes, so we allow roughly 60% of the memory budget for paths.
@@ -1461,15 +1468,55 @@ class AsyncEFSPurger:
         discovery_queue: asyncio.Queue[Path] = (
             asyncio.Queue(maxsize=self.queue_maxsize) if self.queue_maxsize > 0 else asyncio.Queue()
         )
-        discovery_queue.put_nowait(self.root_path)
         discovery_errors = 0
         total_dirs_discovered = 0
         root_depth = len(self.root_path.parts)
         # When max_entries_per_dir is set we may re-queue a directory; discovered_dirs avoids double-counting.
-        discovered_dirs: set[Path] = {self.root_path}
+        discovered_dirs: set[Path] = set()
         # pending_dirs tracks dirs enqueued but not yet fully processed.
         # When it reaches 0 all reachable directories have been scanned.
-        pending_dirs = 1  # root is already in the queue
+        pending_dirs = 0
+
+        # Resume from Phase 1a checkpoint if requested, otherwise start from root.
+        # remaining_phase1a_pending holds checkpoint dirs that didn't fit in the queue;
+        # they are fed in by a loader task running alongside the discovery workers.
+        remaining_phase1a_pending: list[Path] = []
+        if self.dir_deletion_resume and self.dir_deletion_checkpoint_file:
+            cp1a = load_phase1a_checkpoint(self.dir_deletion_checkpoint_file)
+            if cp1a:
+                resume_dirs = [Path(p) for p in cp1a["pending_dirs"]]
+                loaded = 0
+                for p in resume_dirs:
+                    try:
+                        discovery_queue.put_nowait(p)
+                        loaded += 1
+                    except asyncio.QueueFull:
+                        break
+                remaining_phase1a_pending = resume_dirs[loaded:]
+                pending_dirs = len(resume_dirs)
+                discovered_dirs = set(resume_dirs)  # prevent re-queuing
+                log_with_context(
+                    self.logger,
+                    "info",
+                    "Phase 1a: Resuming from checkpoint",
+                    {
+                        "checkpoint_file": str(self.dir_deletion_checkpoint_file),
+                        "pending_dirs": pending_dirs,
+                        "loaded_into_queue": loaded,
+                        "remaining_to_load": len(remaining_phase1a_pending),
+                    },
+                )
+
+        if pending_dirs == 0:
+            # Not resuming or checkpoint invalid/empty — start fresh from root
+            discovery_queue.put_nowait(self.root_path)
+            discovered_dirs = {self.root_path}
+            pending_dirs = 1
+
+        # Shared list for collecting unprocessed dirs when memory aborts discovery.
+        # Workers append their per-worker pending lists + current dir here on abort.
+        # Single-threaded asyncio: no lock needed.
+        phase1a_checkpoint_pending: list[Path] = []
 
         log_with_context(
             self.logger,
@@ -1513,6 +1560,8 @@ class AsyncEFSPurger:
 
                 # Check termination conditions
                 if memory_abort or discovery_limit_reached:
+                    if memory_abort and self.dir_deletion_checkpoint_file:
+                        phase1a_checkpoint_pending.extend(pending_discovery)
                     pending_dirs -= len(pending_discovery)
                     break
 
@@ -1568,7 +1617,10 @@ class AsyncEFSPurger:
                             )
                             memory_abort = True
                             discovery_done.set()
-                            # Put the dir back since we didn't process it
+                            # current_dir was dequeued but not processed — save it for checkpoint
+                            if self.dir_deletion_checkpoint_file:
+                                phase1a_checkpoint_pending.append(current_dir)
+                                phase1a_checkpoint_pending.extend(pending_discovery)
                             pending_dirs -= 1
                             if pending_dirs <= 0:
                                 discovery_done.set()
@@ -1653,6 +1705,10 @@ class AsyncEFSPurger:
                                     )
                                     memory_abort = True
                                     discovery_done.set()
+                                    # current_dir was mid-scan — save it for checkpoint
+                                    if self.dir_deletion_checkpoint_file:
+                                        phase1a_checkpoint_pending.append(current_dir)
+                                        phase1a_checkpoint_pending.extend(pending_discovery)
                                     break
 
                     if not yielded_early:
@@ -1699,12 +1755,36 @@ class AsyncEFSPurger:
                         },
                     )
 
-        # Launch parallel discovery workers
+        # Launch parallel discovery workers (plus an optional loader task for resume overflow)
         num_workers = self.max_concurrent_discovery
         workers = [asyncio.create_task(_discovery_worker(i)) for i in range(num_workers)]
 
+        # If resuming with more pending dirs than queue_maxsize, feed them incrementally
+        # using a loader task (same pattern as Phase 2 checkpoint loader).
+        phase1a_loader_task: asyncio.Task | None = None
+        if remaining_phase1a_pending:
+            async def _phase1a_loader() -> None:
+                for p in remaining_phase1a_pending:
+                    if memory_abort or discovery_done.is_set():
+                        if memory_abort and self.dir_deletion_checkpoint_file:
+                            phase1a_checkpoint_pending.extend(remaining_phase1a_pending[remaining_phase1a_pending.index(p):])
+                        return
+                    while True:
+                        if memory_abort or discovery_done.is_set():
+                            return
+                        try:
+                            discovery_queue.put_nowait(p)
+                            break
+                        except asyncio.QueueFull:
+                            await asyncio.sleep(0.1)
+
+            phase1a_loader_task = asyncio.create_task(_phase1a_loader())
+
         # Wait for all workers to complete
         await asyncio.gather(*workers, return_exceptions=True)
+        if phase1a_loader_task is not None:
+            phase1a_loader_task.cancel()
+            await asyncio.gather(phase1a_loader_task, return_exceptions=True)
 
         # Discovery complete - clear state so progress monitor stops reporting discovery
         self._discovery_active = False
@@ -1988,10 +2068,12 @@ class AsyncEFSPurger:
                 },
             )
 
-        # Drain discovery queue so references are released (may have items if discovery aborted early)
+        # Drain discovery queue — if memory aborted, collect remaining dirs for checkpoint
         while True:
             try:
-                discovery_queue.get_nowait()
+                p = discovery_queue.get_nowait()
+                if memory_abort and self.dir_deletion_checkpoint_file:
+                    phase1a_checkpoint_pending.append(p)
             except asyncio.QueueEmpty:
                 break
 
@@ -2014,8 +2096,47 @@ class AsyncEFSPurger:
                 "skipped_not_empty": skipped_not_empty,
                 "errors": deletion_errors + discovery_errors,
                 "memory_mb": round(get_memory_usage_mb(), 1),
+                "checkpoint_pending": len(phase1a_checkpoint_pending) if memory_abort else 0,
             },
         )
+
+        # If memory aborted discovery and a checkpoint file is configured:
+        # save the BFS frontier so the next run can resume from where we stopped,
+        # then exit 75 so the loop knows to respawn.
+        if memory_abort and self.dir_deletion_checkpoint_file:
+            save_phase1a_checkpoint(
+                self.dir_deletion_checkpoint_file,
+                str(self.root_path),
+                [str(p) for p in phase1a_checkpoint_pending],
+                {"root_path": str(self.root_path)},
+            )
+            log_with_context(
+                self.logger,
+                "info",
+                "Phase 1a checkpoint saved. Run with --dir-deletion-resume to continue discovery.",
+                {
+                    "checkpoint_file": str(self.dir_deletion_checkpoint_file),
+                    "pending_dirs_count": len(phase1a_checkpoint_pending),
+                    "dirs_deleted_this_run": deleted_count,
+                },
+            )
+            raise CheckpointExit(
+                f"Phase 1a memory critical: checkpoint saved to {self.dir_deletion_checkpoint_file}. "
+                "Run with --dir-deletion-resume to continue."
+            )
+
+        # Clean completion — delete checkpoint file if it exists (tree fully discovered)
+        if self.dir_deletion_checkpoint_file and self.dir_deletion_checkpoint_file.exists():
+            try:
+                self.dir_deletion_checkpoint_file.unlink()
+                log_with_context(
+                    self.logger,
+                    "info",
+                    "Phase 1a checkpoint deleted (discovery complete)",
+                    {"checkpoint_file": str(self.dir_deletion_checkpoint_file)},
+                )
+            except OSError as e:
+                self.logger.warning("Could not delete Phase 1a checkpoint: %s", e)
 
         return deleted_count
 
@@ -2102,6 +2223,10 @@ class AsyncEFSPurger:
                 for k, v in cp.get("stats", {}).items():
                     if k in self.stats and isinstance(self.stats[k], (int, float)):
                         self.stats[k] = v
+                # Restore empty_dirs accumulated in previous run so Phase 3 can clean them up
+                saved_empty_dirs = cp.get("empty_dirs", [])
+                if saved_empty_dirs:
+                    self.empty_dirs.update(Path(p) for p in saved_empty_dirs)
                 log_with_context(
                     self.logger,
                     "info",
@@ -2381,6 +2506,7 @@ class AsyncEFSPurger:
                     "max_age_days": self.max_age_days,
                     "root_path": str(self.root_path),
                 },
+                empty_dirs=[str(p) for p in self.empty_dirs],
             )
             log_with_context(
                 self.logger,
@@ -2878,6 +3004,8 @@ async def async_main(
     max_entries_per_dir: int = 0,
     checkpoint_file: str | Path | None = None,
     resume: bool = False,
+    dir_deletion_checkpoint_file: str | Path | None = None,
+    dir_deletion_resume: bool = False,
 ) -> dict:
     """
     Async entry point for the purger.
@@ -2900,6 +3028,8 @@ async def async_main(
         max_entries_per_dir: Cap entries per directory in Phase 1a (0 = no limit) to avoid one huge dir stalling workers
         checkpoint_file: Path to save checkpoint when memory critical (enables auto-checkpoint)
         resume: If True, load checkpoint and resume Phase 2 from saved state
+        dir_deletion_checkpoint_file: Path to save/load Phase 1a BFS frontier checkpoint on memory abort
+        dir_deletion_resume: If True, resume Phase 1a discovery from dir_deletion_checkpoint_file
 
     Returns:
         Operation statistics
@@ -2922,6 +3052,8 @@ async def async_main(
         max_entries_per_dir=max_entries_per_dir,
         checkpoint_file=checkpoint_file,
         resume=resume,
+        dir_deletion_checkpoint_file=dir_deletion_checkpoint_file,
+        dir_deletion_resume=dir_deletion_resume,
     )
 
     return await purger.purge()

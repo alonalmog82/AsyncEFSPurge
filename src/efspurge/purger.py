@@ -1495,6 +1495,15 @@ class AsyncEFSPurger:
                 remaining_phase1a_pending = resume_dirs[loaded:]
                 pending_dirs = len(resume_dirs)
                 discovered_dirs = set(resume_dirs)  # prevent re-queuing
+                # Pre-populate dirs_by_depth with checkpoint dirs.
+                # On a normal run, dirs are added to dirs_by_depth when their parent is scanned.
+                # On resume we skip the parent scan, so we must seed dirs_by_depth directly —
+                # otherwise Phase 1b has no dirs to check/delete.
+                for p in resume_dirs:
+                    depth = len(p.parts) - root_depth
+                    if depth > 0:
+                        dirs_by_depth[depth].append(p)
+                total_dirs_discovered = len(resume_dirs)
                 log_with_context(
                     self.logger,
                     "info",

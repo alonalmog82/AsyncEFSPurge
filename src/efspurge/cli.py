@@ -286,7 +286,13 @@ def main() -> None:
             "or --dir-deletion-resume to continue Phase 1a directory discovery.",
             file=sys.stderr,
         )
-        sys.exit(75)  # EX_TEMPFAIL - checkpoint saved, resume suggested
+        sys.stderr.flush()
+        sys.stdout.flush()
+        # Use os._exit(75) instead of sys.exit(75) to bypass atexit handlers.
+        # sys.exit() triggers ThreadPoolExecutor's atexit which waits for all
+        # in-flight threads (EFS scandir calls) — causing multi-minute hangs.
+        # The checkpoint is already safely on disk; we can exit immediately.
+        os._exit(75)
     except KeyboardInterrupt:
         print("\nOperation cancelled by user", file=sys.stderr)
         sys.exit(130)

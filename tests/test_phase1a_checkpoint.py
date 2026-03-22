@@ -692,6 +692,45 @@ def test_cli_phase1_only_default_false(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# main() exit-path tests
+# ---------------------------------------------------------------------------
+
+
+def test_main_checkpoint_exit_uses_os_exit(tmp_path, monkeypatch):
+    """main() must call os._exit(75) for CheckpointExit, not sys.exit(75).
+
+    sys.exit() triggers ThreadPoolExecutor's atexit handler which waits for
+    all in-flight threads (EFS scandir calls), causing multi-minute hangs.
+    os._exit() bypasses atexit and exits immediately once the checkpoint is
+    safely on disk.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from efspurge.cli import main
+
+    monkeypatch.setattr("sys.argv", ["efspurge", str(tmp_path), "--max-age-days", "0"])
+
+    with patch("efspurge.cli.async_main", new=AsyncMock(side_effect=CheckpointExit("test cp"))):
+        with patch("os._exit") as mock_os_exit:
+            main()
+            mock_os_exit.assert_called_once_with(75)
+
+
+def test_main_success_uses_sys_exit_0(tmp_path, monkeypatch):
+    """main() calls sys.exit(0) on success (executor is already shut down cleanly)."""
+    from unittest.mock import AsyncMock, patch
+
+    from efspurge.cli import main
+
+    monkeypatch.setattr("sys.argv", ["efspurge", str(tmp_path), "--max-age-days", "0"])
+
+    with patch("efspurge.cli.async_main", new=AsyncMock(return_value={})):
+        with pytest.raises(SystemExit) as exc_info:
+            main()
+        assert exc_info.value.code == 0
+
+
+# ---------------------------------------------------------------------------
 # --phase1-only: async behaviour tests
 # ---------------------------------------------------------------------------
 

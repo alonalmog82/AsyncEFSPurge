@@ -13,7 +13,14 @@ from pathlib import Path
 import aiofiles.os
 
 from . import __version__
-from .checkpoint import load_checkpoint, load_phase1a_checkpoint, save_checkpoint, save_phase1a_checkpoint
+from .checkpoint import (
+    load_checkpoint,
+    load_phase1a_checkpoint,
+    load_phase1b_checkpoint,
+    save_checkpoint,
+    save_phase1a_checkpoint,
+    save_phase1b_checkpoint,
+)
 from .logging import log_with_context, setup_logging
 
 # Maximum number of directories to discover in Phase 1a.
@@ -444,6 +451,7 @@ class AsyncEFSPurger:
         resume: bool = False,
         dir_deletion_checkpoint_file: str | Path | None = None,
         dir_deletion_resume: bool = False,
+        phase1_only: bool = False,
     ):
         """
         Initialize the async EFS purger.
@@ -581,6 +589,7 @@ class AsyncEFSPurger:
         self.resume = resume
         self.dir_deletion_checkpoint_file = Path(dir_deletion_checkpoint_file) if dir_deletion_checkpoint_file else None
         self.dir_deletion_resume = dir_deletion_resume
+        self.phase1_only = phase1_only
 
         # Compute discovery limit: if explicitly set use that, otherwise derive from memory budget.
         # Each Path object is ~400-600 bytes, so we allow roughly 60% of the memory budget for paths.
@@ -1477,11 +1486,34 @@ class AsyncEFSPurger:
         # When it reaches 0 all reachable directories have been scanned.
         pending_dirs = 0
 
+        # Check for Phase 1b resume (memory aborted during bottom-up deletion).
+        # Phase 1b checkpoint takes priority over Phase 1a — it means discovery
+        # already completed and we just need to finish the deletion pass.
+        phase1b_resume = False
+        if self.dir_deletion_resume and self.dir_deletion_checkpoint_file:
+            cp1b = load_phase1b_checkpoint(self.dir_deletion_checkpoint_file)
+            if cp1b:
+                for depth_str, paths in cp1b["dirs_by_depth"].items():
+                    depth = int(depth_str)
+                    dirs_by_depth[depth] = [Path(p) for p in paths]
+                total_dirs_discovered = sum(len(v) for v in dirs_by_depth.values())
+                phase1b_resume = True
+                log_with_context(
+                    self.logger,
+                    "info",
+                    "Phase 1b: Resuming from Phase 1b checkpoint",
+                    {
+                        "checkpoint_file": str(self.dir_deletion_checkpoint_file),
+                        "depth_levels": len(dirs_by_depth),
+                        "total_dirs_remaining": total_dirs_discovered,
+                    },
+                )
+
         # Resume from Phase 1a checkpoint if requested, otherwise start from root.
         # remaining_phase1a_pending holds checkpoint dirs that didn't fit in the queue;
         # they are fed in by a loader task running alongside the discovery workers.
         remaining_phase1a_pending: list[Path] = []
-        if self.dir_deletion_resume and self.dir_deletion_checkpoint_file:
+        if not phase1b_resume and self.dir_deletion_resume and self.dir_deletion_checkpoint_file:
             cp1a = load_phase1a_checkpoint(self.dir_deletion_checkpoint_file)
             if cp1a:
                 resume_dirs = [Path(p) for p in cp1a["pending_dirs"]]
@@ -1516,7 +1548,7 @@ class AsyncEFSPurger:
                     },
                 )
 
-        if pending_dirs == 0:
+        if not phase1b_resume and pending_dirs == 0:
             # Not resuming or checkpoint invalid/empty — start fresh from root
             discovery_queue.put_nowait(self.root_path)
             discovered_dirs = {self.root_path}
@@ -1766,12 +1798,13 @@ class AsyncEFSPurger:
 
         # Launch parallel discovery workers (plus an optional loader task for resume overflow)
         num_workers = self.max_concurrent_discovery
-        workers = [asyncio.create_task(_discovery_worker(i)) for i in range(num_workers)]
+        # Skip Phase 1a workers entirely when resuming from Phase 1b checkpoint
+        workers = [] if phase1b_resume else [asyncio.create_task(_discovery_worker(i)) for i in range(num_workers)]
 
         # If resuming with more pending dirs than queue_maxsize, feed them incrementally
         # using a loader task (same pattern as Phase 2 checkpoint loader).
         phase1a_loader_task: asyncio.Task | None = None
-        if remaining_phase1a_pending:
+        if remaining_phase1a_pending and not phase1b_resume:
 
             async def _phase1a_loader() -> None:
                 for p in remaining_phase1a_pending:
@@ -1804,19 +1837,20 @@ class AsyncEFSPurger:
 
         max_depth = max(dirs_by_depth.keys()) if dirs_by_depth else 0
 
-        log_with_context(
-            self.logger,
-            "info",
-            "Phase 1a complete: Directory tree discovered",
-            {
-                "total_dirs_discovered": total_dirs_discovered,
-                "depth_levels": len(dirs_by_depth),
-                "max_depth": max_depth,
-                "discovery_errors": discovery_errors,
-                "concurrent_workers": self.max_concurrent_discovery,
-                "memory_mb": round(get_memory_usage_mb(), 1),
-            },
-        )
+        if not phase1b_resume:
+            log_with_context(
+                self.logger,
+                "info",
+                "Phase 1a complete: Directory tree discovered",
+                {
+                    "total_dirs_discovered": total_dirs_discovered,
+                    "depth_levels": len(dirs_by_depth),
+                    "max_depth": max_depth,
+                    "discovery_errors": discovery_errors,
+                    "concurrent_workers": self.max_concurrent_discovery,
+                    "memory_mb": round(get_memory_usage_mb(), 1),
+                },
+            )
 
         # Free discovery-only state before Phase 1b to reduce memory pressure
         discovered_dirs.clear()
@@ -1849,6 +1883,7 @@ class AsyncEFSPurger:
         skipped_not_empty = 0
         deleted_lock = asyncio.Lock()
         rate_limit_reached = False
+        phase1b_checkpoint_saved = False
 
         # Use a semaphore for concurrency control
         deletion_sem = asyncio.Semaphore(self.max_concurrency_deletion)
@@ -1990,11 +2025,23 @@ class AsyncEFSPurger:
                         memory_mb = get_memory_usage_mb()
                         memory_percent = memory_mb / self.memory_limit_mb
                         if memory_percent > 0.95:
-                            # Still critical after GC - abort remaining deletion
+                            # Still critical after GC - save Phase 1b checkpoint and abort
+                            # Remaining dirs: unprocessed tail of current level + all shallower levels
+                            _remaining: dict[str, list[str]] = {str(current_depth): [str(p) for p in level_dirs[i:]]}
+                            for _d, _paths in dirs_by_depth.items():
+                                _remaining[str(_d)] = [str(p) for p in _paths]
+                            if self.dir_deletion_checkpoint_file:
+                                save_phase1b_checkpoint(
+                                    self.dir_deletion_checkpoint_file,
+                                    str(self.root_path),
+                                    _remaining,
+                                    {"root_path": str(self.root_path)},
+                                )
+                                phase1b_checkpoint_saved = True
                             log_with_context(
                                 self.logger,
                                 "warning",
-                                "Memory critical during deletion, stopping to prevent OOM",
+                                "Memory critical during deletion, checkpoint saved",
                                 {
                                     "memory_mb": round(memory_mb, 1),
                                     "memory_percent": round(memory_percent * 100, 1),
@@ -2004,6 +2051,7 @@ class AsyncEFSPurger:
                                     "current_depth": current_depth,
                                     "remaining_in_level": level_size - i,
                                     "remaining_levels": len(dirs_by_depth),
+                                    "checkpoint_saved": phase1b_checkpoint_saved,
                                 },
                             )
                             rate_limit_reached = True
@@ -2109,8 +2157,25 @@ class AsyncEFSPurger:
                 "errors": deletion_errors + discovery_errors,
                 "memory_mb": round(get_memory_usage_mb(), 1),
                 "checkpoint_pending": len(phase1a_checkpoint_pending) if memory_abort else 0,
+                "phase1b_checkpoint_saved": phase1b_checkpoint_saved,
             },
         )
+
+        # If Phase 1b memory aborted and checkpoint was saved, exit 75 so the loop respawns.
+        if phase1b_checkpoint_saved:
+            log_with_context(
+                self.logger,
+                "info",
+                "Phase 1b checkpoint saved. Run with --dir-deletion-resume to continue deletion.",
+                {
+                    "checkpoint_file": str(self.dir_deletion_checkpoint_file),
+                    "dirs_deleted_this_run": deleted_count,
+                },
+            )
+            raise CheckpointExit(
+                f"Phase 1b memory critical: checkpoint saved to {self.dir_deletion_checkpoint_file}. "
+                "Run with --dir-deletion-resume to continue."
+            )
 
         # If memory aborted discovery and a checkpoint file is configured:
         # save the BFS frontier so the next run can resume from where we stopped,
@@ -2847,19 +2912,20 @@ class AsyncEFSPurger:
             if self.remove_empty_dirs and not self.resume:
                 await self._purge_empty_directories_standalone()
 
-            # Phase 2: Scan and purge files (BFS queue + worker pool)
-            self.current_phase = "scanning"
-            self.rate_tracker.set_phase_start("scanning")
-            await self._scan_and_purge_files()
+            if not self.phase1_only:
+                # Phase 2: Scan and purge files (BFS queue + worker pool)
+                self.current_phase = "scanning"
+                self.rate_tracker.set_phase_start("scanning")
+                await self._scan_and_purge_files()
 
-            # Mark scanning phase as complete (for accurate overall rate calculation)
-            self.scanning_end_time = time.time()
+                # Mark scanning phase as complete (for accurate overall rate calculation)
+                self.scanning_end_time = time.time()
 
-            # Phase 3: Post-scan empty directory cleanup
-            # After purging files, some directories may have become empty.
-            # Run the existing post-order deletion to catch these.
-            if self.remove_empty_dirs:
-                await self._remove_empty_directories()
+                # Phase 3: Post-scan empty directory cleanup
+                # After purging files, some directories may have become empty.
+                # Run the existing post-order deletion to catch these.
+                if self.remove_empty_dirs:
+                    await self._remove_empty_directories()
 
             # Purge completed successfully - remove checkpoint file so a future
             # run with --resume won't mistakenly resume from stale state.
@@ -3018,6 +3084,7 @@ async def async_main(
     resume: bool = False,
     dir_deletion_checkpoint_file: str | Path | None = None,
     dir_deletion_resume: bool = False,
+    phase1_only: bool = False,
 ) -> dict:
     """
     Async entry point for the purger.
@@ -3066,6 +3133,7 @@ async def async_main(
         resume=resume,
         dir_deletion_checkpoint_file=dir_deletion_checkpoint_file,
         dir_deletion_resume=dir_deletion_resume,
+        phase1_only=phase1_only,
     )
 
     return await purger.purge()

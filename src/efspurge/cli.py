@@ -12,7 +12,7 @@ from .purger import CheckpointExit, async_main
 logger = logging.getLogger("efspurge")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(args=None) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description="AsyncEFSPurge - High-performance async file purger for AWS EFS",
@@ -189,6 +189,17 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--phase1-only",
+        action="store_true",
+        default=os.getenv("EFSPURGE_PHASE1_ONLY", "").lower() in ("1", "true", "yes"),
+        help=(
+            "Run Phase 1 (empty directory cleanup) only, skipping Phase 2 file scan and Phase 3. "
+            "Use with --remove-empty-dirs and --dir-deletion-checkpoint-file for iterative "
+            "empty-dir cleanup across large trees. Set EFSPURGE_PHASE1_ONLY=1 to enable via env var."
+        ),
+    )
+
+    parser.add_argument(
         "--no-uvloop",
         action="store_true",
         default=os.getenv("EFSPURGE_UVLOOP", "true").lower() in ("0", "false", "no"),
@@ -206,7 +217,7 @@ def parse_args() -> argparse.Namespace:
         version=f"efspurge {__version__}",
     )
 
-    return parser.parse_args()
+    return parser.parse_args(args)
 
 
 def main() -> None:
@@ -260,6 +271,7 @@ def main() -> None:
                 resume=args.resume,
                 dir_deletion_checkpoint_file=args.dir_deletion_checkpoint_file or None,
                 dir_deletion_resume=args.dir_deletion_resume,
+                phase1_only=args.phase1_only,
             ),
             loop_factory=loop_factory,
         )

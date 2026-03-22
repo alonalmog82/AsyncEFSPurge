@@ -1,13 +1,22 @@
-"""Tests for Phase 1a checkpoint/resume and Phase 2 empty_dirs checkpoint fix.
+"""Tests for Phase 1a/1b checkpoint/resume, Phase 2 empty_dirs fix, and --phase1-only.
 
 Phase 1a checkpoint:
 - On memory abort during discovery: saves BFS frontier, runs Phase 1b on found dirs, exits 75
 - On resume: restores BFS frontier, continues discovery from where it stopped
 - On clean completion: deletes checkpoint file
 
+Phase 1b checkpoint:
+- On memory abort during bottom-up deletion: saves remaining dirs_by_depth, exits 75
+- On resume: skips Phase 1a entirely, continues deletion from checkpoint
+- On clean completion: deletes checkpoint file
+
 Phase 2 empty_dirs fix:
 - empty_dirs accumulated during Phase 2 are saved in checkpoint
 - On resume, empty_dirs are restored so Phase 3 can process them
+
+--phase1-only flag:
+- Skips Phase 2 and Phase 3 entirely
+- Works with checkpoint/resume for iterative empty-dir cleanup
 """
 
 import json
@@ -21,8 +30,10 @@ from efspurge.checkpoint import (
     CHECKPOINT_VERSION,
     load_checkpoint,
     load_phase1a_checkpoint,
+    load_phase1b_checkpoint,
     save_checkpoint,
     save_phase1a_checkpoint,
+    save_phase1b_checkpoint,
 )
 from efspurge.purger import AsyncEFSPurger, CheckpointExit
 
@@ -192,14 +203,31 @@ async def test_phase1a_checkpoint_saved_on_memory_abort(temp_dir, tmp_path):
 
     cp_file = tmp_path / "phase1a.json"
 
-    # Mock memory to exceed 95% on the second check (after a few dirs discovered)
+    # Mock memory:
+    # - Calls 1-2: normal so the initial check and root directory scan succeed
+    # - Calls 3+:  high (5226/5500 > 0.95) to trigger Phase 1a worker memory_abort
+    # - Once "Phase 1a complete" is logged, switch back to normal so Phase 1b
+    #   runs cleanly and the Phase 1a checkpoint is saved afterward.
+    import efspurge.purger as _purger_module
+
+    phase1a_done = False
     call_count = 0
+    _real_log = _purger_module.log_with_context  # capture before patch
+
+    def spy_log(logger, level, msg, extra=None):
+        nonlocal phase1a_done
+        if "Phase 1a complete" in msg:
+            phase1a_done = True
+        _real_log(logger, level, msg, extra)
 
     def fake_memory():
         nonlocal call_count
+        if phase1a_done:
+            return 100.0  # Phase 1b: normal memory — no abort
         call_count += 1
-        # First few calls return normal, then simulate critical memory
-        return 5226.0 if call_count > 3 else 100.0  # 5226 / 5500 = 95%
+        # First 2 calls: normal (initial log + root dir memory check → root gets scanned)
+        # Call 3+: high → triggers memory_abort in worker processing sub-dirs
+        return 100.0 if call_count <= 2 else 5226.0
 
     purger = AsyncEFSPurger(
         root_path=str(temp_dir),
@@ -210,9 +238,10 @@ async def test_phase1a_checkpoint_saved_on_memory_abort(temp_dir, tmp_path):
         dir_deletion_checkpoint_file=str(cp_file),
     )
 
-    with patch("efspurge.purger.get_memory_usage_mb", side_effect=fake_memory):
-        with pytest.raises(CheckpointExit):
-            await purger._purge_empty_directories_standalone()
+    with patch("efspurge.purger.log_with_context", side_effect=spy_log):
+        with patch("efspurge.purger.get_memory_usage_mb", side_effect=fake_memory):
+            with pytest.raises(CheckpointExit):
+                await purger._purge_empty_directories_standalone()
 
     # Checkpoint file must exist with phase1a data
     assert cp_file.exists()
@@ -512,3 +541,446 @@ async def test_phase2_empty_dirs_accumulated_across_checkpoint_resume(temp_dir, 
     # Both dirs should be deleted by Phase 3
     assert not from_prev_run.exists(), "Dir from previous checkpoint run should be deleted"
     assert not new_empty.exists(), "Dir found empty in this run should be deleted"
+
+
+# ---------------------------------------------------------------------------
+# save_phase1b_checkpoint / load_phase1b_checkpoint unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_save_phase1b_checkpoint_creates_valid_json(tmp_path):
+    """save_phase1b_checkpoint writes valid JSON with expected keys."""
+    cp = tmp_path / "phase1b.json"
+    save_phase1b_checkpoint(
+        filepath=cp,
+        root_path="/data/root",
+        dirs_by_depth={"3": ["/data/root/a/b/c"], "2": ["/data/root/a/b"]},
+        config={"root_path": "/data/root"},
+    )
+    assert cp.exists()
+    data = json.loads(cp.read_text())
+    assert data["version"] == CHECKPOINT_VERSION
+    assert data["phase"] == "phase1b"
+    assert data["root_path"] == "/data/root"
+    assert data["dirs_by_depth"]["3"] == ["/data/root/a/b/c"]
+    assert data["dirs_by_depth"]["2"] == ["/data/root/a/b"]
+
+
+def test_load_phase1b_checkpoint_roundtrip(tmp_path):
+    """load_phase1b_checkpoint returns the saved data."""
+    cp = tmp_path / "phase1b.json"
+    save_phase1b_checkpoint(
+        filepath=cp,
+        root_path="/data/root",
+        dirs_by_depth={"3": ["/data/root/a/b/c"]},
+        config={"root_path": "/data/root"},
+    )
+    result = load_phase1b_checkpoint(cp)
+    assert result is not None
+    assert result["phase"] == "phase1b"
+    assert result["dirs_by_depth"]["3"] == ["/data/root/a/b/c"]
+
+
+def test_load_phase1b_checkpoint_missing_file(tmp_path):
+    """Returns None when checkpoint file does not exist."""
+    result = load_phase1b_checkpoint(tmp_path / "nonexistent.json")
+    assert result is None
+
+
+def test_load_phase1b_checkpoint_invalid_json(tmp_path):
+    """Returns None on malformed JSON."""
+    cp = tmp_path / "bad.json"
+    cp.write_text("not json")
+    assert load_phase1b_checkpoint(cp) is None
+
+
+def test_load_phase1b_checkpoint_wrong_phase(tmp_path):
+    """Returns None when phase field is not phase1b."""
+    cp = tmp_path / "cp.json"
+    save_phase1a_checkpoint(cp, "/data", ["/data/a"], {})
+    assert load_phase1b_checkpoint(cp) is None
+
+
+def test_load_phase1b_checkpoint_version_mismatch(tmp_path):
+    """Returns None on version mismatch."""
+    cp = tmp_path / "cp.json"
+    cp.write_text(
+        json.dumps(
+            {
+                "version": 999,
+                "phase": "phase1b",
+                "root_path": "/data",
+                "dirs_by_depth": {"2": ["/data/a/b"]},
+                "config": {},
+            }
+        )
+    )
+    assert load_phase1b_checkpoint(cp) is None
+
+
+def test_load_phase1b_checkpoint_empty_dirs(tmp_path):
+    """Returns None when all dirs_by_depth lists are empty."""
+    cp = tmp_path / "cp.json"
+    save_phase1b_checkpoint(cp, "/data", {"2": [], "3": []}, {})
+    assert load_phase1b_checkpoint(cp) is None
+
+
+def test_load_phase1a_checkpoint_rejects_phase1b_file(tmp_path):
+    """load_phase1a_checkpoint returns None for a phase1b file."""
+    cp = tmp_path / "cp.json"
+    save_phase1b_checkpoint(cp, "/data", {"2": ["/data/a/b"]}, {})
+    assert load_phase1a_checkpoint(cp) is None
+
+
+def test_load_checkpoint_rejects_phase1b_file(tmp_path):
+    """load_checkpoint returns None for a phase1b file."""
+    cp = tmp_path / "cp.json"
+    save_phase1b_checkpoint(cp, "/data", {"2": ["/data/a/b"]}, {})
+    assert load_checkpoint(cp) is None
+
+
+# ---------------------------------------------------------------------------
+# --phase1-only flag: purger params and CLI plumbing
+# ---------------------------------------------------------------------------
+
+
+def test_phase1_only_default_false():
+    """phase1_only defaults to False."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        p = AsyncEFSPurger(root_path=tmpdir, max_age_days=30)
+        assert p.phase1_only is False
+
+
+def test_phase1_only_stored():
+    """phase1_only=True is stored on the purger."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        p = AsyncEFSPurger(root_path=tmpdir, max_age_days=0, phase1_only=True)
+        assert p.phase1_only is True
+
+
+def test_cli_phase1_only_flag(tmp_path):
+    """--phase1-only flag is parsed and passed to async_main."""
+    from efspurge.cli import parse_args
+
+    args = parse_args(
+        [
+            str(tmp_path),
+            "--max-age-days",
+            "0",
+            "--phase1-only",
+        ]
+    )
+    assert args.phase1_only is True
+
+
+def test_cli_phase1_only_env_var(tmp_path, monkeypatch):
+    """EFSPURGE_PHASE1_ONLY=1 sets phase1_only via env var."""
+    from efspurge.cli import parse_args
+
+    monkeypatch.setenv("EFSPURGE_PHASE1_ONLY", "1")
+    args = parse_args([str(tmp_path), "--max-age-days", "0"])
+    assert args.phase1_only is True
+
+
+def test_cli_phase1_only_default_false(tmp_path, monkeypatch):
+    """phase1_only defaults to False with no flag or env var."""
+    from efspurge.cli import parse_args
+
+    monkeypatch.delenv("EFSPURGE_PHASE1_ONLY", raising=False)
+    args = parse_args([str(tmp_path), "--max-age-days", "30"])
+    assert args.phase1_only is False
+
+
+# ---------------------------------------------------------------------------
+# --phase1-only: async behaviour tests
+# ---------------------------------------------------------------------------
+
+
+async def test_phase1_only_skips_phase2_and_deletes_empty_dirs(tmp_path):
+    """With --phase1-only, Phase 2 is skipped and empty dirs are deleted."""
+    # Create: empty subdir + subdir with a file
+    empty = tmp_path / "empty_dir"
+    empty.mkdir()
+    nonempty = tmp_path / "nonempty_dir"
+    nonempty.mkdir()
+    (nonempty / "file.txt").write_text("data")
+
+    purger = AsyncEFSPurger(
+        root_path=str(tmp_path),
+        max_age_days=0,
+        remove_empty_dirs=True,
+        memory_limit_mb=0,
+        dry_run=False,
+        phase1_only=True,
+    )
+    await purger.purge()
+
+    # Empty dir deleted, nonempty preserved, file preserved
+    assert not empty.exists()
+    assert nonempty.exists()
+    assert (nonempty / "file.txt").exists()
+
+
+async def test_phase1_only_does_not_delete_files(tmp_path):
+    """With --phase1-only, no files are deleted regardless of age."""
+    old_dir = tmp_path / "old_dir"
+    old_dir.mkdir()
+    old_file = old_dir / "old_file.txt"
+    old_file.write_text("old")
+    # Set mtime to 100 days ago
+    import os
+    import time
+
+    old_time = time.time() - 100 * 86400
+    os.utime(old_file, (old_time, old_time))
+
+    purger = AsyncEFSPurger(
+        root_path=str(tmp_path),
+        max_age_days=30,
+        remove_empty_dirs=True,
+        memory_limit_mb=0,
+        dry_run=False,
+        phase1_only=True,
+    )
+    await purger.purge()
+
+    # File must still exist — Phase 2 was skipped
+    assert old_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# Phase 1b checkpoint: memory abort during deletion
+# ---------------------------------------------------------------------------
+
+
+async def test_phase1b_checkpoint_saved_on_memory_abort(tmp_path):
+    """When memory aborts during Phase 1b, a phase1b checkpoint is saved and CheckpointExit raised."""
+    # Create several empty dirs
+    for i in range(5):
+        (tmp_path / f"empty_{i}").mkdir()
+
+    cp_file = tmp_path / "dircp.json"
+
+    # Simulate memory critical (>95%) on first Phase 1b batch memory check
+    call_count = 0
+
+    def mock_memory_mb():
+        nonlocal call_count
+        call_count += 1
+        # Return normal memory for Phase 1a discovery, then critical for Phase 1b
+        if call_count <= 5:
+            return 10.0  # Phase 1a: low memory
+        return 5226.0  # Phase 1b: 5226/5500 = 0.9502 > 0.95 threshold
+
+    with patch("efspurge.purger.get_memory_usage_mb", side_effect=mock_memory_mb):
+        purger = AsyncEFSPurger(
+            root_path=str(tmp_path),
+            max_age_days=0,
+            remove_empty_dirs=True,
+            memory_limit_mb=5500,
+            dry_run=False,
+            phase1_only=True,
+            dir_deletion_checkpoint_file=str(cp_file),
+        )
+        with pytest.raises(CheckpointExit):
+            await purger.purge()
+
+    # Checkpoint file should exist with phase=phase1b
+    assert cp_file.exists()
+    data = json.loads(cp_file.read_text())
+    assert data["phase"] == "phase1b"
+    assert "dirs_by_depth" in data
+
+
+async def test_phase1b_no_checkpoint_without_flag(tmp_path):
+    """Memory abort during Phase 1b does NOT save checkpoint when no checkpoint file configured."""
+    for i in range(3):
+        (tmp_path / f"empty_{i}").mkdir()
+
+    call_count = 0
+
+    def mock_memory_mb():
+        nonlocal call_count
+        call_count += 1
+        return 10.0 if call_count <= 5 else 5225.0
+
+    with patch("efspurge.purger.get_memory_usage_mb", side_effect=mock_memory_mb):
+        purger = AsyncEFSPurger(
+            root_path=str(tmp_path),
+            max_age_days=0,
+            remove_empty_dirs=True,
+            memory_limit_mb=5500,
+            dry_run=False,
+            phase1_only=True,
+            # No dir_deletion_checkpoint_file
+        )
+        # Should complete without CheckpointExit (just stops deletion early)
+        await purger.purge()
+
+
+async def test_phase1b_resume_skips_phase1a_and_deletes(tmp_path):
+    """Resuming from Phase 1b checkpoint skips Phase 1a and deletes remaining empty dirs."""
+    # Create empty dirs
+    empty_a = tmp_path / "a"
+    empty_b = tmp_path / "b"
+    empty_a.mkdir()
+    empty_b.mkdir()
+
+    cp_file = tmp_path / "dircp.json"
+
+    # Save a phase1b checkpoint with these dirs at depth 1
+    depth = 1
+    save_phase1b_checkpoint(
+        filepath=cp_file,
+        root_path=str(tmp_path),
+        dirs_by_depth={str(depth): [str(empty_a), str(empty_b)]},
+        config={"root_path": str(tmp_path)},
+    )
+
+    purger = AsyncEFSPurger(
+        root_path=str(tmp_path),
+        max_age_days=0,
+        remove_empty_dirs=True,
+        memory_limit_mb=0,
+        dry_run=False,
+        phase1_only=True,
+        dir_deletion_checkpoint_file=str(cp_file),
+        dir_deletion_resume=True,
+    )
+    await purger.purge()
+
+    # Both empty dirs should be deleted
+    assert not empty_a.exists()
+    assert not empty_b.exists()
+    # Checkpoint file should be deleted on clean completion
+    assert not cp_file.exists()
+
+
+async def test_phase1b_resume_checkpoint_deleted_on_clean_completion(tmp_path):
+    """Phase 1b checkpoint file is deleted when deletion completes cleanly."""
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    cp_file = tmp_path / "dircp.json"
+
+    save_phase1b_checkpoint(
+        filepath=cp_file,
+        root_path=str(tmp_path),
+        dirs_by_depth={"1": [str(empty)]},
+        config={},
+    )
+
+    purger = AsyncEFSPurger(
+        root_path=str(tmp_path),
+        max_age_days=0,
+        remove_empty_dirs=True,
+        memory_limit_mb=0,
+        dry_run=False,
+        phase1_only=True,
+        dir_deletion_checkpoint_file=str(cp_file),
+        dir_deletion_resume=True,
+    )
+    await purger.purge()
+
+    assert not cp_file.exists()
+
+
+async def test_phase1b_resume_multiple_depths(tmp_path):
+    """Phase 1b resume handles multiple depth levels correctly (deepest first)."""
+    # Create two-level deep structure: tmp/a/b (depth 2), tmp/a (depth 1)
+    deep = tmp_path / "a" / "b"
+    deep.mkdir(parents=True)
+    shallow = tmp_path / "a"
+
+    cp_file = tmp_path / "dircp.json"
+    save_phase1b_checkpoint(
+        filepath=cp_file,
+        root_path=str(tmp_path),
+        dirs_by_depth={
+            "2": [str(deep)],
+            "1": [str(shallow)],
+        },
+        config={},
+    )
+
+    purger = AsyncEFSPurger(
+        root_path=str(tmp_path),
+        max_age_days=0,
+        remove_empty_dirs=True,
+        memory_limit_mb=0,
+        dry_run=False,
+        phase1_only=True,
+        dir_deletion_checkpoint_file=str(cp_file),
+        dir_deletion_resume=True,
+    )
+    await purger.purge()
+
+    # Both levels should be deleted bottom-up
+    assert not deep.exists()
+    assert not shallow.exists()
+
+
+async def test_phase1b_resume_prefers_phase1b_over_phase1a_checkpoint(tmp_path):
+    """When phase1b checkpoint exists, it takes priority over phase1a checkpoint."""
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    cp_file = tmp_path / "dircp.json"
+    # Write a phase1b checkpoint (not phase1a)
+    save_phase1b_checkpoint(
+        filepath=cp_file,
+        root_path=str(tmp_path),
+        dirs_by_depth={"1": [str(empty)]},
+        config={},
+    )
+
+    # load_phase1a_checkpoint should return None (wrong phase)
+    assert load_phase1a_checkpoint(cp_file) is None
+    # load_phase1b_checkpoint should return the data
+    assert load_phase1b_checkpoint(cp_file) is not None
+
+    purger = AsyncEFSPurger(
+        root_path=str(tmp_path),
+        max_age_days=0,
+        remove_empty_dirs=True,
+        memory_limit_mb=0,
+        dry_run=False,
+        phase1_only=True,
+        dir_deletion_checkpoint_file=str(cp_file),
+        dir_deletion_resume=True,
+    )
+    await purger.purge()
+
+    assert not empty.exists()
+
+
+async def test_phase1b_resume_with_nonempty_dirs_preserved(tmp_path):
+    """Phase 1b resume skips non-empty dirs — only truly empty ones are deleted."""
+    empty = tmp_path / "empty"
+    nonempty = tmp_path / "nonempty"
+    empty.mkdir()
+    nonempty.mkdir()
+    (nonempty / "file.txt").write_text("data")
+
+    cp_file = tmp_path / "dircp.json"
+    save_phase1b_checkpoint(
+        filepath=cp_file,
+        root_path=str(tmp_path),
+        dirs_by_depth={"1": [str(empty), str(nonempty)]},
+        config={},
+    )
+
+    purger = AsyncEFSPurger(
+        root_path=str(tmp_path),
+        max_age_days=0,
+        remove_empty_dirs=True,
+        memory_limit_mb=0,
+        dry_run=False,
+        phase1_only=True,
+        dir_deletion_checkpoint_file=str(cp_file),
+        dir_deletion_resume=True,
+    )
+    await purger.purge()
+
+    assert not empty.exists()
+    assert nonempty.exists()
+    assert (nonempty / "file.txt").exists()

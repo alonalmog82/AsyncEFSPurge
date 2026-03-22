@@ -100,6 +100,66 @@ def load_phase1a_checkpoint(filepath: Path) -> dict | None:
     return data
 
 
+def save_phase1b_checkpoint(
+    filepath: Path,
+    root_path: str,
+    dirs_by_depth: dict,
+    config: dict,
+) -> None:
+    """
+    Save a Phase 1b (bottom-up deletion) checkpoint to disk.
+
+    Args:
+        filepath: Path to write checkpoint JSON
+        root_path: Root path being purged
+        dirs_by_depth: Remaining dirs to process, keyed by depth (str) → list of path strings
+        config: Key config for validation on resume
+    """
+    data = {
+        "version": CHECKPOINT_VERSION,
+        "root_path": root_path,
+        "phase": "phase1b",
+        "dirs_by_depth": dirs_by_depth,
+        "config": config,
+    }
+    with open(filepath, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def load_phase1b_checkpoint(filepath: Path) -> dict | None:
+    """
+    Load a Phase 1b checkpoint from disk.
+
+    Returns:
+        Checkpoint dict with keys: root_path, dirs_by_depth, config; or None if invalid/missing
+    """
+    try:
+        with open(filepath) as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError) as e:
+        _logger.warning("Cannot load Phase 1b checkpoint: %s", e)
+        return None
+
+    if data.get("version") != CHECKPOINT_VERSION:
+        _logger.warning(
+            "Phase 1b checkpoint version mismatch: expected %s, got %s",
+            CHECKPOINT_VERSION,
+            data.get("version"),
+        )
+        return None
+
+    if data.get("phase") != "phase1b":
+        _logger.warning("Checkpoint is not Phase 1b: %s", data.get("phase"))
+        return None
+
+    dirs_by_depth = data.get("dirs_by_depth", {})
+    if not dirs_by_depth or not any(dirs_by_depth.values()):
+        _logger.info("Phase 1b checkpoint has no remaining directories, treating as complete")
+        return None
+
+    return data
+
+
 def load_checkpoint(filepath: Path) -> dict | None:
     """
     Load a checkpoint from disk.

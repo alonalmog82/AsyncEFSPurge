@@ -237,44 +237,50 @@ def main() -> None:
             stacklevel=2,
         )
 
-    # Determine event loop factory: use uvloop by default on Linux/macOS
-    loop_factory = None
+    # Determine whether to use uvloop
+    use_uvloop = False
     if not args.no_uvloop:
         try:
-            import uvloop
+            import uvloop  # noqa: F401
 
-            loop_factory = uvloop.new_event_loop
+            use_uvloop = True
         except ImportError:
             # uvloop not installed (e.g. Windows, or minimal install)
             pass
 
+    coro = async_main(
+        path=args.path,
+        max_age_days=args.max_age_days,
+        max_concurrency=args.max_concurrency,
+        max_concurrency_scanning=args.max_concurrency_scanning,
+        max_concurrency_deletion=args.max_concurrency_deletion,
+        dry_run=args.dry_run,
+        log_level=args.log_level,
+        memory_limit_mb=args.memory_limit_mb,
+        task_batch_size=args.task_batch_size,
+        remove_empty_dirs=args.remove_empty_dirs,
+        max_empty_dirs_to_delete=args.max_empty_dirs_to_delete,
+        max_discovery_dirs=args.max_discovery_dirs,
+        max_concurrent_discovery=args.max_concurrent_discovery,
+        queue_maxsize=args.queue_maxsize,
+        max_entries_per_dir=args.max_entries_per_dir,
+        checkpoint_file=args.checkpoint_file or None,
+        resume=args.resume,
+        dir_deletion_checkpoint_file=args.dir_deletion_checkpoint_file or None,
+        dir_deletion_resume=args.dir_deletion_resume,
+        phase1_only=args.phase1_only,
+    )
+
     try:
-        # Run the async purger
-        asyncio.run(
-            async_main(
-                path=args.path,
-                max_age_days=args.max_age_days,
-                max_concurrency=args.max_concurrency,
-                max_concurrency_scanning=args.max_concurrency_scanning,
-                max_concurrency_deletion=args.max_concurrency_deletion,
-                dry_run=args.dry_run,
-                log_level=args.log_level,
-                memory_limit_mb=args.memory_limit_mb,
-                task_batch_size=args.task_batch_size,
-                remove_empty_dirs=args.remove_empty_dirs,
-                max_empty_dirs_to_delete=args.max_empty_dirs_to_delete,
-                max_discovery_dirs=args.max_discovery_dirs,
-                max_concurrent_discovery=args.max_concurrent_discovery,
-                queue_maxsize=args.queue_maxsize,
-                max_entries_per_dir=args.max_entries_per_dir,
-                checkpoint_file=args.checkpoint_file or None,
-                resume=args.resume,
-                dir_deletion_checkpoint_file=args.dir_deletion_checkpoint_file or None,
-                dir_deletion_resume=args.dir_deletion_resume,
-                phase1_only=args.phase1_only,
-            ),
-            loop_factory=loop_factory,
-        )
+        # Run the async purger.
+        # Use uvloop.run() when available (works on Python 3.11+).
+        # asyncio.run(loop_factory=...) only exists on Python 3.12+.
+        if use_uvloop:
+            import uvloop
+
+            uvloop.run(coro)
+        else:
+            asyncio.run(coro)
 
         # Exit with success
         sys.exit(0)

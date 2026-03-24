@@ -78,6 +78,13 @@ def parse_args(args=None) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--backpressure-checkpoint-timeout",
+        type=int,
+        default=int(os.getenv("EFSPURGE_BACKPRESSURE_CHECKPOINT_TIMEOUT", "600")),
+        help="Seconds of sustained back-pressure before forcing a checkpoint exit (default: 600, 0 = disabled)",
+    )
+
+    parser.add_argument(
         "--task-batch-size",
         type=int,
         default=int(os.getenv("EFSPURGE_TASK_BATCH_SIZE", "5000")),
@@ -269,6 +276,7 @@ def main() -> None:
         dir_deletion_checkpoint_file=args.dir_deletion_checkpoint_file or None,
         dir_deletion_resume=args.dir_deletion_resume,
         phase1_only=args.phase1_only,
+        backpressure_checkpoint_timeout=args.backpressure_checkpoint_timeout,
     )
 
     try:

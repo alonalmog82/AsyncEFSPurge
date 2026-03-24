@@ -452,6 +452,7 @@ class AsyncEFSPurger:
         dir_deletion_checkpoint_file: str | Path | None = None,
         dir_deletion_resume: bool = False,
         phase1_only: bool = False,
+        backpressure_checkpoint_timeout: int = 600,
     ):
         """
         Initialize the async EFS purger.
@@ -480,6 +481,9 @@ class AsyncEFSPurger:
             dir_deletion_checkpoint_file: Path to save/load Phase 1a BFS frontier checkpoint on memory abort.
                 On abort: saves remaining dirs to scan, runs Phase 1b on dirs found so far, exits 75.
             dir_deletion_resume: If True, resume Phase 1a discovery from dir_deletion_checkpoint_file.
+            backpressure_checkpoint_timeout: Seconds of sustained back-pressure before forcing a checkpoint exit
+                (default: 600). Prevents the job from stalling indefinitely when memory stabilises between the
+                back-pressure threshold (85%) and the critical checkpoint threshold (95%). Set to 0 to disable.
 
         Raises:
             ValueError: If invalid parameters are provided
@@ -590,6 +594,7 @@ class AsyncEFSPurger:
         self.dir_deletion_checkpoint_file = Path(dir_deletion_checkpoint_file) if dir_deletion_checkpoint_file else None
         self.dir_deletion_resume = dir_deletion_resume
         self.phase1_only = phase1_only
+        self.backpressure_checkpoint_timeout = backpressure_checkpoint_timeout
 
         # Compute discovery limit: if explicitly set use that, otherwise derive from memory budget.
         # Each Path object is ~400-600 bytes, so we allow roughly 60% of the memory budget for paths.
@@ -693,6 +698,7 @@ class AsyncEFSPurger:
         self.last_memory_warning = 0  # Track last warning time
         self.memory_warning_interval = 60  # Only warn once per minute
         self.memory_check_lock = asyncio.Lock()  # Prevent concurrent checks
+        self._backpressure_start_time: float | None = None  # When sustained back-pressure began
 
         # Checkpoint/resume: when memory critical, save state and exit for resume
         self._checkpoint_requested = False
@@ -758,6 +764,10 @@ class AsyncEFSPurger:
                 current_time = time.time()
                 memory_percent = (memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
 
+                # Record when back-pressure started (used for sustained back-pressure detection below)
+                if self._backpressure_start_time is None:
+                    self._backpressure_start_time = current_time
+
                 # At 95%+: request checkpoint and exit to avoid OOM (when checkpoint_file is set)
                 CRITICAL_THRESHOLD_PERCENT = 95
                 if (
@@ -773,6 +783,32 @@ class AsyncEFSPurger:
                         {
                             "memory_mb": round(memory_mb, 1),
                             "memory_percent": round(memory_percent, 1),
+                            "checkpoint_file": str(self.checkpoint_file),
+                        },
+                    )
+                    return True, memory_mb
+
+                # Sustained back-pressure: if memory has been above the back-pressure threshold
+                # for longer than backpressure_checkpoint_timeout seconds without reaching the
+                # critical threshold (95%), checkpoint and exit. This prevents the job from
+                # stalling indefinitely when memory stabilises between the two thresholds.
+                if (
+                    self.checkpoint_file
+                    and self.backpressure_checkpoint_timeout > 0
+                    and not self._checkpoint_requested
+                    and (current_time - self._backpressure_start_time) >= self.backpressure_checkpoint_timeout
+                ):
+                    self._checkpoint_requested = True
+                    sustained_seconds = int(current_time - self._backpressure_start_time)
+                    log_with_context(
+                        self.logger,
+                        "warning",
+                        "Sustained back-pressure timeout reached, requesting checkpoint and graceful exit for resume",
+                        {
+                            "memory_mb": round(memory_mb, 1),
+                            "memory_percent": round(memory_percent, 1),
+                            "sustained_seconds": sustained_seconds,
+                            "timeout_seconds": self.backpressure_checkpoint_timeout,
                             "checkpoint_file": str(self.checkpoint_file),
                         },
                     )
@@ -797,6 +833,10 @@ class AsyncEFSPurger:
                 gc.collect()
 
                 return True, memory_mb  # Memory is high, caller should reduce batch sizes
+
+            else:
+                # Memory has dropped below the back-pressure threshold — reset the sustained timer
+                self._backpressure_start_time = None
 
             return False, memory_mb  # Memory is OK, but return value for proactive reduction
 
@@ -3085,6 +3125,7 @@ async def async_main(
     dir_deletion_checkpoint_file: str | Path | None = None,
     dir_deletion_resume: bool = False,
     phase1_only: bool = False,
+    backpressure_checkpoint_timeout: int = 600,
 ) -> dict:
     """
     Async entry point for the purger.
@@ -3109,6 +3150,8 @@ async def async_main(
         resume: If True, load checkpoint and resume Phase 2 from saved state
         dir_deletion_checkpoint_file: Path to save/load Phase 1a BFS frontier checkpoint on memory abort
         dir_deletion_resume: If True, resume Phase 1a discovery from dir_deletion_checkpoint_file
+        backpressure_checkpoint_timeout: Seconds of sustained back-pressure before forcing checkpoint exit
+            (default: 600)
 
     Returns:
         Operation statistics
@@ -3134,6 +3177,7 @@ async def async_main(
         dir_deletion_checkpoint_file=dir_deletion_checkpoint_file,
         dir_deletion_resume=dir_deletion_resume,
         phase1_only=phase1_only,
+        backpressure_checkpoint_timeout=backpressure_checkpoint_timeout,
     )
 
     return await purger.purge()

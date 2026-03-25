@@ -37,7 +37,7 @@ def save_checkpoint(
         "empty_dirs": empty_dirs or [],
     }
     with open(filepath, "w") as f:
-        json.dump(data, f, indent=2)
+        json.dump(data, f)
 
 
 def save_phase1a_checkpoint(

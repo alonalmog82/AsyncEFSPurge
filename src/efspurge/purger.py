@@ -2610,6 +2610,10 @@ class AsyncEFSPurger:
         pending_tasks: set[asyncio.Task] = set(workers)
         if loader_task is not None:
             pending_tasks.add(loader_task)
+        # Checkpoint write task started early (before finally overhead) on the rescue path.
+        # Initialised here so the post-finally block can always reference it.
+        _cp_task_early: asyncio.Future | None = None
+        _cp_pending_count: int = 0
         try:
             while pending_tasks:
                 done, pending_tasks = await asyncio.wait(pending_tasks, timeout=1.0)
@@ -2641,6 +2645,62 @@ class AsyncEFSPurger:
                         # threads), so asyncio.gather would block indefinitely.  os._exit(75)
                         # will kill the threads when the process exits after saving the checkpoint.
                     pending_tasks.clear()
+
+                    # START CHECKPOINT WRITE EARLY — before the finally-block worker cleanup.
+                    # The finally block waits up to 5 s for cooperative workers + 5 s for the
+                    # loader; starting the write here means it runs concurrently with that
+                    # cleanup, gaining ~10 s of NFS write time before the OOM killer fires.
+                    #
+                    # Why it's safe to drain the queue here:
+                    #   - cooperative workers already exited (they responded to _checkpoint_requested
+                    #     during the stuck_worker_cancel_timeout wait above)
+                    #   - stuck workers are blocked inside run_in_executor and cannot push to queue
+                    #   - the loader has had >= stuck_worker_cancel_timeout seconds to see the flag
+                    #     and populate loader_remaining; we do a brief extra wait to confirm
+                    if self.checkpoint_file:
+                        # Brief wait for loader to drain remaining paths into loader_remaining.
+                        # After stuck_worker_cancel_timeout seconds with the flag set, the loader
+                        # has almost certainly already exited cooperatively; this is a safety net.
+                        if loader_task is not None and not loader_task.done():
+                            await asyncio.wait({loader_task}, timeout=1.0)
+                        _all_pending_early: list[Path] = []
+                        while True:
+                            try:
+                                _all_pending_early.append(scan_queue.get_nowait())
+                            except asyncio.QueueEmpty:
+                                break
+                        async with self._checkpoint_lock:
+                            _all_pending_early.extend(self._checkpoint_pending)
+                        _all_pending_early.extend(loader_remaining)
+                        _cp_pending_count = len(_all_pending_early)
+                        _loop = asyncio.get_running_loop()
+                        _pending_strs = [str(p) for p in _all_pending_early]
+                        _empty_strs = [str(p) for p in self.empty_dirs]
+                        _cp_task_early = asyncio.ensure_future(
+                            _loop.run_in_executor(
+                                None,
+                                lambda: save_checkpoint(
+                                    self.checkpoint_file,
+                                    str(self.root_path),
+                                    _pending_strs,
+                                    dict(self.stats),
+                                    {
+                                        "max_age_days": self.max_age_days,
+                                        "root_path": str(self.root_path),
+                                    },
+                                    empty_dirs=_empty_strs,
+                                ),
+                            )
+                        )
+                        log_with_context(
+                            self.logger,
+                            "info",
+                            "Checkpoint write started early (concurrent with worker cleanup)",
+                            {
+                                "pending_dirs_count": _cp_pending_count,
+                                "checkpoint_file": str(self.checkpoint_file),
+                            },
+                        )
                     break
         finally:
             # Ensure clean shutdown: signal workers and cancel any still running
@@ -2661,66 +2721,84 @@ class AsyncEFSPurger:
             if loader_task is not None:
                 await asyncio.wait({loader_task}, timeout=5.0)
 
-        # If checkpoint was requested (memory critical), save and exit for resume
+        # If checkpoint was requested (memory critical), wait for the in-progress write
+        # (started early in the rescue path) or start one now (cooperative-exit path where
+        # all workers finished before the stuck-worker cancel timeout fired).
         if self._checkpoint_requested and self.checkpoint_file:
-            # Collect all pending dirs: queue contents + workers' contributions + loader's remainder
-            all_pending: list[Path] = []
-            while True:
-                try:
-                    p = scan_queue.get_nowait()
-                    all_pending.append(p)
-                except asyncio.QueueEmpty:
-                    break
-            async with self._checkpoint_lock:
-                all_pending.extend(self._checkpoint_pending)
-            all_pending.extend(loader_remaining)
-            # Dedupe not needed - BFS can have same dir from different parents, but we'll process
-            # each once; duplicates just mean redundant scans. Keep order for simplicity.
-            #
-            # Run save_checkpoint in a thread executor so EFS NFS write syscalls cannot freeze
-            # the event loop.  open(filepath, "w") is itself an NFS syscall that can hang
-            # (same mechanism as scandir) — calling it synchronously would block os._exit
-            # indefinitely.  asyncio.wait(timeout=60) returns after 60 s without attempting
-            # to cancel the thread (same reasoning as the finally block above), so the old
-            # checkpoint is never truncated if the NFS open() hangs.
-            loop = asyncio.get_running_loop()
-            pending_dirs_strs = [str(p) for p in all_pending]
-            empty_dirs_strs = [str(p) for p in self.empty_dirs]
-            cp_task = asyncio.ensure_future(
-                loop.run_in_executor(
-                    None,
-                    lambda: save_checkpoint(
-                        self.checkpoint_file,
-                        str(self.root_path),
-                        pending_dirs_strs,
-                        dict(self.stats),
+            if _cp_task_early is not None:
+                # Write was started before the finally block.  The finally block took up to 10 s
+                # (5 s worker wait + 5 s loader wait); give the remaining budget of ~50 s.
+                done, _ = await asyncio.wait({_cp_task_early}, timeout=50.0)
+                if _cp_task_early in done:
+                    log_with_context(
+                        self.logger,
+                        "info",
+                        "Checkpoint saved, exit for resume. Run with --resume to continue.",
                         {
-                            "max_age_days": self.max_age_days,
-                            "root_path": str(self.root_path),
+                            "checkpoint_file": str(self.checkpoint_file),
+                            "pending_dirs_count": _cp_pending_count,
                         },
-                        empty_dirs=empty_dirs_strs,
-                    ),
-                ),
-            )
-            done, _ = await asyncio.wait({cp_task}, timeout=60.0)
-            if cp_task in done:
-                log_with_context(
-                    self.logger,
-                    "info",
-                    "Checkpoint saved, exit for resume. Run with --resume to continue.",
-                    {
-                        "checkpoint_file": str(self.checkpoint_file),
-                        "pending_dirs_count": len(all_pending),
-                    },
-                )
+                    )
+                else:
+                    log_with_context(
+                        self.logger,
+                        "warning",
+                        "Checkpoint write timed out (EFS NFS open/write syscall hung). "
+                        "Old checkpoint preserved — will retry on next run.",
+                        {"checkpoint_file": str(self.checkpoint_file)},
+                    )
             else:
-                log_with_context(
-                    self.logger,
-                    "warning",
-                    "Checkpoint write timed out (EFS NFS open/write syscall hung). "
-                    "Old checkpoint preserved — will retry on next run.",
-                    {"checkpoint_file": str(self.checkpoint_file)},
+                # Cooperative-exit path: all workers finished before stuck_worker_cancel_timeout
+                # fired, so no early write was started.  Start one now.
+                # (Same executor + asyncio.wait pattern — see rationale in the rescue path above.)
+                all_pending: list[Path] = []
+                while True:
+                    try:
+                        p = scan_queue.get_nowait()
+                        all_pending.append(p)
+                    except asyncio.QueueEmpty:
+                        break
+                async with self._checkpoint_lock:
+                    all_pending.extend(self._checkpoint_pending)
+                all_pending.extend(loader_remaining)
+                loop = asyncio.get_running_loop()
+                pending_dirs_strs = [str(p) for p in all_pending]
+                empty_dirs_strs = [str(p) for p in self.empty_dirs]
+                cp_task = asyncio.ensure_future(
+                    loop.run_in_executor(
+                        None,
+                        lambda: save_checkpoint(
+                            self.checkpoint_file,
+                            str(self.root_path),
+                            pending_dirs_strs,
+                            dict(self.stats),
+                            {
+                                "max_age_days": self.max_age_days,
+                                "root_path": str(self.root_path),
+                            },
+                            empty_dirs=empty_dirs_strs,
+                        ),
+                    ),
                 )
+                done, _ = await asyncio.wait({cp_task}, timeout=60.0)
+                if cp_task in done:
+                    log_with_context(
+                        self.logger,
+                        "info",
+                        "Checkpoint saved, exit for resume. Run with --resume to continue.",
+                        {
+                            "checkpoint_file": str(self.checkpoint_file),
+                            "pending_dirs_count": len(all_pending),
+                        },
+                    )
+                else:
+                    log_with_context(
+                        self.logger,
+                        "warning",
+                        "Checkpoint write timed out (EFS NFS open/write syscall hung). "
+                        "Old checkpoint preserved — will retry on next run.",
+                        {"checkpoint_file": str(self.checkpoint_file)},
+                    )
             raise CheckpointExit("Memory critical, checkpoint save attempted. Run with --resume to continue.")
 
     async def _background_progress_reporter(self) -> None:

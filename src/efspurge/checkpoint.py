@@ -1,6 +1,7 @@
 """Checkpoint/resume support for long-running purge operations."""
 
 import gzip
+import io
 import json
 import logging
 import os
@@ -53,7 +54,15 @@ def save_checkpoint(
     try:
         with os.fdopen(tmp_fd, "wb") as raw:
             with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=1) as gz:
-                gz.write(json.dumps(data).encode())
+                # Stream JSON directly into gzip rather than building the full
+                # string first.  json.dumps(data).encode() for 7M+ pending dirs
+                # allocates ~1 GB of temporary objects — fatal at 85% cgroup
+                # memory usage.  json.dump() writes incrementally to the wrapper,
+                # keeping peak memory near zero for the serialisation step.
+                wrapper = io.TextIOWrapper(gz, encoding="utf-8")
+                json.dump(data, wrapper)
+                wrapper.flush()
+                wrapper.detach()  # prevent TextIOWrapper.__exit__ from closing gz
         os.replace(tmp_path, filepath)
     except Exception:
         try:

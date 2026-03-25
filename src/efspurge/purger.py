@@ -2327,15 +2327,18 @@ class AsyncEFSPurger:
         # When checkpoint has more paths than queue_maxsize, we must feed the queue
         # incrementally via a loader task. Otherwise put_nowait breaks on QueueFull
         # and we lose the remaining paths, causing a permanent hang.
-        remaining_checkpoint_paths: list[Path] = []
+        # Keep checkpoint paths as strings (not Path objects) to avoid the ~1.5 GB
+        # peak allocation from converting 7M+ strings to Path objects upfront.
+        # Path objects are created one at a time as items enter the queue.
+        remaining_checkpoint_paths: list[str] = []
         if self.resume and self.checkpoint_file and self.checkpoint_file.exists():
             cp = load_checkpoint(self.checkpoint_file)
             if cp:
-                pending_paths = [Path(p) for p in cp["pending_dirs"]]
+                pending_paths: list[str] = cp["pending_dirs"]
                 loaded_count = 0
                 for p in pending_paths:
                     try:
-                        scan_queue.put_nowait(p)
+                        scan_queue.put_nowait(Path(p))
                         loaded_count += 1
                     except asyncio.QueueFull:
                         remaining_checkpoint_paths = pending_paths[loaded_count:]
@@ -2573,7 +2576,9 @@ class AsyncEFSPurger:
         # When queue is full we sleep briefly and recheck _checkpoint_requested so we don't
         # block forever when workers have exited (memory-critical path). Paths not yet put
         # are stored in loader_remaining for inclusion in the checkpoint.
-        loader_remaining: list[Path] = []
+        # Keep loader_remaining as strings (matches remaining_checkpoint_paths type).
+        # str(string) is a no-op in CPython, so _pending_strs conversion at rescue is free.
+        loader_remaining: list[str] = []
 
         async def _checkpoint_loader() -> None:
             for i, p in enumerate(remaining_checkpoint_paths):
@@ -2581,7 +2586,7 @@ class AsyncEFSPurger:
                     loader_remaining.extend(remaining_checkpoint_paths[i:])
                     return
                 try:
-                    scan_queue.put_nowait(p)
+                    scan_queue.put_nowait(Path(p))
                 except asyncio.QueueFull:
                     # Back-pressure: wait and recheck so we can exit when checkpoint requested
                     while True:
@@ -2590,7 +2595,7 @@ class AsyncEFSPurger:
                             return
                         await asyncio.sleep(0.1)
                         try:
-                            scan_queue.put_nowait(p)
+                            scan_queue.put_nowait(Path(p))
                             break
                         except asyncio.QueueFull:
                             continue

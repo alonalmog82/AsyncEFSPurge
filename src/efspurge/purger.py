@@ -453,6 +453,7 @@ class AsyncEFSPurger:
         dir_deletion_resume: bool = False,
         phase1_only: bool = False,
         backpressure_checkpoint_timeout: int = 600,
+        stuck_worker_cancel_timeout: int = 30,
     ):
         """
         Initialize the async EFS purger.
@@ -484,6 +485,9 @@ class AsyncEFSPurger:
             backpressure_checkpoint_timeout: Seconds of sustained back-pressure before forcing a checkpoint exit
                 (default: 600). Prevents the job from stalling indefinitely when memory stabilises between the
                 back-pressure threshold (85%) and the critical checkpoint threshold (95%). Set to 0 to disable.
+            stuck_worker_cancel_timeout: Seconds to wait for cooperative worker exit after checkpoint is requested
+                before force-cancelling workers that are stuck in EFS syscalls (default: 30). Stuck workers'
+                in-flight directories are rescued into the checkpoint for retry on the next resume.
 
         Raises:
             ValueError: If invalid parameters are provided
@@ -595,6 +599,7 @@ class AsyncEFSPurger:
         self.dir_deletion_resume = dir_deletion_resume
         self.phase1_only = phase1_only
         self.backpressure_checkpoint_timeout = backpressure_checkpoint_timeout
+        self.stuck_worker_cancel_timeout = stuck_worker_cancel_timeout
 
         # Compute discovery limit: if explicitly set use that, otherwise derive from memory budget.
         # Each Path object is ~400-600 bytes, so we allow roughly 60% of the memory budget for paths.
@@ -2384,6 +2389,12 @@ class AsyncEFSPurger:
             },
         )
 
+        # Per-worker current directory: used to rescue in-flight dirs when workers are
+        # blocked inside EFS syscalls (run_in_executor) and cannot respond to
+        # _checkpoint_requested cooperatively.  Keyed by worker_id; value is the
+        # directory the worker is currently scanning, or None when idle.
+        worker_active_dirs: dict[int, Path | None] = {}
+
         async def _scan_worker(worker_id: int) -> None:
             """Worker that scans directories from queue and processes files."""
             nonlocal pending_dirs
@@ -2414,6 +2425,10 @@ class AsyncEFSPurger:
                     if scan_done.is_set():
                         break
                     continue
+
+                # Record current dir so the gather loop can rescue it if this worker
+                # gets stuck on an EFS syscall and cannot exit cooperatively.
+                worker_active_dirs[worker_id] = directory
 
                 # Track this directory as active (for stuck detection diagnostics)
                 async with self.active_directories_lock:
@@ -2545,6 +2560,9 @@ class AsyncEFSPurger:
                     async with self.active_directories_lock:
                         self.active_directories.discard(directory)
 
+                    # Clear the per-worker active-dir tracker now that this dir is done
+                    worker_active_dirs[worker_id] = None
+
                     # Decrement pending counter; when zero, all work is done
                     async with pending_lock:
                         pending_dirs -= 1
@@ -2579,14 +2597,48 @@ class AsyncEFSPurger:
 
         # Launch workers and optionally the checkpoint loader
         workers = [asyncio.create_task(_scan_worker(i)) for i in range(num_workers)]
+        # Maps task object-id → worker_id so we can look up worker_active_dirs on cancel
+        task_to_worker_id: dict[int, int] = {id(task): i for i, task in enumerate(workers)}
         loader_task = asyncio.create_task(_checkpoint_loader()) if remaining_checkpoint_paths else None
 
-        # Wait for workers and loader to complete
+        # Wait for workers and loader to complete.
+        # On the checkpoint path, workers stuck inside EFS syscalls (run_in_executor) cannot
+        # respond to _checkpoint_requested. After _STUCK_WORKER_CANCEL_TIMEOUT seconds we
+        # cancel them (after stuck_worker_cancel_timeout seconds), rescue their in-flight
+        # directory into _checkpoint_pending for retry on the next run, then proceed to
+        # save the checkpoint normally.
+        pending_tasks: set[asyncio.Task] = set(workers)
+        if loader_task is not None:
+            pending_tasks.add(loader_task)
         try:
-            if loader_task is not None:
-                await asyncio.gather(*workers, loader_task)
-            else:
-                await asyncio.gather(*workers)
+            while pending_tasks:
+                done, pending_tasks = await asyncio.wait(pending_tasks, timeout=1.0)
+                if self._checkpoint_requested and pending_tasks:
+                    # Give remaining tasks up to stuck_worker_cancel_timeout to exit
+                    # cooperatively (normal workers check the flag each loop iteration).
+                    _, still_stuck = await asyncio.wait(pending_tasks, timeout=self.stuck_worker_cancel_timeout)
+                    if still_stuck:
+                        for task in still_stuck:
+                            wid = task_to_worker_id.get(id(task))
+                            if wid is not None:
+                                stuck_dir = worker_active_dirs.get(wid)
+                                if stuck_dir is not None:
+                                    async with self._checkpoint_lock:
+                                        self._checkpoint_pending.append(stuck_dir)
+                                    log_with_context(
+                                        self.logger,
+                                        "warning",
+                                        "Worker stuck on EFS syscall, rescued in-flight directory for checkpoint retry",
+                                        {
+                                            "worker_id": wid,
+                                            "directory": str(stuck_dir),
+                                        },
+                                    )
+                        for task in still_stuck:
+                            task.cancel()
+                        await asyncio.gather(*still_stuck, return_exceptions=True)
+                    pending_tasks.clear()
+                    break
         finally:
             # Ensure clean shutdown: signal workers and cancel any still running
             scan_done.set()

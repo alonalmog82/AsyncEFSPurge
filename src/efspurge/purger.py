@@ -2652,15 +2652,14 @@ class AsyncEFSPurger:
                 loader_task.cancel()
             # Brief timeout: cooperative workers finish quickly; stuck EFS threads cannot be
             # cancelled and will be killed by os._exit — don't block indefinitely waiting for them.
-            try:
-                await asyncio.wait_for(asyncio.gather(*workers, return_exceptions=True), timeout=5.0)
-            except asyncio.TimeoutError:
-                pass
+            # NOTE: asyncio.wait_for is intentionally NOT used here. In Python 3.12, wait_for
+            # after its timeout fires calls fut.cancel() and then awaits cancellation acknowledgment
+            # before raising TimeoutError. Since run_in_executor threads blocked on EFS cannot
+            # acknowledge cancellation, wait_for would hang indefinitely. asyncio.wait(timeout=N)
+            # simply returns (done, pending) after N seconds without attempting to cancel anything.
+            await asyncio.wait(set(workers), timeout=5.0)
             if loader_task is not None:
-                try:
-                    await asyncio.wait_for(asyncio.gather(loader_task, return_exceptions=True), timeout=5.0)
-                except asyncio.TimeoutError:
-                    pass
+                await asyncio.wait({loader_task}, timeout=5.0)
 
         # If checkpoint was requested (memory critical), save and exit for resume
         if self._checkpoint_requested and self.checkpoint_file:

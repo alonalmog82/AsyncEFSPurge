@@ -2,6 +2,8 @@
 
 import json
 import logging
+import os
+import tempfile
 from pathlib import Path
 
 CHECKPOINT_VERSION = 1
@@ -36,8 +38,22 @@ def save_checkpoint(
         "config": config,
         "empty_dirs": empty_dirs or [],
     }
-    with open(filepath, "w") as f:
-        json.dump(data, f)
+    # Atomic write: write to a temp file on the same filesystem, then rename.
+    # This ensures the previous checkpoint is never truncated unless the new one
+    # is fully written — critical when an NFS open(O_TRUNC) on the existing file
+    # can hang indefinitely (same NFS saturation mechanism as getdents).
+    filepath = Path(filepath)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=filepath.parent, suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp_path, filepath)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def save_phase1a_checkpoint(
@@ -62,8 +78,18 @@ def save_phase1a_checkpoint(
         "pending_dirs": pending_dirs,
         "config": config,
     }
-    with open(filepath, "w") as f:
-        json.dump(data, f, indent=2)
+    filepath = Path(filepath)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=filepath.parent, suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, filepath)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def load_phase1a_checkpoint(filepath: Path) -> dict | None:
@@ -122,8 +148,18 @@ def save_phase1b_checkpoint(
         "dirs_by_depth": dirs_by_depth,
         "config": config,
     }
-    with open(filepath, "w") as f:
-        json.dump(data, f, indent=2)
+    filepath = Path(filepath)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=filepath.parent, suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, filepath)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def load_phase1b_checkpoint(filepath: Path) -> dict | None:

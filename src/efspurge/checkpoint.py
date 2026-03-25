@@ -1,5 +1,6 @@
 """Checkpoint/resume support for long-running purge operations."""
 
+import gzip
 import json
 import logging
 import os
@@ -42,11 +43,17 @@ def save_checkpoint(
     # This ensures the previous checkpoint is never truncated unless the new one
     # is fully written — critical when an NFS open(O_TRUNC) on the existing file
     # can hang indefinitely (same NFS saturation mechanism as getdents).
+    #
+    # Gzip (level 1): reduces ~500 MB plain-JSON to ~60 MB, cutting NFS write time
+    # from 50+ s to ~6 s even on a saturated mount — well within the OOMKill window.
+    # Level 1 (fastest) is intentional: we want minimum CPU overhead and maximum
+    # throughput, not maximum compression ratio.
     filepath = Path(filepath)
     tmp_fd, tmp_path = tempfile.mkstemp(dir=filepath.parent, suffix=".tmp")
     try:
-        with os.fdopen(tmp_fd, "w") as f:
-            json.dump(data, f)
+        with os.fdopen(tmp_fd, "wb") as raw:
+            with gzip.GzipFile(fileobj=raw, mode="wb", compresslevel=1) as gz:
+                gz.write(json.dumps(data).encode())
         os.replace(tmp_path, filepath)
     except Exception:
         try:
@@ -200,12 +207,19 @@ def load_checkpoint(filepath: Path) -> dict | None:
     """
     Load a checkpoint from disk.
 
+    Supports both gzip-compressed (new) and plain-JSON (legacy) checkpoint files.
+
     Returns:
         Checkpoint dict with keys: root_path, pending_dirs, stats, config, empty_dirs; or None if invalid/missing
     """
     try:
-        with open(filepath) as f:
-            data = json.load(f)
+        try:
+            with gzip.open(filepath, "rt") as f:
+                data = json.load(f)
+        except gzip.BadGzipFile:
+            # Legacy plain-JSON checkpoint written before gzip was introduced.
+            with open(filepath) as f:
+                data = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError) as e:
         _logger.warning("Cannot load checkpoint: %s", e)
         return None

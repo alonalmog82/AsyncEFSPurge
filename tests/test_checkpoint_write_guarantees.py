@@ -340,14 +340,21 @@ async def test_checkpoint_old_content_preserved_until_new_write_complete(tmp_pat
 
     def _concurrent_reader():
         """Keep reading the checkpoint file while save_checkpoint is running."""
+        import gzip as _gzip
+        import json as _json
         while not stop_reading.is_set():
             try:
-                data = cp_path.read_text()
-                if not data:
+                raw = cp_path.read_bytes()
+                if not raw:
                     read_errors.append("checkpoint file was empty during concurrent write")
                 else:
-                    import json as _json
-                    _json.loads(data)  # must be valid JSON at all times
+                    # Must be either valid gzip-JSON (new) or valid plain JSON (legacy).
+                    try:
+                        import io
+                        with _gzip.open(io.BytesIO(raw), "rt") as f:
+                            _json.load(f)
+                    except _gzip.BadGzipFile:
+                        _json.loads(raw.decode())
             except (OSError, ValueError) as e:
                 read_errors.append(f"checkpoint unreadable during write: {e}")
             time.sleep(0.001)

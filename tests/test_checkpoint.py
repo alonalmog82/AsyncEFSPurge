@@ -19,7 +19,8 @@ from efspurge.purger import AsyncEFSPurger
 
 
 def test_save_checkpoint_creates_valid_json(tmp_path):
-    """save_checkpoint writes valid JSON with expected keys."""
+    """save_checkpoint writes valid gzip-compressed JSON with expected keys."""
+    import gzip
     cp = tmp_path / "checkpoint.json"
     save_checkpoint(
         filepath=cp,
@@ -29,7 +30,8 @@ def test_save_checkpoint_creates_valid_json(tmp_path):
         config={"max_age_days": 30},
     )
     assert cp.exists()
-    data = json.loads(cp.read_text())
+    with gzip.open(cp, "rt") as f:
+        data = json.loads(f.read())
     assert data["version"] == CHECKPOINT_VERSION
     assert data["phase"] == "phase2"
     assert data["root_path"] == "/data/root"

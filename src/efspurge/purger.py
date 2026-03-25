@@ -2730,15 +2730,28 @@ class AsyncEFSPurger:
                 # (5 s worker wait + 5 s loader wait); give the remaining budget of ~50 s.
                 done, _ = await asyncio.wait({_cp_task_early}, timeout=50.0)
                 if _cp_task_early in done:
-                    log_with_context(
-                        self.logger,
-                        "info",
-                        "Checkpoint saved, exit for resume. Run with --resume to continue.",
-                        {
-                            "checkpoint_file": str(self.checkpoint_file),
-                            "pending_dirs_count": _cp_pending_count,
-                        },
-                    )
+                    try:
+                        _cp_task_early.result()  # re-raises if save_checkpoint threw
+                        log_with_context(
+                            self.logger,
+                            "info",
+                            "Checkpoint saved, exit for resume. Run with --resume to continue.",
+                            {
+                                "checkpoint_file": str(self.checkpoint_file),
+                                "pending_dirs_count": _cp_pending_count,
+                            },
+                        )
+                    except Exception as exc:
+                        log_with_context(
+                            self.logger,
+                            "warning",
+                            "Checkpoint write failed (NFS error). "
+                            "Old checkpoint preserved — will retry on next run.",
+                            {
+                                "checkpoint_file": str(self.checkpoint_file),
+                                "error": str(exc),
+                            },
+                        )
                 else:
                     log_with_context(
                         self.logger,
@@ -2782,15 +2795,28 @@ class AsyncEFSPurger:
                 )
                 done, _ = await asyncio.wait({cp_task}, timeout=60.0)
                 if cp_task in done:
-                    log_with_context(
-                        self.logger,
-                        "info",
-                        "Checkpoint saved, exit for resume. Run with --resume to continue.",
-                        {
-                            "checkpoint_file": str(self.checkpoint_file),
-                            "pending_dirs_count": len(all_pending),
-                        },
-                    )
+                    try:
+                        cp_task.result()  # re-raises if save_checkpoint threw
+                        log_with_context(
+                            self.logger,
+                            "info",
+                            "Checkpoint saved, exit for resume. Run with --resume to continue.",
+                            {
+                                "checkpoint_file": str(self.checkpoint_file),
+                                "pending_dirs_count": len(all_pending),
+                            },
+                        )
+                    except Exception as exc:
+                        log_with_context(
+                            self.logger,
+                            "warning",
+                            "Checkpoint write failed (NFS error). "
+                            "Old checkpoint preserved — will retry on next run.",
+                            {
+                                "checkpoint_file": str(self.checkpoint_file),
+                                "error": str(exc),
+                            },
+                        )
                 else:
                     log_with_context(
                         self.logger,

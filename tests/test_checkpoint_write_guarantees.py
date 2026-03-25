@@ -40,10 +40,8 @@ from unittest.mock import patch
 
 import pytest
 
-import efspurge.checkpoint as checkpoint_mod
 from efspurge.checkpoint import load_checkpoint, save_checkpoint
 from efspurge.purger import AsyncEFSPurger, CheckpointExit, async_scandir_batched
-
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -175,7 +173,7 @@ async def test_checkpoint_write_starts_before_finally_overhead(tmp_path):
     """
     STUCK_CANCEL_TIMEOUT = 1
     FINALLY_SIMULATED_DELAY_S = 3.0  # injected into each finally-block wait (timeout=5.0)
-    MIN_EXPECTED_GAP_SECONDS = 2.5   # write started ≥ 2.5 s before CheckpointExit
+    MIN_EXPECTED_GAP_SECONDS = 2.5  # write started ≥ 2.5 s before CheckpointExit
 
     root = tmp_path / "root"
     root.mkdir()
@@ -342,6 +340,7 @@ async def test_checkpoint_old_content_preserved_until_new_write_complete(tmp_pat
         """Keep reading the checkpoint file while save_checkpoint is running."""
         import gzip as _gzip
         import json as _json
+
         while not stop_reading.is_set():
             try:
                 raw = cp_path.read_bytes()
@@ -351,6 +350,7 @@ async def test_checkpoint_old_content_preserved_until_new_write_complete(tmp_pat
                     # Must be either valid gzip-JSON (new) or valid plain JSON (legacy).
                     try:
                         import io
+
                         with _gzip.open(io.BytesIO(raw), "rt") as f:
                             _json.load(f)
                     except _gzip.BadGzipFile:
@@ -378,6 +378,5 @@ async def test_checkpoint_old_content_preserved_until_new_write_complete(tmp_pat
 
     assert not read_errors, (
         "Checkpoint file was observed in an invalid state during a concurrent write — "
-        "the write is not atomic.  Bug 4 regression: "
-        + "; ".join(read_errors[:3])
+        "the write is not atomic.  Bug 4 regression: " + "; ".join(read_errors[:3])
     )

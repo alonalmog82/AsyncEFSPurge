@@ -2676,27 +2676,52 @@ class AsyncEFSPurger:
             all_pending.extend(loader_remaining)
             # Dedupe not needed - BFS can have same dir from different parents, but we'll process
             # each once; duplicates just mean redundant scans. Keep order for simplicity.
-            save_checkpoint(
-                self.checkpoint_file,
-                str(self.root_path),
-                [str(p) for p in all_pending],
-                dict(self.stats),
-                {
-                    "max_age_days": self.max_age_days,
-                    "root_path": str(self.root_path),
-                },
-                empty_dirs=[str(p) for p in self.empty_dirs],
+            #
+            # Run save_checkpoint in a thread executor so EFS NFS write syscalls cannot freeze
+            # the event loop.  open(filepath, "w") is itself an NFS syscall that can hang
+            # (same mechanism as scandir) — calling it synchronously would block os._exit
+            # indefinitely.  asyncio.wait(timeout=60) returns after 60 s without attempting
+            # to cancel the thread (same reasoning as the finally block above), so the old
+            # checkpoint is never truncated if the NFS open() hangs.
+            loop = asyncio.get_running_loop()
+            pending_dirs_strs = [str(p) for p in all_pending]
+            empty_dirs_strs = [str(p) for p in self.empty_dirs]
+            cp_task = asyncio.ensure_future(
+                loop.run_in_executor(
+                    None,
+                    lambda: save_checkpoint(
+                        self.checkpoint_file,
+                        str(self.root_path),
+                        pending_dirs_strs,
+                        dict(self.stats),
+                        {
+                            "max_age_days": self.max_age_days,
+                            "root_path": str(self.root_path),
+                        },
+                        empty_dirs=empty_dirs_strs,
+                    ),
+                ),
             )
-            log_with_context(
-                self.logger,
-                "info",
-                "Checkpoint saved, exit for resume. Run with --resume to continue.",
-                {
-                    "checkpoint_file": str(self.checkpoint_file),
-                    "pending_dirs_count": len(all_pending),
-                },
-            )
-            raise CheckpointExit("Memory critical, checkpoint saved. Run with --resume to continue.")
+            done, _ = await asyncio.wait({cp_task}, timeout=60.0)
+            if cp_task in done:
+                log_with_context(
+                    self.logger,
+                    "info",
+                    "Checkpoint saved, exit for resume. Run with --resume to continue.",
+                    {
+                        "checkpoint_file": str(self.checkpoint_file),
+                        "pending_dirs_count": len(all_pending),
+                    },
+                )
+            else:
+                log_with_context(
+                    self.logger,
+                    "warning",
+                    "Checkpoint write timed out (EFS NFS open/write syscall hung). "
+                    "Old checkpoint preserved — will retry on next run.",
+                    {"checkpoint_file": str(self.checkpoint_file)},
+                )
+            raise CheckpointExit("Memory critical, checkpoint save attempted. Run with --resume to continue.")
 
     async def _background_progress_reporter(self) -> None:
         """

@@ -2636,7 +2636,10 @@ class AsyncEFSPurger:
                                     )
                         for task in still_stuck:
                             task.cancel()
-                        await asyncio.gather(*still_stuck, return_exceptions=True)
+                        # Do NOT await still_stuck here: run_in_executor threads blocked on EFS
+                        # cannot be cancelled (cf_future.cancel() returns False for running
+                        # threads), so asyncio.gather would block indefinitely.  os._exit(75)
+                        # will kill the threads when the process exits after saving the checkpoint.
                     pending_tasks.clear()
                     break
         finally:
@@ -2647,9 +2650,17 @@ class AsyncEFSPurger:
                     w.cancel()
             if loader_task is not None and not loader_task.done():
                 loader_task.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
+            # Brief timeout: cooperative workers finish quickly; stuck EFS threads cannot be
+            # cancelled and will be killed by os._exit — don't block indefinitely waiting for them.
+            try:
+                await asyncio.wait_for(asyncio.gather(*workers, return_exceptions=True), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
             if loader_task is not None:
-                await asyncio.gather(loader_task, return_exceptions=True)
+                try:
+                    await asyncio.wait_for(asyncio.gather(loader_task, return_exceptions=True), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
 
         # If checkpoint was requested (memory critical), save and exit for resume
         if self._checkpoint_requested and self.checkpoint_file:

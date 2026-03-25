@@ -9,6 +9,7 @@ the next resume — making the scan self-resolving given sufficient runs.
 
 import asyncio
 import os
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -41,17 +42,25 @@ def _make_purger(tmp_path: Path, root: Path, stuck_worker_cancel_timeout: int = 
 
 
 def _hanging_scandir_factory(stuck_paths: set[Path]):
-    """Return a patched async_scandir_batched that hangs forever on stuck_paths."""
-    hang_event = asyncio.Event()  # never set
+    """Return a patched async_scandir_batched that blocks in a thread for stuck_paths.
+
+    Uses run_in_executor + threading.Event to faithfully simulate a real EFS syscall
+    hang: the blocking happens in a thread, so asyncio task.cancel() cannot unblock
+    it (cf_future.cancel() returns False for a running thread).  This matches the
+    prod behaviour where os._exit(75) is the only thing that kills the threads.
+    """
+    unblock_event = threading.Event()  # set by fixture teardown / test cleanup
 
     async def _patched(path, executor):
         if Path(path) in stuck_paths:
-            await hang_event.wait()  # simulates blocked EFS syscall
+            loop = asyncio.get_running_loop()
+            # Block in the thread pool — cannot be cancelled by asyncio
+            await loop.run_in_executor(executor, lambda: unblock_event.wait(timeout=30))
             return
         async for batch in async_scandir_batched(path, executor):
             yield batch
 
-    return _patched
+    return _patched, unblock_event
 
 
 # ---------------------------------------------------------------------------
@@ -77,11 +86,14 @@ async def test_single_stuck_worker_rescued_to_checkpoint(tmp_path):
         await asyncio.sleep(0.2)
         purger._checkpoint_requested = True
 
-    patched = _hanging_scandir_factory({stuck_dir})
-    with patch("efspurge.purger.async_scandir_batched", new=patched):
-        asyncio.create_task(_trigger())
-        with pytest.raises(CheckpointExit):
-            await purger._scan_and_purge_files()
+    patched, unblock = _hanging_scandir_factory({stuck_dir})
+    try:
+        with patch("efspurge.purger.async_scandir_batched", new=patched):
+            asyncio.create_task(_trigger())
+            with pytest.raises(CheckpointExit):
+                await purger._scan_and_purge_files()
+    finally:
+        unblock.set()
 
     cp = load_checkpoint(tmp_path / "cp.json")
     assert cp is not None, "Checkpoint file must be written"
@@ -105,11 +117,14 @@ async def test_multiple_stuck_workers_all_rescued(tmp_path):
         await asyncio.sleep(0.2)
         purger._checkpoint_requested = True
 
-    patched = _hanging_scandir_factory(stuck_dirs)
-    with patch("efspurge.purger.async_scandir_batched", new=patched):
-        asyncio.create_task(_trigger())
-        with pytest.raises(CheckpointExit):
-            await purger._scan_and_purge_files()
+    patched, unblock = _hanging_scandir_factory(stuck_dirs)
+    try:
+        with patch("efspurge.purger.async_scandir_batched", new=patched):
+            asyncio.create_task(_trigger())
+            with pytest.raises(CheckpointExit):
+                await purger._scan_and_purge_files()
+    finally:
+        unblock.set()
 
     cp = load_checkpoint(tmp_path / "cp.json")
     assert cp is not None
@@ -167,11 +182,14 @@ async def test_rescued_dir_included_in_next_resume(tmp_path):
         await asyncio.sleep(0.2)
         purger._checkpoint_requested = True
 
-    patched = _hanging_scandir_factory({stuck_dir})
-    with patch("efspurge.purger.async_scandir_batched", new=patched):
-        asyncio.create_task(_trigger())
-        with pytest.raises(CheckpointExit):
-            await purger._scan_and_purge_files()
+    patched, unblock = _hanging_scandir_factory({stuck_dir})
+    try:
+        with patch("efspurge.purger.async_scandir_batched", new=patched):
+            asyncio.create_task(_trigger())
+            with pytest.raises(CheckpointExit):
+                await purger._scan_and_purge_files()
+    finally:
+        unblock.set()
 
     cp = load_checkpoint(tmp_path / "cp.json")
     assert cp is not None

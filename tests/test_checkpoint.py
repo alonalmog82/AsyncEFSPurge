@@ -21,6 +21,7 @@ from efspurge.purger import AsyncEFSPurger
 def test_save_checkpoint_creates_valid_json(tmp_path):
     """save_checkpoint writes valid gzip-compressed JSON with expected keys."""
     import gzip
+
     cp = tmp_path / "checkpoint.json"
     save_checkpoint(
         filepath=cp,

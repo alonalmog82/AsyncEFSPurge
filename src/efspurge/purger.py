@@ -2745,8 +2745,7 @@ class AsyncEFSPurger:
                         log_with_context(
                             self.logger,
                             "warning",
-                            "Checkpoint write failed (NFS error). "
-                            "Old checkpoint preserved — will retry on next run.",
+                            "Checkpoint write failed (NFS error). Old checkpoint preserved — will retry on next run.",
                             {
                                 "checkpoint_file": str(self.checkpoint_file),
                                 "error": str(exc),
@@ -2810,8 +2809,7 @@ class AsyncEFSPurger:
                         log_with_context(
                             self.logger,
                             "warning",
-                            "Checkpoint write failed (NFS error). "
-                            "Old checkpoint preserved — will retry on next run.",
+                            "Checkpoint write failed (NFS error). Old checkpoint preserved — will retry on next run.",
                             {
                                 "checkpoint_file": str(self.checkpoint_file),
                                 "error": str(exc),

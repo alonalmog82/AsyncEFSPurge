@@ -405,7 +405,8 @@ async def test_phase1a_resume_with_overflow_beyond_queue_maxsize(temp_dir, tmp_p
 
 
 def test_save_checkpoint_includes_empty_dirs(tmp_path):
-    """save_checkpoint writes empty_dirs to JSON when provided."""
+    """save_checkpoint writes empty_dirs to gzip-compressed JSON when provided."""
+    import gzip as _gzip
     cp = tmp_path / "cp.json"
     save_checkpoint(
         filepath=cp,
@@ -415,12 +416,14 @@ def test_save_checkpoint_includes_empty_dirs(tmp_path):
         config={"max_age_days": 30},
         empty_dirs=["/data/empty1", "/data/empty2"],
     )
-    data = json.loads(cp.read_text())
+    with _gzip.open(cp, "rt") as f:
+        data = json.loads(f.read())
     assert data["empty_dirs"] == ["/data/empty1", "/data/empty2"]
 
 
 def test_save_checkpoint_empty_dirs_defaults_to_empty_list(tmp_path):
     """save_checkpoint writes empty list for empty_dirs when not provided."""
+    import gzip as _gzip
     cp = tmp_path / "cp.json"
     save_checkpoint(
         filepath=cp,
@@ -429,7 +432,8 @@ def test_save_checkpoint_empty_dirs_defaults_to_empty_list(tmp_path):
         stats={},
         config={},
     )
-    data = json.loads(cp.read_text())
+    with _gzip.open(cp, "rt") as f:
+        data = json.loads(f.read())
     assert data["empty_dirs"] == []
 
 

@@ -14,12 +14,16 @@ import aiofiles.os
 
 from . import __version__
 from .checkpoint import (
+    append_empty_dirs_sidecar,
+    empty_dirs_sidecar_path,
     load_checkpoint,
     load_phase1a_checkpoint,
     load_phase1b_checkpoint,
+    remove_empty_dirs_sidecar,
     save_checkpoint,
     save_phase1a_checkpoint,
     save_phase1b_checkpoint,
+    stream_empty_dirs_sidecar,
 )
 from .logging import log_with_context, setup_logging
 
@@ -917,6 +921,29 @@ class AsyncEFSPurger:
         Uses post-order deletion (children before parents) with cascading parent checks.
         Concurrent processing with deletion_semaphore for high throughput.
         """
+        # Merge in carry-over empty-dir candidates from prior runs.  These are
+        # streamed from the sidecar file written by save_checkpoint() so they
+        # never have to sit in Phase 2 memory.  Phase 3 has the queue and
+        # workers torn down, so converting to Path here is safe.
+        if self.checkpoint_file is not None:
+            sidecar = empty_dirs_sidecar_path(self.checkpoint_file)
+            if sidecar.exists():
+                loaded_from_sidecar = 0
+                for path_str in stream_empty_dirs_sidecar(self.checkpoint_file):
+                    self.empty_dirs.add(Path(path_str))
+                    loaded_from_sidecar += 1
+                if loaded_from_sidecar:
+                    log_with_context(
+                        self.logger,
+                        "info",
+                        "Loaded carry-over empty-dir candidates from sidecar",
+                        {
+                            "sidecar_file": str(sidecar),
+                            "loaded_count": loaded_from_sidecar,
+                            "in_memory_count": len(self.empty_dirs),
+                        },
+                    )
+
         if not self.empty_dirs:
             return
 
@@ -2348,10 +2375,28 @@ class AsyncEFSPurger:
                 for k, v in cp.get("stats", {}).items():
                     if k in self.stats and isinstance(self.stats[k], (int, float)):
                         self.stats[k] = v
-                # Restore empty_dirs accumulated in previous run so Phase 3 can clean them up
-                saved_empty_dirs = cp.get("empty_dirs", [])
-                if saved_empty_dirs:
-                    self.empty_dirs.update(Path(p) for p in saved_empty_dirs)
+                # Empty-dir candidates from prior runs are persisted to a sidecar
+                # file (see checkpoint.empty_dirs_sidecar_path) and streamed in
+                # only at the start of Phase 3.  Holding them in self.empty_dirs
+                # during Phase 2 was the dominant driver of the resume-baseline
+                # spiral: with millions of carry-over paths the set consumed
+                # several GB before workers had even started, pinning the
+                # process at the 85% back-pressure threshold and grinding
+                # progress to ~1 dir/s.
+                #
+                # Legacy migration: if an older checkpoint still has empty_dirs
+                # embedded, flush them to the sidecar and drop the in-memory
+                # copy immediately so the rest of Phase 2 runs with a clean
+                # baseline.  The list reference is released right after the
+                # append so the gc can reclaim it before workers start.
+                legacy_empty = cp.get("empty_dirs")
+                if legacy_empty and self.checkpoint_file is not None:
+                    try:
+                        append_empty_dirs_sidecar(self.checkpoint_file, legacy_empty)
+                    except OSError as e:
+                        self.logger.warning("Could not migrate legacy empty_dirs to sidecar: %s", e)
+                    cp["empty_dirs"] = []
+                    del legacy_empty
                 log_with_context(
                     self.logger,
                     "info",
@@ -2363,6 +2408,9 @@ class AsyncEFSPurger:
                         "remaining_to_load": len(remaining_checkpoint_paths),
                         "files_scanned_so_far": self.stats.get("files_scanned", 0),
                         "dirs_scanned_so_far": self.stats.get("dirs_scanned", 0),
+                        "empty_dirs_sidecar_exists": (
+                            self.checkpoint_file is not None and empty_dirs_sidecar_path(self.checkpoint_file).exists()
+                        ),
                     },
                 )
         if pending_dirs == 0:
@@ -3179,6 +3227,12 @@ class AsyncEFSPurger:
                         "Could not remove checkpoint file after successful purge",
                         {"checkpoint_file": str(self.checkpoint_file), "error": str(e)},
                     )
+            # Also remove the empty-dirs sidecar (written next to the
+            # checkpoint to keep carry-over empty-dir candidates off the
+            # Phase 2 heap).  Best-effort: a stale sidecar with no matching
+            # checkpoint is harmless because the next purge starts fresh.
+            if self.checkpoint_file is not None:
+                remove_empty_dirs_sidecar(self.checkpoint_file)
         finally:
             # Cancel background reporter
             progress_task.cancel()

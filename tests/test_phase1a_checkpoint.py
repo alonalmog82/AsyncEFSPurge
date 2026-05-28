@@ -404,9 +404,16 @@ async def test_phase1a_resume_with_overflow_beyond_queue_maxsize(temp_dir, tmp_p
 # ---------------------------------------------------------------------------
 
 
-def test_save_checkpoint_includes_empty_dirs(tmp_path):
-    """save_checkpoint writes empty_dirs to gzip-compressed JSON when provided."""
-    import gzip as _gzip
+def test_save_checkpoint_writes_empty_dirs_to_sidecar(tmp_path):
+    """save_checkpoint appends empty_dirs to ``<checkpoint>.empty_dirs.gz`` (not inline).
+
+    Embedding millions of empty-dir paths in the main checkpoint forced the
+    purger to re-materialise them on every resume, which drove the resume
+    baseline above the back-pressure threshold and caused a death-spiral on
+    prod.  The new design persists them to a sidecar that's streamed in only
+    at the start of Phase 3.
+    """
+    from efspurge.checkpoint import empty_dirs_sidecar_path, stream_empty_dirs_sidecar
 
     cp = tmp_path / "cp.json"
     save_checkpoint(
@@ -417,14 +424,19 @@ def test_save_checkpoint_includes_empty_dirs(tmp_path):
         config={"max_age_days": 30},
         empty_dirs=["/data/empty1", "/data/empty2"],
     )
-    with _gzip.open(cp, "rt") as f:
-        data = json.loads(f.read())
-    assert data["empty_dirs"] == ["/data/empty1", "/data/empty2"]
+    # Main checkpoint must not embed empty_dirs anymore (keeps resume baseline low).
+    loaded = load_checkpoint(cp)
+    assert loaded is not None
+    assert "empty_dirs" not in loaded or not loaded.get("empty_dirs")
+
+    # Sidecar exists and contains the paths in order.
+    assert empty_dirs_sidecar_path(cp).exists()
+    assert list(stream_empty_dirs_sidecar(cp)) == ["/data/empty1", "/data/empty2"]
 
 
-def test_save_checkpoint_empty_dirs_defaults_to_empty_list(tmp_path):
-    """save_checkpoint writes empty list for empty_dirs when not provided."""
-    import gzip as _gzip
+def test_save_checkpoint_without_empty_dirs_skips_sidecar(tmp_path):
+    """save_checkpoint with no empty_dirs does not create the sidecar."""
+    from efspurge.checkpoint import empty_dirs_sidecar_path
 
     cp = tmp_path / "cp.json"
     save_checkpoint(
@@ -434,13 +446,49 @@ def test_save_checkpoint_empty_dirs_defaults_to_empty_list(tmp_path):
         stats={},
         config={},
     )
-    with _gzip.open(cp, "rt") as f:
-        data = json.loads(f.read())
-    assert data["empty_dirs"] == []
+    assert not empty_dirs_sidecar_path(cp).exists()
 
 
-def test_load_checkpoint_returns_empty_dirs(tmp_path):
-    """load_checkpoint returns empty_dirs from checkpoint JSON."""
+def test_save_checkpoint_appends_to_existing_sidecar(tmp_path):
+    """Repeated save_checkpoint calls append to the sidecar instead of rewriting it.
+
+    This is what lets the in-memory ``empty_dirs`` set shed entries between
+    checkpoints: each save flushes the current run's incremental findings to
+    the sidecar, and prior runs' findings stay on disk where they belong.
+    """
+    from efspurge.checkpoint import stream_empty_dirs_sidecar
+
+    cp = tmp_path / "cp.json"
+    save_checkpoint(
+        filepath=cp,
+        root_path="/data",
+        pending_dirs=["/data/a"],
+        stats={},
+        config={},
+        empty_dirs=["/data/run1_a", "/data/run1_b"],
+    )
+    save_checkpoint(
+        filepath=cp,
+        root_path="/data",
+        pending_dirs=["/data/a"],
+        stats={},
+        config={},
+        empty_dirs=["/data/run2_a"],
+    )
+    assert list(stream_empty_dirs_sidecar(cp)) == [
+        "/data/run1_a",
+        "/data/run1_b",
+        "/data/run2_a",
+    ]
+
+
+def test_load_checkpoint_no_longer_embeds_empty_dirs(tmp_path):
+    """load_checkpoint returns the main checkpoint dict without an embedded empty_dirs list.
+
+    Older checkpoints written with embedded empty_dirs remain readable so
+    the purger can migrate them to the sidecar on first resume; that
+    backwards-compat path is exercised by the integration test below.
+    """
     cp = tmp_path / "cp.json"
     save_checkpoint(
         filepath=cp,
@@ -452,13 +500,18 @@ def test_load_checkpoint_returns_empty_dirs(tmp_path):
     )
     loaded = load_checkpoint(cp)
     assert loaded is not None
-    assert loaded["empty_dirs"] == ["/data/was_empty"]
+    # New checkpoints omit empty_dirs from the main payload entirely.
+    assert "empty_dirs" not in loaded
 
 
-def test_load_checkpoint_empty_dirs_missing_returns_empty_list(tmp_path):
-    """load_checkpoint handles old checkpoints without empty_dirs key gracefully."""
+def test_load_checkpoint_legacy_embedded_empty_dirs_preserved(tmp_path):
+    """A pre-existing checkpoint with embedded empty_dirs is still readable.
+
+    The purger consumes this field once on resume and migrates the entries
+    to the sidecar so subsequent runs never see it again.
+    """
     cp = tmp_path / "cp.json"
-    # Write an old-style checkpoint without empty_dirs
+    # Write a legacy-style checkpoint with empty_dirs inline (pre-sidecar format).
     data = {
         "version": CHECKPOINT_VERSION,
         "root_path": "/data",
@@ -466,11 +519,12 @@ def test_load_checkpoint_empty_dirs_missing_returns_empty_list(tmp_path):
         "pending_dirs": ["/data/a"],
         "stats": {},
         "config": {},
+        "empty_dirs": ["/data/legacy_empty"],
     }
     cp.write_text(json.dumps(data))
     loaded = load_checkpoint(cp)
     assert loaded is not None
-    assert loaded.get("empty_dirs", []) == []
+    assert loaded.get("empty_dirs") == ["/data/legacy_empty"]
 
 
 @pytest.mark.asyncio
@@ -547,6 +601,76 @@ async def test_phase2_empty_dirs_accumulated_across_checkpoint_resume(temp_dir, 
     # Both dirs should be deleted by Phase 3
     assert not from_prev_run.exists(), "Dir from previous checkpoint run should be deleted"
     assert not new_empty.exists(), "Dir found empty in this run should be deleted"
+
+
+@pytest.mark.asyncio
+async def test_phase2_resume_does_not_load_empty_dirs_into_memory(temp_dir, tmp_path):
+    """Regression: carry-over empty_dirs from prior runs must NOT live in self.empty_dirs during Phase 2.
+
+    Prod symptom (death-spiral, ~1 dir/s, exit 75 every 10 min): on resume the
+    purger materialised the entire saved empty_dirs list into a ``set[Path]``
+    before workers started, pushing memory above the 85% back-pressure
+    threshold for the entire run.  This test asserts the in-memory set is
+    empty at the start of Phase 2 even when the checkpoint records many
+    carry-over empty-dir candidates, and that those candidates are still
+    available to Phase 3 (via the sidecar) once scanning finishes.
+    """
+    # Directory that the checkpoint says was found empty in a prior run.
+    carry_over = temp_dir / "carry_over"
+    carry_over.mkdir()
+
+    # Something for Phase 2 to actually scan so we exercise the full code path.
+    scan_target = temp_dir / "to_scan"
+    scan_target.mkdir()
+    (scan_target / "file.txt").write_text("x")
+
+    cp_file = tmp_path / "cp.json"
+    save_checkpoint(
+        filepath=cp_file,
+        root_path=str(temp_dir),
+        pending_dirs=[str(scan_target)],
+        stats={"files_scanned": 0, "dirs_scanned": 0},
+        config={"max_age_days": 30},
+        empty_dirs=[str(carry_over)],
+    )
+
+    purger = AsyncEFSPurger(
+        root_path=str(temp_dir),
+        max_age_days=30,
+        remove_empty_dirs=True,
+        memory_limit_mb=0,
+        dry_run=False,
+        checkpoint_file=str(cp_file),
+        resume=True,
+    )
+
+    # Patch _remove_empty_directories to snapshot the in-memory state right
+    # before Phase 3 streams the sidecar back in.
+    state_before_phase3: dict = {}
+    original_remove = purger._remove_empty_directories
+
+    async def spy_remove():
+        # At this point Phase 2 is done; self.empty_dirs should contain only
+        # what *this run* found (nothing in this test, since scan_target has
+        # a file in it and so isn't empty).  Carry-over dirs must NOT be
+        # present yet — they are streamed from the sidecar inside Phase 3.
+        state_before_phase3["empty_dirs_count_pre_phase3"] = len(purger.empty_dirs)
+        state_before_phase3["carry_over_in_memory"] = Path(str(carry_over)) in purger.empty_dirs
+        await original_remove()
+
+    purger._remove_empty_directories = spy_remove
+
+    await purger.purge()
+
+    # Phase 2 must not have held the carry-over dir in RAM.
+    assert state_before_phase3["empty_dirs_count_pre_phase3"] == 0, (
+        f"Phase 2 should not hold carry-over empty_dirs in memory; "
+        f"found {state_before_phase3['empty_dirs_count_pre_phase3']}"
+    )
+    assert state_before_phase3["carry_over_in_memory"] is False
+
+    # Phase 3 still picked up the carry-over dir from the sidecar and deleted it.
+    assert not carry_over.exists(), "Phase 3 should still delete carry-over empty dirs via sidecar"
 
 
 # ---------------------------------------------------------------------------

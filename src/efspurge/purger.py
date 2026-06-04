@@ -2393,11 +2393,18 @@ class AsyncEFSPurger:
                 # Legacy pending_dirs migration.  Older checkpoints embed
                 # the frontier as a list; rewrite it to the sidecar and
                 # release the list reference before any worker starts so
-                # the resume baseline drops back to ~queue_maxsize.
+                # the resume baseline drops back to ~queue_maxsize.  Crucially
+                # we also propagate the migrated count into
+                # ``pending_dirs_count`` so the resume bookkeeping below sees
+                # the real frontier size — without this, the legacy path
+                # leaves pending_dirs=0 and the "fresh start" branch
+                # below redundantly re-seeds the root, forcing a re-scan
+                # of the entire tree.
                 legacy_pending = cp.get("pending_dirs")
                 if legacy_pending and self.checkpoint_file is not None:
                     try:
-                        write_pending_dirs_sidecar(self.checkpoint_file, legacy_pending)
+                        migrated_count = write_pending_dirs_sidecar(self.checkpoint_file, legacy_pending)
+                        cp["pending_dirs_count"] = migrated_count
                     except OSError as e:
                         self.logger.warning("Could not migrate legacy pending_dirs to sidecar: %s", e)
                     cp["pending_dirs"] = []

@@ -877,9 +877,20 @@ async def test_phase2_resume_migrates_legacy_embedded_pending_dirs(temp_dir, tmp
     from efspurge.checkpoint import pending_dirs_sidecar_path
     from efspurge.purger import AsyncEFSPurger
 
+    # Seed dir lives under root and carries the only file we expect to
+    # see in stats.  A *sibling* subtree under root holds files we expect
+    # NOT to be scanned, since the legacy checkpoint's frontier names
+    # only the seed dir.  If migration accidentally falls through to
+    # the "fresh start" branch and re-seeds root, the sibling files
+    # would be counted too and the assertion below catches it.
     seed = temp_dir / "legacy_seed"
     seed.mkdir()
     (seed / "f.txt").write_text("x")
+
+    sibling = temp_dir / "should_be_untouched"
+    sibling.mkdir()
+    (sibling / "ignored_a.txt").write_text("y")
+    (sibling / "ignored_b.txt").write_text("z")
 
     cp_file = tmp_path / "cp.json"
     # Hand-craft a legacy checkpoint: gzip+JSON with embedded pending_dirs,
@@ -916,7 +927,15 @@ async def test_phase2_resume_migrates_legacy_embedded_pending_dirs(temp_dir, tmp
     assert not pending_dirs_sidecar_path(cp_file).exists(), (
         "Migrated sidecar should be removed on clean Phase 2 completion"
     )
-    assert purger.stats["files_scanned"] >= 1, "Legacy seed dir was not scanned after migration"
+    # Only the legacy-checkpoint frontier was scanned — not the entire tree
+    # under root.  If migration forgets to propagate the migrated count
+    # into pending_dirs_count, the resume code falls into the "fresh
+    # start" branch and re-seeds the root, sweeping up the sibling tree.
+    assert purger.stats["files_scanned"] == 1, (
+        f"Migration regression: expected to scan only seed/f.txt, "
+        f"got files_scanned={purger.stats['files_scanned']} — likely a "
+        f"redundant root reseed after legacy migration."
+    )
 
 
 @pytest.mark.asyncio

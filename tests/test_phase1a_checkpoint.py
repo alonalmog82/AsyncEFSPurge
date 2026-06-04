@@ -939,6 +939,94 @@ async def test_phase2_resume_migrates_legacy_embedded_pending_dirs(temp_dir, tmp
 
 
 @pytest.mark.asyncio
+async def test_phase2_scan_done_waits_for_feeder_even_if_count_was_wrong(temp_dir, tmp_path):
+    """Regression: scan_done must not fire until the feeder has drained the sidecar.
+
+    Production incident (2026-06-04): when the count in the main JSON
+    was mis-initialised to 0 (the legacy-migration bug fixed by
+    723b9c8), the resume code's "fresh start" branch seeded the root
+    and pending_dirs began at 1.  A worker scanning a leaf decremented
+    pending_dirs back to 0 before the feeder pumped more frontier
+    paths, ``scan_done.set()`` fired permanently, all workers exited,
+    and Phase 2 "completion" cleanup deleted the checkpoint plus both
+    sidecars — wiping ~10h of frontier progress.
+
+    The hardening: ``scan_done`` is gated on ``feeder_done``.  Even if
+    pending_dirs reaches 0 transiently, Phase 2 cannot conclude until
+    the feeder has signalled it has no more frontier entries to push.
+
+    This test stands the bug up directly: write a sidecar with N
+    leaf-only directories, then drive the purger through resume.  With
+    the gate in place, every leaf is scanned even though pending_dirs
+    starts at 0 (we don't pre-populate ``pending_dirs_count`` — the
+    test asserts on hardened scan_done behaviour, not the count fix).
+    """
+    from efspurge.checkpoint import (
+        pending_dirs_sidecar_path,
+        write_pending_dirs_sidecar,
+    )
+    from efspurge.purger import AsyncEFSPurger
+
+    # 25 leaf dirs, each with one file.  All leaves: every scan decrements
+    # pending_dirs without re-incrementing.  Under the old race, scan_done
+    # would fire after the first leaf finished.
+    leaves: list[Path] = []
+    for i in range(25):
+        d = temp_dir / f"leaf_{i:02d}"
+        d.mkdir()
+        (d / "f.txt").write_text("x")
+        leaves.append(d)
+
+    cp_file = tmp_path / "cp.json"
+    # Hand-craft a checkpoint that mimics the buggy migration state:
+    # pending_dirs_count=0 (or absent) in the main JSON, but the sidecar
+    # holds the real frontier.  load_checkpoint would normally treat
+    # count==0 as "done" and return None — to exercise the gate we still
+    # want resume to enter, so we put a single sentinel in the main JSON
+    # count and rely on the sidecar holding the real work.
+    import gzip as _gzip
+
+    main_json = {
+        "version": CHECKPOINT_VERSION,
+        "root_path": str(temp_dir),
+        "phase": "phase2",
+        "pending_dirs_count": 1,  # under-counts on purpose (real frontier is 25)
+        "stats": {"files_scanned": 0, "dirs_scanned": 0},
+        "config": {"max_age_days": 30, "root_path": str(temp_dir)},
+    }
+    with _gzip.open(cp_file, "wt") as f:
+        json.dump(main_json, f)
+    write_pending_dirs_sidecar(cp_file, [str(p) for p in leaves])
+    assert pending_dirs_sidecar_path(cp_file).exists()
+
+    purger = AsyncEFSPurger(
+        root_path=str(temp_dir),
+        max_age_days=30,
+        remove_empty_dirs=False,
+        memory_limit_mb=0,
+        dry_run=False,
+        checkpoint_file=str(cp_file),
+        resume=True,
+        queue_maxsize=3,  # tiny queue forces the feeder to serve in multiple passes
+        max_concurrent_discovery=4,
+    )
+    await purger.purge()
+
+    # Every leaf was scanned — confirms scan_done held until the feeder
+    # actually drained the sidecar, even though pending_dirs hit 0 many
+    # times along the way (one per leaf).
+    assert purger.stats["files_scanned"] == 25, (
+        f"Race regression: expected all 25 leaf files to be scanned, "
+        f"got files_scanned={purger.stats['files_scanned']}.  scan_done "
+        f"likely fired before the feeder finished — Phase 2 'completed' "
+        f"with frontier still on disk."
+    )
+    # Clean completion removed both checkpoint and sidecar.
+    assert not cp_file.exists()
+    assert not pending_dirs_sidecar_path(cp_file).exists()
+
+
+@pytest.mark.asyncio
 async def test_phase2_resume_streams_pending_dirs_without_materialising(temp_dir, tmp_path):
     """Regression: Phase 2 resume must not allocate a Python list of all frontier paths.
 

@@ -2354,6 +2354,16 @@ class AsyncEFSPurger:
         pending_dirs = 0
         pending_lock = asyncio.Lock()
         scan_done = asyncio.Event()
+        # Gates ``scan_done`` so Phase 2 cannot declare itself "complete"
+        # while the pending-dirs feeder still has frontier paths to deliver.
+        # Workers can transiently drain the queue faster than the feeder can
+        # pump it (e.g. a stretch of leaf dirs that decrement pending_dirs
+        # without re-incrementing); on 2026-06-04 that race fired with a
+        # mis-initialised counter and the worker-set scan_done deleted the
+        # entire checkpoint after a premature "completion".  We set the
+        # event up front when no feeder will run so single-pass scans
+        # (Phase 2 from scratch) behave as before.
+        feeder_done = asyncio.Event()
 
         # Resume from checkpoint if requested.
         #
@@ -2409,7 +2419,14 @@ class AsyncEFSPurger:
                         self.logger.warning("Could not migrate legacy pending_dirs to sidecar: %s", e)
                     cp["pending_dirs"] = []
                     del legacy_pending
-                pending_dirs = cp.get("pending_dirs_count", 0) or 0
+                # ``pending_dirs`` counts outstanding work in flight; it is
+                # incremented by the feeder per-pushed path and by workers
+                # per-discovered subdir, and decremented when a directory
+                # finishes scanning.  The pre-feeder initial value is
+                # therefore always 0 — the count in the main JSON is used
+                # only for progress logging (and historically also caused
+                # the race that wiped the prod checkpoint on 2026-06-04).
+                resume_pending_count_for_log = cp.get("pending_dirs_count", 0) or 0
                 # Open the sidecar (best-effort: missing sidecar means the
                 # frontier was already fully drained — Phase 2 simply
                 # exits cleanly after the root is seeded below).
@@ -2421,7 +2438,7 @@ class AsyncEFSPurger:
                     "Phase 2: Resuming from checkpoint",
                     {
                         "checkpoint_file": str(self.checkpoint_file),
-                        "pending_dirs": pending_dirs,
+                        "pending_dirs": resume_pending_count_for_log,
                         "files_scanned_so_far": self.stats.get("files_scanned", 0),
                         "dirs_scanned_so_far": self.stats.get("dirs_scanned", 0),
                         "pending_dirs_sidecar_exists": (
@@ -2433,8 +2450,11 @@ class AsyncEFSPurger:
                         ),
                     },
                 )
-        if pending_dirs == 0:
-            # Not resuming or checkpoint invalid - start from root
+        if pending_dirs_iter is None:
+            # No feeder (not resuming, or sidecar missing).  Seed the
+            # scan from the configured root.  When a feeder is set up
+            # we never reseed root here — the feeder pushes the frontier
+            # and increments pending_dirs per path.
             scan_queue.put_nowait(self.root_path)
             pending_dirs = 1
 
@@ -2634,10 +2654,14 @@ class AsyncEFSPurger:
                     # Clear the per-worker active-dir tracker now that this dir is done
                     worker_active_dirs[worker_id] = None
 
-                    # Decrement pending counter; when zero, all work is done
+                    # Decrement pending counter; when zero AND the feeder has
+                    # finished, all work is done.  Gating on feeder_done
+                    # prevents a transient ``pending_dirs == 0`` (workers
+                    # racing ahead of the feeder) from terminating Phase 2
+                    # while the feeder still holds sidecar entries.
                     async with pending_lock:
                         pending_dirs -= 1
-                        if pending_dirs == 0:
+                        if pending_dirs == 0 and feeder_done.is_set():
                             scan_done.set()
 
         # Pending-dirs feeder: stream the frontier sidecar line-by-line
@@ -2666,32 +2690,63 @@ class AsyncEFSPurger:
                 yield from pending_dirs_iter
 
         async def _pending_dirs_feeder() -> None:
-            if pending_dirs_iter is None:
-                return
-            for p in pending_dirs_iter:
-                if self._checkpoint_requested or scan_done.is_set():
-                    feeder_unsent.append(p)
+            nonlocal pending_dirs
+            try:
+                if pending_dirs_iter is None:
                     return
-                # put_nowait + back-off polling keeps the feeder responsive
-                # to the checkpoint flag even when workers have exited and
-                # the queue can no longer drain.
-                while True:
-                    try:
-                        scan_queue.put_nowait(Path(p))
-                        break
-                    except asyncio.QueueFull:
-                        if self._checkpoint_requested or scan_done.is_set():
-                            feeder_unsent.append(p)
-                            return
-                        await asyncio.sleep(0.1)
+                for p in pending_dirs_iter:
+                    if self._checkpoint_requested or scan_done.is_set():
+                        feeder_unsent.append(p)
+                        return
+                    # Reserve the slot in pending_dirs BEFORE pushing so a
+                    # worker can't grab the path and decrement before the
+                    # increment lands (which would let pending_dirs hit 0
+                    # transiently and — with the feeder_done gate clear —
+                    # fire scan_done prematurely).
+                    async with pending_lock:
+                        pending_dirs += 1
+                    # put_nowait + back-off polling keeps the feeder responsive
+                    # to the checkpoint flag even when workers have exited and
+                    # the queue can no longer drain.
+                    while True:
+                        try:
+                            scan_queue.put_nowait(Path(p))
+                            break
+                        except asyncio.QueueFull:
+                            if self._checkpoint_requested or scan_done.is_set():
+                                # Roll back the slot we reserved; this path
+                                # is captured via feeder_unsent and saved to
+                                # the new sidecar by the checkpoint code.
+                                async with pending_lock:
+                                    pending_dirs -= 1
+                                feeder_unsent.append(p)
+                                return
+                            await asyncio.sleep(0.1)
+            finally:
+                # Always signal feeder completion so the worker decrement
+                # check can fire ``scan_done`` once pending_dirs hits 0.
+                feeder_done.set()
+                # If workers are quiesced (pending_dirs==0 because they
+                # raced ahead while the feeder was queue-blocked or sleeping),
+                # they're stuck in ``scan_queue.get()`` with a 1s timeout
+                # and won't notice the queue is now permanently empty until
+                # something flips ``scan_done``.  Flip it here.
+                async with pending_lock:
+                    if pending_dirs == 0:
+                        scan_done.set()
 
-        # Launch workers and (when resuming with a sidecar) the feeder
+        # Launch workers and (when resuming with a sidecar) the feeder.
+        # When there is no feeder, signal ``feeder_done`` immediately so the
+        # worker decrement check can fire ``scan_done`` on the normal
+        # single-pass path (Phase 2 from scratch / no resume).
         workers = [asyncio.create_task(_scan_worker(i)) for i in range(num_workers)]
         # Maps task object-id → worker_id so we can look up worker_active_dirs on cancel
         task_to_worker_id: dict[int, int] = {id(task): i for i, task in enumerate(workers)}
-        loader_task: asyncio.Task | None = (
-            asyncio.create_task(_pending_dirs_feeder()) if pending_dirs_iter is not None else None
-        )
+        if pending_dirs_iter is not None:
+            loader_task: asyncio.Task | None = asyncio.create_task(_pending_dirs_feeder())
+        else:
+            feeder_done.set()
+            loader_task = None
 
         # Wait for workers and loader to complete.
         # On the checkpoint path, workers stuck inside EFS syscalls (run_in_executor) cannot

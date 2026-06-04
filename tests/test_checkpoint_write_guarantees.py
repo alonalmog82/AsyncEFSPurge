@@ -311,7 +311,10 @@ async def test_checkpoint_write_completes_despite_direct_open_hang(tmp_path):
     # Verify the new checkpoint was written correctly.
     cp = load_checkpoint(cp_path)
     assert cp is not None, "Checkpoint file not loadable after atomic write"
-    assert "/data/dir2" in cp["pending_dirs"], "New checkpoint content not written"
+    # Frontier moved to a sidecar in commit <pending_dirs_sidecar>; read it back from there.
+    from efspurge.checkpoint import stream_pending_dirs_sidecar
+
+    assert "/data/dir2" in list(stream_pending_dirs_sidecar(cp_path)), "New checkpoint content not written"
 
 
 @pytest.mark.asyncio

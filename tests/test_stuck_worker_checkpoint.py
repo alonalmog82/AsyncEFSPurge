@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
-from efspurge.checkpoint import load_checkpoint
+from efspurge.checkpoint import load_checkpoint, stream_pending_dirs_sidecar
 from efspurge.purger import AsyncEFSPurger, CheckpointExit, async_scandir_batched
 
 
@@ -97,7 +97,7 @@ async def test_single_stuck_worker_rescued_to_checkpoint(tmp_path):
 
     cp = load_checkpoint(tmp_path / "cp.json")
     assert cp is not None, "Checkpoint file must be written"
-    pending = set(cp["pending_dirs"])
+    pending = set(stream_pending_dirs_sidecar(tmp_path / "cp.json"))
     assert str(stuck_dir) in pending, f"stuck_dir should be rescued into checkpoint; pending={pending}"
 
 
@@ -128,7 +128,7 @@ async def test_multiple_stuck_workers_all_rescued(tmp_path):
 
     cp = load_checkpoint(tmp_path / "cp.json")
     assert cp is not None
-    pending = set(cp["pending_dirs"])
+    pending = set(stream_pending_dirs_sidecar(tmp_path / "cp.json"))
     for d in stuck_dirs:
         assert str(d) in pending, f"{d.name} not rescued; pending={pending}"
 
@@ -193,7 +193,7 @@ async def test_rescued_dir_included_in_next_resume(tmp_path):
 
     cp = load_checkpoint(tmp_path / "cp.json")
     assert cp is not None
-    pending = [Path(p) for p in cp["pending_dirs"]]
+    pending = [Path(p) for p in stream_pending_dirs_sidecar(tmp_path / "cp.json")]
 
     # The stuck_dir must be reachable by the next run — present in pending_dirs
     assert stuck_dir in pending or any(p == stuck_dir or stuck_dir in p.parents for p in pending), (

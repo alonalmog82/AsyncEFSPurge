@@ -7,6 +7,7 @@ import os
 import queue
 import time
 from collections import defaultdict, deque
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -19,11 +20,15 @@ from .checkpoint import (
     load_checkpoint,
     load_phase1a_checkpoint,
     load_phase1b_checkpoint,
+    pending_dirs_sidecar_path,
     remove_empty_dirs_sidecar,
+    remove_pending_dirs_sidecar,
     save_checkpoint,
     save_phase1a_checkpoint,
     save_phase1b_checkpoint,
     stream_empty_dirs_sidecar,
+    stream_pending_dirs_sidecar,
+    write_pending_dirs_sidecar,
 )
 from .logging import log_with_context, setup_logging
 
@@ -2350,45 +2355,33 @@ class AsyncEFSPurger:
         pending_lock = asyncio.Lock()
         scan_done = asyncio.Event()
 
-        # Resume from checkpoint if requested
-        # When checkpoint has more paths than queue_maxsize, we must feed the queue
-        # incrementally via a loader task. Otherwise put_nowait breaks on QueueFull
-        # and we lose the remaining paths, causing a permanent hang.
-        # Keep checkpoint paths as strings (not Path objects) to avoid the ~1.5 GB
-        # peak allocation from converting 7M+ strings to Path objects upfront.
-        # Path objects are created one at a time as items enter the queue.
-        remaining_checkpoint_paths: list[str] = []
+        # Resume from checkpoint if requested.
+        #
+        # The frontier ("pending_dirs") lives in a sidecar file
+        # ``<checkpoint>.pending_dirs.gz`` and is streamed line-by-line into
+        # the bounded ``scan_queue`` by a dedicated feeder task.  Before
+        # this change the frontier was loaded into a single ``list[str]``
+        # at resume time — at ~30 M paths that one list alone was the
+        # dominant driver of the resume-baseline spiral that recurred on
+        # prod after the empty_dirs sidecar fix.
+        #
+        # Legacy embedded frontier: older checkpoints still carry
+        # ``pending_dirs`` inline in the main JSON.  We migrate them to the
+        # sidecar via ``write_pending_dirs_sidecar`` and drop the in-memory
+        # copy immediately so the resume baseline is the same on the first
+        # post-upgrade resume as on every subsequent one.
+        pending_dirs_iter: Iterator[str] | None = None  # set when resuming
         if self.resume and self.checkpoint_file and self.checkpoint_file.exists():
             cp = load_checkpoint(self.checkpoint_file)
             if cp:
-                pending_paths: list[str] = cp["pending_dirs"]
-                loaded_count = 0
-                for p in pending_paths:
-                    try:
-                        scan_queue.put_nowait(Path(p))
-                        loaded_count += 1
-                    except asyncio.QueueFull:
-                        remaining_checkpoint_paths = pending_paths[loaded_count:]
-                        break
-                pending_dirs = len(pending_paths)
                 # Restore stats for progress reporting
                 for k, v in cp.get("stats", {}).items():
                     if k in self.stats and isinstance(self.stats[k], (int, float)):
                         self.stats[k] = v
-                # Empty-dir candidates from prior runs are persisted to a sidecar
-                # file (see checkpoint.empty_dirs_sidecar_path) and streamed in
-                # only at the start of Phase 3.  Holding them in self.empty_dirs
-                # during Phase 2 was the dominant driver of the resume-baseline
-                # spiral: with millions of carry-over paths the set consumed
-                # several GB before workers had even started, pinning the
-                # process at the 85% back-pressure threshold and grinding
-                # progress to ~1 dir/s.
-                #
-                # Legacy migration: if an older checkpoint still has empty_dirs
-                # embedded, flush them to the sidecar and drop the in-memory
-                # copy immediately so the rest of Phase 2 runs with a clean
-                # baseline.  The list reference is released right after the
-                # append so the gc can reclaim it before workers start.
+                # Legacy empty_dirs migration (see commit 736e513).  If an
+                # older checkpoint still has empty_dirs embedded, flush
+                # them to the sidecar and drop the in-memory copy so
+                # Phase 2 runs with a clean baseline.
                 legacy_empty = cp.get("empty_dirs")
                 if legacy_empty and self.checkpoint_file is not None:
                     try:
@@ -2397,6 +2390,24 @@ class AsyncEFSPurger:
                         self.logger.warning("Could not migrate legacy empty_dirs to sidecar: %s", e)
                     cp["empty_dirs"] = []
                     del legacy_empty
+                # Legacy pending_dirs migration.  Older checkpoints embed
+                # the frontier as a list; rewrite it to the sidecar and
+                # release the list reference before any worker starts so
+                # the resume baseline drops back to ~queue_maxsize.
+                legacy_pending = cp.get("pending_dirs")
+                if legacy_pending and self.checkpoint_file is not None:
+                    try:
+                        write_pending_dirs_sidecar(self.checkpoint_file, legacy_pending)
+                    except OSError as e:
+                        self.logger.warning("Could not migrate legacy pending_dirs to sidecar: %s", e)
+                    cp["pending_dirs"] = []
+                    del legacy_pending
+                pending_dirs = cp.get("pending_dirs_count", 0) or 0
+                # Open the sidecar (best-effort: missing sidecar means the
+                # frontier was already fully drained — Phase 2 simply
+                # exits cleanly after the root is seeded below).
+                if self.checkpoint_file is not None and pending_dirs_sidecar_path(self.checkpoint_file).exists():
+                    pending_dirs_iter = stream_pending_dirs_sidecar(self.checkpoint_file)
                 log_with_context(
                     self.logger,
                     "info",
@@ -2404,10 +2415,12 @@ class AsyncEFSPurger:
                     {
                         "checkpoint_file": str(self.checkpoint_file),
                         "pending_dirs": pending_dirs,
-                        "loaded_into_queue": loaded_count,
-                        "remaining_to_load": len(remaining_checkpoint_paths),
                         "files_scanned_so_far": self.stats.get("files_scanned", 0),
                         "dirs_scanned_so_far": self.stats.get("dirs_scanned", 0),
+                        "pending_dirs_sidecar_exists": (
+                            self.checkpoint_file is not None
+                            and pending_dirs_sidecar_path(self.checkpoint_file).exists()
+                        ),
                         "empty_dirs_sidecar_exists": (
                             self.checkpoint_file is not None and empty_dirs_sidecar_path(self.checkpoint_file).exists()
                         ),
@@ -2620,39 +2633,58 @@ class AsyncEFSPurger:
                         if pending_dirs == 0:
                             scan_done.set()
 
-        # Loader task: feed remaining checkpoint paths into queue as workers drain it.
-        # When queue is full we sleep briefly and recheck _checkpoint_requested so we don't
-        # block forever when workers have exited (memory-critical path). Paths not yet put
-        # are stored in loader_remaining for inclusion in the checkpoint.
-        # Keep loader_remaining as strings (matches remaining_checkpoint_paths type).
-        # str(string) is a no-op in CPython, so _pending_strs conversion at rescue is free.
-        loader_remaining: list[str] = []
+        # Pending-dirs feeder: stream the frontier sidecar line-by-line
+        # into ``scan_queue``.  Replaces the prior "load whole list, slice
+        # remainder, drain via loader task" pattern, which forced a
+        # ~30 M-string materialisation at resume time and was the cause of
+        # the second-wave death-spiral observed on 2026-06-04.
+        #
+        # The feeder always holds at most one in-flight path ``_unsent``
+        # in addition to the open file handle.  On checkpoint exit the
+        # caller pipes ``_unsent`` + the file iterator's unread tail into
+        # the new sidecar via ``feeder_tail()`` — see the rescue/cooperative
+        # checkpoint paths below for the merge point.
+        feeder_unsent: list[str] = []  # 0- or 1-element holder
 
-        async def _checkpoint_loader() -> None:
-            for i, p in enumerate(remaining_checkpoint_paths):
+        def feeder_tail() -> Iterator[str]:
+            """Yield (in order): the path the feeder pulled but never
+            enqueued, then the remainder of the sidecar from the feeder's
+            current file position.  Safe to call after the feeder has
+            exited.  Yields nothing when the feeder consumed the whole
+            sidecar cleanly.
+            """
+            if feeder_unsent:
+                yield feeder_unsent.pop()
+            if pending_dirs_iter is not None:
+                yield from pending_dirs_iter
+
+        async def _pending_dirs_feeder() -> None:
+            if pending_dirs_iter is None:
+                return
+            for p in pending_dirs_iter:
                 if self._checkpoint_requested or scan_done.is_set():
-                    loader_remaining.extend(remaining_checkpoint_paths[i:])
+                    feeder_unsent.append(p)
                     return
-                try:
-                    scan_queue.put_nowait(Path(p))
-                except asyncio.QueueFull:
-                    # Back-pressure: wait and recheck so we can exit when checkpoint requested
-                    while True:
+                # put_nowait + back-off polling keeps the feeder responsive
+                # to the checkpoint flag even when workers have exited and
+                # the queue can no longer drain.
+                while True:
+                    try:
+                        scan_queue.put_nowait(Path(p))
+                        break
+                    except asyncio.QueueFull:
                         if self._checkpoint_requested or scan_done.is_set():
-                            loader_remaining.extend(remaining_checkpoint_paths[i:])
+                            feeder_unsent.append(p)
                             return
                         await asyncio.sleep(0.1)
-                        try:
-                            scan_queue.put_nowait(Path(p))
-                            break
-                        except asyncio.QueueFull:
-                            continue
 
-        # Launch workers and optionally the checkpoint loader
+        # Launch workers and (when resuming with a sidecar) the feeder
         workers = [asyncio.create_task(_scan_worker(i)) for i in range(num_workers)]
         # Maps task object-id → worker_id so we can look up worker_active_dirs on cancel
         task_to_worker_id: dict[int, int] = {id(task): i for i, task in enumerate(workers)}
-        loader_task = asyncio.create_task(_checkpoint_loader()) if remaining_checkpoint_paths else None
+        loader_task: asyncio.Task | None = (
+            asyncio.create_task(_pending_dirs_feeder()) if pending_dirs_iter is not None else None
+        )
 
         # Wait for workers and loader to complete.
         # On the checkpoint path, workers stuck inside EFS syscalls (run_in_executor) cannot
@@ -2701,33 +2733,49 @@ class AsyncEFSPurger:
 
                     # START CHECKPOINT WRITE EARLY — before the finally-block worker cleanup.
                     # The finally block waits up to 5 s for cooperative workers + 5 s for the
-                    # loader; starting the write here means it runs concurrently with that
+                    # feeder; starting the write here means it runs concurrently with that
                     # cleanup, gaining ~10 s of NFS write time before the OOM killer fires.
                     #
                     # Why it's safe to drain the queue here:
                     #   - cooperative workers already exited (they responded to _checkpoint_requested
                     #     during the stuck_worker_cancel_timeout wait above)
                     #   - stuck workers are blocked inside run_in_executor and cannot push to queue
-                    #   - the loader has had >= stuck_worker_cancel_timeout seconds to see the flag
-                    #     and populate loader_remaining; we do a brief extra wait to confirm
+                    #   - the feeder has had >= stuck_worker_cancel_timeout seconds to see the flag
+                    #     and store its unsent path in feeder_unsent; we do a brief extra wait to confirm
                     if self.checkpoint_file:
-                        # Brief wait for loader to drain remaining paths into loader_remaining.
-                        # After stuck_worker_cancel_timeout seconds with the flag set, the loader
+                        # Brief wait for feeder to park its unsent path.  After
+                        # stuck_worker_cancel_timeout seconds with the flag set the feeder
                         # has almost certainly already exited cooperatively; this is a safety net.
                         if loader_task is not None and not loader_task.done():
                             await asyncio.wait({loader_task}, timeout=1.0)
-                        _all_pending_early: list[Path] = []
+                        # Drain the bounded queue (≤ queue_maxsize entries).
+                        _in_flight: list[Path] = []
                         while True:
                             try:
-                                _all_pending_early.append(scan_queue.get_nowait())
+                                _in_flight.append(scan_queue.get_nowait())
                             except asyncio.QueueEmpty:
                                 break
                         async with self._checkpoint_lock:
-                            _all_pending_early.extend(self._checkpoint_pending)
-                        _all_pending_early.extend(loader_remaining)
-                        _cp_pending_count = len(_all_pending_early)
+                            _in_flight.extend(self._checkpoint_pending)
+                        _in_flight_count = len(_in_flight)
+
+                        def _pending_iter() -> Iterator[str]:
+                            for p in _in_flight:
+                                yield str(p)
+                            # feeder_tail() yields feeder_unsent (≤ 1) and then
+                            # streams the sidecar's unread tail line-by-line.
+                            # Crucially this never materialises the whole tail
+                            # in Python — even at 30 M+ entries, peak memory
+                            # stays at queue_maxsize Path objects.
+                            yield from feeder_tail()
+
+                        # Count is best-effort for logging: known lower bound is
+                        # the in-flight count plus the prior checkpoint's
+                        # ``pending_dirs_count`` from the cp dict.  We don't pre-
+                        # count the feeder tail because doing so would require
+                        # iterating it twice.
+                        _cp_pending_count = _in_flight_count + len(feeder_unsent)
                         _loop = asyncio.get_running_loop()
-                        _pending_strs = [str(p) for p in _all_pending_early]
                         _empty_strs = [str(p) for p in self.empty_dirs]
                         _cp_task_early = asyncio.ensure_future(
                             _loop.run_in_executor(
@@ -2735,7 +2783,7 @@ class AsyncEFSPurger:
                                 lambda: save_checkpoint(
                                     self.checkpoint_file,
                                     str(self.root_path),
-                                    _pending_strs,
+                                    _pending_iter(),
                                     dict(self.stats),
                                     {
                                         "max_age_days": self.max_age_days,
@@ -2750,7 +2798,7 @@ class AsyncEFSPurger:
                             "info",
                             "Checkpoint write started early (concurrent with worker cleanup)",
                             {
-                                "pending_dirs_count": _cp_pending_count,
+                                "in_flight_pending": _in_flight_count,
                                 "checkpoint_file": str(self.checkpoint_file),
                             },
                         )
@@ -2780,18 +2828,18 @@ class AsyncEFSPurger:
         if self._checkpoint_requested and self.checkpoint_file:
             if _cp_task_early is not None:
                 # Write was started before the finally block.  The finally block took up to 10 s
-                # (5 s worker wait + 5 s loader wait); give the remaining budget of ~50 s.
+                # (5 s worker wait + 5 s feeder wait); give the remaining budget of ~50 s.
                 done, _ = await asyncio.wait({_cp_task_early}, timeout=50.0)
                 if _cp_task_early in done:
                     try:
-                        _cp_task_early.result()  # re-raises if save_checkpoint threw
+                        written = _cp_task_early.result()  # re-raises if save_checkpoint threw
                         log_with_context(
                             self.logger,
                             "info",
                             "Checkpoint saved, exit for resume. Run with --resume to continue.",
                             {
                                 "checkpoint_file": str(self.checkpoint_file),
-                                "pending_dirs_count": _cp_pending_count,
+                                "pending_dirs_count": written,
                             },
                         )
                     except Exception as exc:
@@ -2816,26 +2864,29 @@ class AsyncEFSPurger:
                 # Cooperative-exit path: all workers finished before stuck_worker_cancel_timeout
                 # fired, so no early write was started.  Start one now.
                 # (Same executor + asyncio.wait pattern — see rationale in the rescue path above.)
-                all_pending: list[Path] = []
+                _coop_in_flight: list[Path] = []
                 while True:
                     try:
-                        p = scan_queue.get_nowait()
-                        all_pending.append(p)
+                        _coop_in_flight.append(scan_queue.get_nowait())
                     except asyncio.QueueEmpty:
                         break
                 async with self._checkpoint_lock:
-                    all_pending.extend(self._checkpoint_pending)
-                all_pending.extend(loader_remaining)
+                    _coop_in_flight.extend(self._checkpoint_pending)
                 loop = asyncio.get_running_loop()
-                pending_dirs_strs = [str(p) for p in all_pending]
                 empty_dirs_strs = [str(p) for p in self.empty_dirs]
+
+                def _coop_pending_iter() -> Iterator[str]:
+                    for p in _coop_in_flight:
+                        yield str(p)
+                    yield from feeder_tail()
+
                 cp_task = asyncio.ensure_future(
                     loop.run_in_executor(
                         None,
                         lambda: save_checkpoint(
                             self.checkpoint_file,
                             str(self.root_path),
-                            pending_dirs_strs,
+                            _coop_pending_iter(),
                             dict(self.stats),
                             {
                                 "max_age_days": self.max_age_days,
@@ -2848,14 +2899,14 @@ class AsyncEFSPurger:
                 done, _ = await asyncio.wait({cp_task}, timeout=60.0)
                 if cp_task in done:
                     try:
-                        cp_task.result()  # re-raises if save_checkpoint threw
+                        written = cp_task.result()  # re-raises if save_checkpoint threw
                         log_with_context(
                             self.logger,
                             "info",
                             "Checkpoint saved, exit for resume. Run with --resume to continue.",
                             {
                                 "checkpoint_file": str(self.checkpoint_file),
-                                "pending_dirs_count": len(all_pending),
+                                "pending_dirs_count": written,
                             },
                         )
                     except Exception as exc:
@@ -3227,12 +3278,13 @@ class AsyncEFSPurger:
                         "Could not remove checkpoint file after successful purge",
                         {"checkpoint_file": str(self.checkpoint_file), "error": str(e)},
                     )
-            # Also remove the empty-dirs sidecar (written next to the
-            # checkpoint to keep carry-over empty-dir candidates off the
-            # Phase 2 heap).  Best-effort: a stale sidecar with no matching
+            # Also remove the empty-dirs and pending-dirs sidecars (written
+            # next to the checkpoint to keep carry-over off the Phase 2
+            # heap).  Best-effort: a stale sidecar with no matching
             # checkpoint is harmless because the next purge starts fresh.
             if self.checkpoint_file is not None:
                 remove_empty_dirs_sidecar(self.checkpoint_file)
+                remove_pending_dirs_sidecar(self.checkpoint_file)
         finally:
             # Cancel background reporter
             progress_task.cancel()

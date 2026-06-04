@@ -19,6 +19,7 @@ Phase 2 empty_dirs fix:
 - Works with checkpoint/resume for iterative empty-dir cleanup
 """
 
+import asyncio
 import json
 import tempfile
 from pathlib import Path
@@ -671,6 +672,307 @@ async def test_phase2_resume_does_not_load_empty_dirs_into_memory(temp_dir, tmp_
 
     # Phase 3 still picked up the carry-over dir from the sidecar and deleted it.
     assert not carry_over.exists(), "Phase 3 should still delete carry-over empty dirs via sidecar"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 pending_dirs (BFS frontier) moved to a sidecar
+# ---------------------------------------------------------------------------
+
+
+def test_save_checkpoint_writes_pending_dirs_to_sidecar(tmp_path):
+    """save_checkpoint streams the BFS frontier into ``<cp>.pending_dirs.gz``.
+
+    Before this change the frontier was embedded in the main checkpoint
+    JSON as a ``list[str]``.  At ~30 M entries observed on prod that
+    list alone consumed several GB on resume — the second wave of the
+    death-spiral that recurred on 2026-06-04 after the empty_dirs
+    sidecar fix shipped.  The frontier now lives on disk and is streamed
+    line-by-line into the bounded scan queue by a feeder task.
+    """
+    from efspurge.checkpoint import pending_dirs_sidecar_path, stream_pending_dirs_sidecar
+
+    cp = tmp_path / "cp.json"
+    n = save_checkpoint(
+        filepath=cp,
+        root_path="/data",
+        pending_dirs=["/data/a", "/data/b", "/data/c"],
+        stats={"dirs_scanned": 100},
+        config={"max_age_days": 30},
+    )
+    assert n == 3
+
+    # Sidecar holds the paths; main JSON holds only the count.
+    assert pending_dirs_sidecar_path(cp).exists()
+    assert list(stream_pending_dirs_sidecar(cp)) == ["/data/a", "/data/b", "/data/c"]
+
+    loaded = load_checkpoint(cp)
+    assert loaded is not None
+    assert loaded["pending_dirs_count"] == 3
+    assert not loaded.get("pending_dirs"), "Frontier paths should not be inline in main JSON"
+
+
+def test_save_checkpoint_accepts_generator_as_pending_dirs(tmp_path):
+    """save_checkpoint never materialises the iterable as a Python list.
+
+    This is the key memory invariant for the fix: a 30 M-entry generator
+    can be passed in and only one line at a time touches Python memory.
+    We assert by passing a generator that *would* fail if iterated twice.
+    """
+    from efspurge.checkpoint import stream_pending_dirs_sidecar
+
+    cp = tmp_path / "cp.json"
+
+    def single_use_gen():
+        yield "/data/a"
+        yield "/data/b"
+
+    n = save_checkpoint(
+        filepath=cp,
+        root_path="/data",
+        pending_dirs=single_use_gen(),
+        stats={},
+        config={},
+    )
+    assert n == 2
+    assert list(stream_pending_dirs_sidecar(cp)) == ["/data/a", "/data/b"]
+
+
+def test_save_checkpoint_empty_pending_drops_sidecar(tmp_path):
+    """Saving with an empty frontier removes any existing sidecar.
+
+    Otherwise an empty trailing sidecar would survive across saves and
+    confuse the "done" detection in load_checkpoint.
+    """
+    from efspurge.checkpoint import pending_dirs_sidecar_path
+
+    cp = tmp_path / "cp.json"
+    # First save with content.
+    save_checkpoint(
+        filepath=cp,
+        root_path="/data",
+        pending_dirs=["/data/a"],
+        stats={},
+        config={},
+    )
+    assert pending_dirs_sidecar_path(cp).exists()
+
+    # Subsequent save with empty frontier — sidecar should be cleared.
+    save_checkpoint(
+        filepath=cp,
+        root_path="/data",
+        pending_dirs=[],
+        stats={},
+        config={},
+    )
+    assert not pending_dirs_sidecar_path(cp).exists()
+    # And load_checkpoint treats the result as "done".
+    assert load_checkpoint(cp) is None
+
+
+def test_load_checkpoint_legacy_embedded_pending_dirs_preserved(tmp_path):
+    """A legacy checkpoint with the frontier embedded inline is still readable.
+
+    The purger surfaces ``cp["pending_dirs"]`` to its resume code so the
+    list can be migrated to the sidecar on the first post-upgrade resume.
+    """
+    cp = tmp_path / "cp.json"
+    data = {
+        "version": CHECKPOINT_VERSION,
+        "root_path": "/data",
+        "phase": "phase2",
+        "pending_dirs": ["/data/legacy_a", "/data/legacy_b"],
+        "stats": {},
+        "config": {},
+    }
+    cp.write_text(json.dumps(data))
+    loaded = load_checkpoint(cp)
+    assert loaded is not None
+    assert loaded["pending_dirs"] == ["/data/legacy_a", "/data/legacy_b"]
+
+
+@pytest.mark.asyncio
+async def test_phase2_checkpoint_exit_merges_inflight_and_feeder_tail(temp_dir, tmp_path):
+    """Regression: a checkpoint exit mid-resume must preserve every frontier entry.
+
+    The novel merge path in commit <pending_dirs_sidecar> writes the new
+    sidecar from a generator that yields (queue contents → per-worker
+    buffers → feeder's unsent path → feeder's unread file tail).  A bug
+    in any of those legs would silently drop directories on a memory-
+    critical exit, leaving them un-scanned forever.
+
+    This test seeds a sidecar with N frontier entries, resumes with a
+    queue smaller than N so the feeder cannot drain everything in one
+    pass, raises the checkpoint flag, and asserts the *new* sidecar
+    written on exit contains the full original set (minus anything that
+    was actually scanned, which we lower-bound via the dirs_scanned
+    stat).
+    """
+    from efspurge.checkpoint import stream_pending_dirs_sidecar
+    from efspurge.purger import AsyncEFSPurger, CheckpointExit
+
+    # Build a small tree of scannable dirs so the resume path is exercised.
+    seeded: list[Path] = []
+    for i in range(40):
+        d = temp_dir / f"seed_{i:02d}"
+        d.mkdir()
+        # Each dir empty — fast scans so the feeder gets multiple turns.
+        seeded.append(d)
+
+    cp_file = tmp_path / "cp.json"
+    save_checkpoint(
+        filepath=cp_file,
+        root_path=str(temp_dir),
+        pending_dirs=[str(p) for p in seeded],
+        stats={"files_scanned": 0, "dirs_scanned": 0},
+        config={"max_age_days": 30},
+    )
+
+    purger = AsyncEFSPurger(
+        root_path=str(temp_dir),
+        max_age_days=30,
+        remove_empty_dirs=False,
+        memory_limit_mb=0,
+        dry_run=True,
+        checkpoint_file=str(cp_file),
+        resume=True,
+        queue_maxsize=5,  # < 40 so the feeder must serve in multiple passes
+        max_concurrent_discovery=2,
+    )
+
+    async def _trigger():
+        # Let the feeder/workers churn briefly so some entries are scanned
+        # and some are still in the feeder's unread tail / in-flight queue.
+        await asyncio.sleep(0.3)
+        purger._checkpoint_requested = True
+
+    asyncio.create_task(_trigger())
+    with pytest.raises(CheckpointExit):
+        await purger._scan_and_purge_files()
+
+    # New sidecar must collectively cover every directory that wasn't
+    # already counted as scanned.  In practice with such a small tree we
+    # expect *all* 40 to be present (the loop almost certainly hadn't
+    # scanned anything before the flag flipped).
+    new_pending = set(stream_pending_dirs_sidecar(cp_file))
+    seeded_strs = {str(p) for p in seeded}
+    scanned = purger.stats.get("dirs_scanned", 0)
+    missing = seeded_strs - new_pending
+    assert len(missing) <= scanned, (
+        f"Checkpoint exit dropped frontier entries: dirs_scanned={scanned}, "
+        f"missing from new sidecar={sorted(missing)[:10]} (total {len(missing)})"
+    )
+
+
+@pytest.mark.asyncio
+async def test_phase2_resume_migrates_legacy_embedded_pending_dirs(temp_dir, tmp_path):
+    """End-to-end: a legacy checkpoint with inline ``pending_dirs`` migrates to the sidecar.
+
+    Older checkpoints (pre-sidecar format) embedded the frontier directly
+    in the main JSON.  The Phase 2 resume code calls
+    ``write_pending_dirs_sidecar`` to migrate the inline list before any
+    worker starts, so the resume baseline is the same on the first
+    post-upgrade resume as on every subsequent one.  This test exercises
+    that path end-to-end.
+    """
+    from efspurge.checkpoint import pending_dirs_sidecar_path
+    from efspurge.purger import AsyncEFSPurger
+
+    seed = temp_dir / "legacy_seed"
+    seed.mkdir()
+    (seed / "f.txt").write_text("x")
+
+    cp_file = tmp_path / "cp.json"
+    # Hand-craft a legacy checkpoint: gzip+JSON with embedded pending_dirs,
+    # no sidecar present.  Mirrors the on-disk shape produced by the
+    # pre-sidecar save_checkpoint().
+    import gzip as _gzip
+
+    legacy = {
+        "version": CHECKPOINT_VERSION,
+        "root_path": str(temp_dir),
+        "phase": "phase2",
+        "pending_dirs": [str(seed)],
+        "stats": {"files_scanned": 0, "dirs_scanned": 0},
+        "config": {"max_age_days": 30, "root_path": str(temp_dir)},
+    }
+    with _gzip.open(cp_file, "wt") as f:
+        json.dump(legacy, f)
+    assert not pending_dirs_sidecar_path(cp_file).exists()
+
+    purger = AsyncEFSPurger(
+        root_path=str(temp_dir),
+        max_age_days=30,
+        remove_empty_dirs=False,
+        memory_limit_mb=0,
+        dry_run=False,
+        checkpoint_file=str(cp_file),
+        resume=True,
+    )
+    await purger.purge()
+
+    # Phase 2 ran to completion: both the checkpoint and the (migrated)
+    # sidecar are gone, and the legacy entry was actually scanned.
+    assert not cp_file.exists(), "Checkpoint should be removed after a successful purge"
+    assert not pending_dirs_sidecar_path(cp_file).exists(), (
+        "Migrated sidecar should be removed on clean Phase 2 completion"
+    )
+    assert purger.stats["files_scanned"] >= 1, "Legacy seed dir was not scanned after migration"
+
+
+@pytest.mark.asyncio
+async def test_phase2_resume_streams_pending_dirs_without_materialising(temp_dir, tmp_path):
+    """Regression: Phase 2 resume must not allocate a Python list of all frontier paths.
+
+    Production symptom (2026-06-04): after a normal day of operation the
+    frontier grew past 30 M entries, and the Phase 2 resume code
+    ``cp["pending_dirs"]`` materialised the entire list as ``list[str]``,
+    pushing the resume baseline above 85 % memory and re-triggering the
+    death-spiral.  This test asserts that ``load_checkpoint`` no longer
+    surfaces the frontier as an in-memory list — the paths are streamed
+    from the sidecar by a feeder task instead.
+    """
+    # Stand up a small Phase-2 scan target so the purge runs end-to-end.
+    scan_target = temp_dir / "to_scan"
+    scan_target.mkdir()
+    (scan_target / "f.txt").write_text("x")
+
+    cp_file = tmp_path / "cp.json"
+    save_checkpoint(
+        filepath=cp_file,
+        root_path=str(temp_dir),
+        pending_dirs=[str(scan_target)],
+        stats={"files_scanned": 0, "dirs_scanned": 0},
+        config={"max_age_days": 30},
+    )
+
+    # Verify the in-memory shape: load_checkpoint should not return a
+    # populated ``pending_dirs`` list (only ``pending_dirs_count``).
+    loaded = load_checkpoint(cp_file)
+    assert loaded is not None
+    assert not loaded.get("pending_dirs"), (
+        "load_checkpoint must not return frontier paths as an in-memory list — "
+        "those should be streamed from the sidecar by the Phase 2 feeder task."
+    )
+    assert loaded["pending_dirs_count"] == 1
+
+    # End-to-end: the resume still works (feeder picks the path up from disk).
+    from efspurge.purger import AsyncEFSPurger
+
+    purger = AsyncEFSPurger(
+        root_path=str(temp_dir),
+        max_age_days=30,
+        remove_empty_dirs=False,
+        memory_limit_mb=0,
+        dry_run=False,
+        checkpoint_file=str(cp_file),
+        resume=True,
+    )
+    await purger.purge()
+    # Checkpoint and sidecar are both removed on clean completion.
+    assert not cp_file.exists()
+    from efspurge.checkpoint import pending_dirs_sidecar_path
+
+    assert not pending_dirs_sidecar_path(cp_file).exists()
 
 
 # ---------------------------------------------------------------------------

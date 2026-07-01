@@ -7,13 +7,29 @@ import os
 import queue
 import time
 from collections import defaultdict, deque
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import aiofiles.os
 
 from . import __version__
-from .checkpoint import load_checkpoint, save_checkpoint
+from .checkpoint import (
+    append_empty_dirs_sidecar,
+    empty_dirs_sidecar_path,
+    load_checkpoint,
+    load_phase1a_checkpoint,
+    load_phase1b_checkpoint,
+    pending_dirs_sidecar_path,
+    remove_empty_dirs_sidecar,
+    remove_pending_dirs_sidecar,
+    save_checkpoint,
+    save_phase1a_checkpoint,
+    save_phase1b_checkpoint,
+    stream_empty_dirs_sidecar,
+    stream_pending_dirs_sidecar,
+    write_pending_dirs_sidecar,
+)
 from .logging import log_with_context, setup_logging
 
 # Maximum number of directories to discover in Phase 1a.
@@ -442,6 +458,11 @@ class AsyncEFSPurger:
         max_entries_per_dir: int = 0,
         checkpoint_file: str | Path | None = None,
         resume: bool = False,
+        dir_deletion_checkpoint_file: str | Path | None = None,
+        dir_deletion_resume: bool = False,
+        phase1_only: bool = False,
+        backpressure_checkpoint_timeout: int = 600,
+        stuck_worker_cancel_timeout: int = 30,
     ):
         """
         Initialize the async EFS purger.
@@ -467,6 +488,15 @@ class AsyncEFSPurger:
                 stalling workers.
             checkpoint_file: Path to save checkpoint when memory is critical (enables auto-checkpoint on OOM risk).
             resume: If True, load checkpoint from checkpoint_file and resume Phase 2 from saved state.
+            dir_deletion_checkpoint_file: Path to save/load Phase 1a BFS frontier checkpoint on memory abort.
+                On abort: saves remaining dirs to scan, runs Phase 1b on dirs found so far, exits 75.
+            dir_deletion_resume: If True, resume Phase 1a discovery from dir_deletion_checkpoint_file.
+            backpressure_checkpoint_timeout: Seconds of sustained back-pressure before forcing a checkpoint exit
+                (default: 600). Prevents the job from stalling indefinitely when memory stabilises between the
+                back-pressure threshold (85%) and the critical checkpoint threshold (95%). Set to 0 to disable.
+            stuck_worker_cancel_timeout: Seconds to wait for cooperative worker exit after checkpoint is requested
+                before force-cancelling workers that are stuck in EFS syscalls (default: 30). Stuck workers'
+                in-flight directories are rescued into the checkpoint for retry on the next resume.
 
         Raises:
             ValueError: If invalid parameters are provided
@@ -574,6 +604,11 @@ class AsyncEFSPurger:
         self.max_entries_per_dir = max_entries_per_dir
         self.checkpoint_file = Path(checkpoint_file) if checkpoint_file else None
         self.resume = resume
+        self.dir_deletion_checkpoint_file = Path(dir_deletion_checkpoint_file) if dir_deletion_checkpoint_file else None
+        self.dir_deletion_resume = dir_deletion_resume
+        self.phase1_only = phase1_only
+        self.backpressure_checkpoint_timeout = backpressure_checkpoint_timeout
+        self.stuck_worker_cancel_timeout = stuck_worker_cancel_timeout
 
         # Compute discovery limit: if explicitly set use that, otherwise derive from memory budget.
         # Each Path object is ~400-600 bytes, so we allow roughly 60% of the memory budget for paths.
@@ -677,6 +712,7 @@ class AsyncEFSPurger:
         self.last_memory_warning = 0  # Track last warning time
         self.memory_warning_interval = 60  # Only warn once per minute
         self.memory_check_lock = asyncio.Lock()  # Prevent concurrent checks
+        self._backpressure_start_time: float | None = None  # When sustained back-pressure began
 
         # Checkpoint/resume: when memory critical, save state and exit for resume
         self._checkpoint_requested = False
@@ -742,6 +778,10 @@ class AsyncEFSPurger:
                 current_time = time.time()
                 memory_percent = (memory_mb / self.memory_limit_mb * 100) if self.memory_limit_mb > 0 else 0
 
+                # Record when back-pressure started (used for sustained back-pressure detection below)
+                if self._backpressure_start_time is None:
+                    self._backpressure_start_time = current_time
+
                 # At 95%+: request checkpoint and exit to avoid OOM (when checkpoint_file is set)
                 CRITICAL_THRESHOLD_PERCENT = 95
                 if (
@@ -757,6 +797,32 @@ class AsyncEFSPurger:
                         {
                             "memory_mb": round(memory_mb, 1),
                             "memory_percent": round(memory_percent, 1),
+                            "checkpoint_file": str(self.checkpoint_file),
+                        },
+                    )
+                    return True, memory_mb
+
+                # Sustained back-pressure: if memory has been above the back-pressure threshold
+                # for longer than backpressure_checkpoint_timeout seconds without reaching the
+                # critical threshold (95%), checkpoint and exit. This prevents the job from
+                # stalling indefinitely when memory stabilises between the two thresholds.
+                if (
+                    self.checkpoint_file
+                    and self.backpressure_checkpoint_timeout > 0
+                    and not self._checkpoint_requested
+                    and (current_time - self._backpressure_start_time) >= self.backpressure_checkpoint_timeout
+                ):
+                    self._checkpoint_requested = True
+                    sustained_seconds = int(current_time - self._backpressure_start_time)
+                    log_with_context(
+                        self.logger,
+                        "warning",
+                        "Sustained back-pressure timeout reached, requesting checkpoint and graceful exit for resume",
+                        {
+                            "memory_mb": round(memory_mb, 1),
+                            "memory_percent": round(memory_percent, 1),
+                            "sustained_seconds": sustained_seconds,
+                            "timeout_seconds": self.backpressure_checkpoint_timeout,
                             "checkpoint_file": str(self.checkpoint_file),
                         },
                     )
@@ -781,6 +847,10 @@ class AsyncEFSPurger:
                 gc.collect()
 
                 return True, memory_mb  # Memory is high, caller should reduce batch sizes
+
+            else:
+                # Memory has dropped below the back-pressure threshold — reset the sustained timer
+                self._backpressure_start_time = None
 
             return False, memory_mb  # Memory is OK, but return value for proactive reduction
 
@@ -856,6 +926,29 @@ class AsyncEFSPurger:
         Uses post-order deletion (children before parents) with cascading parent checks.
         Concurrent processing with deletion_semaphore for high throughput.
         """
+        # Merge in carry-over empty-dir candidates from prior runs.  These are
+        # streamed from the sidecar file written by save_checkpoint() so they
+        # never have to sit in Phase 2 memory.  Phase 3 has the queue and
+        # workers torn down, so converting to Path here is safe.
+        if self.checkpoint_file is not None:
+            sidecar = empty_dirs_sidecar_path(self.checkpoint_file)
+            if sidecar.exists():
+                loaded_from_sidecar = 0
+                for path_str in stream_empty_dirs_sidecar(self.checkpoint_file):
+                    self.empty_dirs.add(Path(path_str))
+                    loaded_from_sidecar += 1
+                if loaded_from_sidecar:
+                    log_with_context(
+                        self.logger,
+                        "info",
+                        "Loaded carry-over empty-dir candidates from sidecar",
+                        {
+                            "sidecar_file": str(sidecar),
+                            "loaded_count": loaded_from_sidecar,
+                            "in_memory_count": len(self.empty_dirs),
+                        },
+                    )
+
         if not self.empty_dirs:
             return
 
@@ -1461,15 +1554,87 @@ class AsyncEFSPurger:
         discovery_queue: asyncio.Queue[Path] = (
             asyncio.Queue(maxsize=self.queue_maxsize) if self.queue_maxsize > 0 else asyncio.Queue()
         )
-        discovery_queue.put_nowait(self.root_path)
         discovery_errors = 0
         total_dirs_discovered = 0
         root_depth = len(self.root_path.parts)
         # When max_entries_per_dir is set we may re-queue a directory; discovered_dirs avoids double-counting.
-        discovered_dirs: set[Path] = {self.root_path}
+        discovered_dirs: set[Path] = set()
         # pending_dirs tracks dirs enqueued but not yet fully processed.
         # When it reaches 0 all reachable directories have been scanned.
-        pending_dirs = 1  # root is already in the queue
+        pending_dirs = 0
+
+        # Check for Phase 1b resume (memory aborted during bottom-up deletion).
+        # Phase 1b checkpoint takes priority over Phase 1a — it means discovery
+        # already completed and we just need to finish the deletion pass.
+        phase1b_resume = False
+        if self.dir_deletion_resume and self.dir_deletion_checkpoint_file:
+            cp1b = load_phase1b_checkpoint(self.dir_deletion_checkpoint_file)
+            if cp1b:
+                for depth_str, paths in cp1b["dirs_by_depth"].items():
+                    depth = int(depth_str)
+                    dirs_by_depth[depth] = [Path(p) for p in paths]
+                total_dirs_discovered = sum(len(v) for v in dirs_by_depth.values())
+                phase1b_resume = True
+                log_with_context(
+                    self.logger,
+                    "info",
+                    "Phase 1b: Resuming from Phase 1b checkpoint",
+                    {
+                        "checkpoint_file": str(self.dir_deletion_checkpoint_file),
+                        "depth_levels": len(dirs_by_depth),
+                        "total_dirs_remaining": total_dirs_discovered,
+                    },
+                )
+
+        # Resume from Phase 1a checkpoint if requested, otherwise start from root.
+        # remaining_phase1a_pending holds checkpoint dirs that didn't fit in the queue;
+        # they are fed in by a loader task running alongside the discovery workers.
+        remaining_phase1a_pending: list[Path] = []
+        if not phase1b_resume and self.dir_deletion_resume and self.dir_deletion_checkpoint_file:
+            cp1a = load_phase1a_checkpoint(self.dir_deletion_checkpoint_file)
+            if cp1a:
+                resume_dirs = [Path(p) for p in cp1a["pending_dirs"]]
+                loaded = 0
+                for p in resume_dirs:
+                    try:
+                        discovery_queue.put_nowait(p)
+                        loaded += 1
+                    except asyncio.QueueFull:
+                        break
+                remaining_phase1a_pending = resume_dirs[loaded:]
+                pending_dirs = len(resume_dirs)
+                discovered_dirs = set(resume_dirs)  # prevent re-queuing
+                # Pre-populate dirs_by_depth with checkpoint dirs.
+                # On a normal run, dirs are added to dirs_by_depth when their parent is scanned.
+                # On resume we skip the parent scan, so we must seed dirs_by_depth directly —
+                # otherwise Phase 1b has no dirs to check/delete.
+                for p in resume_dirs:
+                    depth = len(p.parts) - root_depth
+                    if depth > 0:
+                        dirs_by_depth[depth].append(p)
+                total_dirs_discovered = len(resume_dirs)
+                log_with_context(
+                    self.logger,
+                    "info",
+                    "Phase 1a: Resuming from checkpoint",
+                    {
+                        "checkpoint_file": str(self.dir_deletion_checkpoint_file),
+                        "pending_dirs": pending_dirs,
+                        "loaded_into_queue": loaded,
+                        "remaining_to_load": len(remaining_phase1a_pending),
+                    },
+                )
+
+        if not phase1b_resume and pending_dirs == 0:
+            # Not resuming or checkpoint invalid/empty — start fresh from root
+            discovery_queue.put_nowait(self.root_path)
+            discovered_dirs = {self.root_path}
+            pending_dirs = 1
+
+        # Shared list for collecting unprocessed dirs when memory aborts discovery.
+        # Workers append their per-worker pending lists + current dir here on abort.
+        # Single-threaded asyncio: no lock needed.
+        phase1a_checkpoint_pending: list[Path] = []
 
         log_with_context(
             self.logger,
@@ -1513,6 +1678,8 @@ class AsyncEFSPurger:
 
                 # Check termination conditions
                 if memory_abort or discovery_limit_reached:
+                    if memory_abort and self.dir_deletion_checkpoint_file:
+                        phase1a_checkpoint_pending.extend(pending_discovery)
                     pending_dirs -= len(pending_discovery)
                     break
 
@@ -1568,7 +1735,10 @@ class AsyncEFSPurger:
                             )
                             memory_abort = True
                             discovery_done.set()
-                            # Put the dir back since we didn't process it
+                            # current_dir was dequeued but not processed — save it for checkpoint
+                            if self.dir_deletion_checkpoint_file:
+                                phase1a_checkpoint_pending.append(current_dir)
+                                phase1a_checkpoint_pending.extend(pending_discovery)
                             pending_dirs -= 1
                             if pending_dirs <= 0:
                                 discovery_done.set()
@@ -1653,6 +1823,10 @@ class AsyncEFSPurger:
                                     )
                                     memory_abort = True
                                     discovery_done.set()
+                                    # current_dir was mid-scan — save it for checkpoint
+                                    if self.dir_deletion_checkpoint_file:
+                                        phase1a_checkpoint_pending.append(current_dir)
+                                        phase1a_checkpoint_pending.extend(pending_discovery)
                                     break
 
                     if not yielded_early:
@@ -1699,12 +1873,40 @@ class AsyncEFSPurger:
                         },
                     )
 
-        # Launch parallel discovery workers
+        # Launch parallel discovery workers (plus an optional loader task for resume overflow)
         num_workers = self.max_concurrent_discovery
-        workers = [asyncio.create_task(_discovery_worker(i)) for i in range(num_workers)]
+        # Skip Phase 1a workers entirely when resuming from Phase 1b checkpoint
+        workers = [] if phase1b_resume else [asyncio.create_task(_discovery_worker(i)) for i in range(num_workers)]
+
+        # If resuming with more pending dirs than queue_maxsize, feed them incrementally
+        # using a loader task (same pattern as Phase 2 checkpoint loader).
+        phase1a_loader_task: asyncio.Task | None = None
+        if remaining_phase1a_pending and not phase1b_resume:
+
+            async def _phase1a_loader() -> None:
+                for p in remaining_phase1a_pending:
+                    if memory_abort or discovery_done.is_set():
+                        if memory_abort and self.dir_deletion_checkpoint_file:
+                            phase1a_checkpoint_pending.extend(
+                                remaining_phase1a_pending[remaining_phase1a_pending.index(p) :]
+                            )
+                        return
+                    while True:
+                        if memory_abort or discovery_done.is_set():
+                            return
+                        try:
+                            discovery_queue.put_nowait(p)
+                            break
+                        except asyncio.QueueFull:
+                            await asyncio.sleep(0.1)
+
+            phase1a_loader_task = asyncio.create_task(_phase1a_loader())
 
         # Wait for all workers to complete
         await asyncio.gather(*workers, return_exceptions=True)
+        if phase1a_loader_task is not None:
+            phase1a_loader_task.cancel()
+            await asyncio.gather(phase1a_loader_task, return_exceptions=True)
 
         # Discovery complete - clear state so progress monitor stops reporting discovery
         self._discovery_active = False
@@ -1712,19 +1914,20 @@ class AsyncEFSPurger:
 
         max_depth = max(dirs_by_depth.keys()) if dirs_by_depth else 0
 
-        log_with_context(
-            self.logger,
-            "info",
-            "Phase 1a complete: Directory tree discovered",
-            {
-                "total_dirs_discovered": total_dirs_discovered,
-                "depth_levels": len(dirs_by_depth),
-                "max_depth": max_depth,
-                "discovery_errors": discovery_errors,
-                "concurrent_workers": self.max_concurrent_discovery,
-                "memory_mb": round(get_memory_usage_mb(), 1),
-            },
-        )
+        if not phase1b_resume:
+            log_with_context(
+                self.logger,
+                "info",
+                "Phase 1a complete: Directory tree discovered",
+                {
+                    "total_dirs_discovered": total_dirs_discovered,
+                    "depth_levels": len(dirs_by_depth),
+                    "max_depth": max_depth,
+                    "discovery_errors": discovery_errors,
+                    "concurrent_workers": self.max_concurrent_discovery,
+                    "memory_mb": round(get_memory_usage_mb(), 1),
+                },
+            )
 
         # Free discovery-only state before Phase 1b to reduce memory pressure
         discovered_dirs.clear()
@@ -1757,6 +1960,7 @@ class AsyncEFSPurger:
         skipped_not_empty = 0
         deleted_lock = asyncio.Lock()
         rate_limit_reached = False
+        phase1b_checkpoint_saved = False
 
         # Use a semaphore for concurrency control
         deletion_sem = asyncio.Semaphore(self.max_concurrency_deletion)
@@ -1898,11 +2102,23 @@ class AsyncEFSPurger:
                         memory_mb = get_memory_usage_mb()
                         memory_percent = memory_mb / self.memory_limit_mb
                         if memory_percent > 0.95:
-                            # Still critical after GC - abort remaining deletion
+                            # Still critical after GC - save Phase 1b checkpoint and abort
+                            # Remaining dirs: unprocessed tail of current level + all shallower levels
+                            _remaining: dict[str, list[str]] = {str(current_depth): [str(p) for p in level_dirs[i:]]}
+                            for _d, _paths in dirs_by_depth.items():
+                                _remaining[str(_d)] = [str(p) for p in _paths]
+                            if self.dir_deletion_checkpoint_file:
+                                save_phase1b_checkpoint(
+                                    self.dir_deletion_checkpoint_file,
+                                    str(self.root_path),
+                                    _remaining,
+                                    {"root_path": str(self.root_path)},
+                                )
+                                phase1b_checkpoint_saved = True
                             log_with_context(
                                 self.logger,
                                 "warning",
-                                "Memory critical during deletion, stopping to prevent OOM",
+                                "Memory critical during deletion, checkpoint saved",
                                 {
                                     "memory_mb": round(memory_mb, 1),
                                     "memory_percent": round(memory_percent * 100, 1),
@@ -1912,6 +2128,7 @@ class AsyncEFSPurger:
                                     "current_depth": current_depth,
                                     "remaining_in_level": level_size - i,
                                     "remaining_levels": len(dirs_by_depth),
+                                    "checkpoint_saved": phase1b_checkpoint_saved,
                                 },
                             )
                             rate_limit_reached = True
@@ -1988,10 +2205,12 @@ class AsyncEFSPurger:
                 },
             )
 
-        # Drain discovery queue so references are released (may have items if discovery aborted early)
+        # Drain discovery queue — if memory aborted, collect remaining dirs for checkpoint
         while True:
             try:
-                discovery_queue.get_nowait()
+                p = discovery_queue.get_nowait()
+                if memory_abort and self.dir_deletion_checkpoint_file:
+                    phase1a_checkpoint_pending.append(p)
             except asyncio.QueueEmpty:
                 break
 
@@ -2014,8 +2233,64 @@ class AsyncEFSPurger:
                 "skipped_not_empty": skipped_not_empty,
                 "errors": deletion_errors + discovery_errors,
                 "memory_mb": round(get_memory_usage_mb(), 1),
+                "checkpoint_pending": len(phase1a_checkpoint_pending) if memory_abort else 0,
+                "phase1b_checkpoint_saved": phase1b_checkpoint_saved,
             },
         )
+
+        # If Phase 1b memory aborted and checkpoint was saved, exit 75 so the loop respawns.
+        if phase1b_checkpoint_saved:
+            log_with_context(
+                self.logger,
+                "info",
+                "Phase 1b checkpoint saved. Run with --dir-deletion-resume to continue deletion.",
+                {
+                    "checkpoint_file": str(self.dir_deletion_checkpoint_file),
+                    "dirs_deleted_this_run": deleted_count,
+                },
+            )
+            raise CheckpointExit(
+                f"Phase 1b memory critical: checkpoint saved to {self.dir_deletion_checkpoint_file}. "
+                "Run with --dir-deletion-resume to continue."
+            )
+
+        # If memory aborted discovery and a checkpoint file is configured:
+        # save the BFS frontier so the next run can resume from where we stopped,
+        # then exit 75 so the loop knows to respawn.
+        if memory_abort and self.dir_deletion_checkpoint_file:
+            save_phase1a_checkpoint(
+                self.dir_deletion_checkpoint_file,
+                str(self.root_path),
+                [str(p) for p in phase1a_checkpoint_pending],
+                {"root_path": str(self.root_path)},
+            )
+            log_with_context(
+                self.logger,
+                "info",
+                "Phase 1a checkpoint saved. Run with --dir-deletion-resume to continue discovery.",
+                {
+                    "checkpoint_file": str(self.dir_deletion_checkpoint_file),
+                    "pending_dirs_count": len(phase1a_checkpoint_pending),
+                    "dirs_deleted_this_run": deleted_count,
+                },
+            )
+            raise CheckpointExit(
+                f"Phase 1a memory critical: checkpoint saved to {self.dir_deletion_checkpoint_file}. "
+                "Run with --dir-deletion-resume to continue."
+            )
+
+        # Clean completion — delete checkpoint file if it exists (tree fully discovered)
+        if self.dir_deletion_checkpoint_file and self.dir_deletion_checkpoint_file.exists():
+            try:
+                self.dir_deletion_checkpoint_file.unlink()
+                log_with_context(
+                    self.logger,
+                    "info",
+                    "Phase 1a checkpoint deleted (discovery complete)",
+                    {"checkpoint_file": str(self.dir_deletion_checkpoint_file)},
+                )
+            except OSError as e:
+                self.logger.warning("Could not delete Phase 1a checkpoint: %s", e)
 
         return deleted_count
 
@@ -2079,44 +2354,107 @@ class AsyncEFSPurger:
         pending_dirs = 0
         pending_lock = asyncio.Lock()
         scan_done = asyncio.Event()
+        # Gates ``scan_done`` so Phase 2 cannot declare itself "complete"
+        # while the pending-dirs feeder still has frontier paths to deliver.
+        # Workers can transiently drain the queue faster than the feeder can
+        # pump it (e.g. a stretch of leaf dirs that decrement pending_dirs
+        # without re-incrementing); on 2026-06-04 that race fired with a
+        # mis-initialised counter and the worker-set scan_done deleted the
+        # entire checkpoint after a premature "completion".  We set the
+        # event up front when no feeder will run so single-pass scans
+        # (Phase 2 from scratch) behave as before.
+        feeder_done = asyncio.Event()
 
-        # Resume from checkpoint if requested
-        # When checkpoint has more paths than queue_maxsize, we must feed the queue
-        # incrementally via a loader task. Otherwise put_nowait breaks on QueueFull
-        # and we lose the remaining paths, causing a permanent hang.
-        remaining_checkpoint_paths: list[Path] = []
+        # Resume from checkpoint if requested.
+        #
+        # The frontier ("pending_dirs") lives in a sidecar file
+        # ``<checkpoint>.pending_dirs.gz`` and is streamed line-by-line into
+        # the bounded ``scan_queue`` by a dedicated feeder task.  Before
+        # this change the frontier was loaded into a single ``list[str]``
+        # at resume time — at ~30 M paths that one list alone was the
+        # dominant driver of the resume-baseline spiral that recurred on
+        # prod after the empty_dirs sidecar fix.
+        #
+        # Legacy embedded frontier: older checkpoints still carry
+        # ``pending_dirs`` inline in the main JSON.  We migrate them to the
+        # sidecar via ``write_pending_dirs_sidecar`` and drop the in-memory
+        # copy immediately so the resume baseline is the same on the first
+        # post-upgrade resume as on every subsequent one.
+        pending_dirs_iter: Iterator[str] | None = None  # set when resuming
         if self.resume and self.checkpoint_file and self.checkpoint_file.exists():
             cp = load_checkpoint(self.checkpoint_file)
             if cp:
-                pending_paths = [Path(p) for p in cp["pending_dirs"]]
-                loaded_count = 0
-                for p in pending_paths:
-                    try:
-                        scan_queue.put_nowait(p)
-                        loaded_count += 1
-                    except asyncio.QueueFull:
-                        remaining_checkpoint_paths = pending_paths[loaded_count:]
-                        break
-                pending_dirs = len(pending_paths)
                 # Restore stats for progress reporting
                 for k, v in cp.get("stats", {}).items():
                     if k in self.stats and isinstance(self.stats[k], (int, float)):
                         self.stats[k] = v
+                # Legacy empty_dirs migration (see commit 736e513).  If an
+                # older checkpoint still has empty_dirs embedded, flush
+                # them to the sidecar and drop the in-memory copy so
+                # Phase 2 runs with a clean baseline.
+                legacy_empty = cp.get("empty_dirs")
+                if legacy_empty and self.checkpoint_file is not None:
+                    try:
+                        append_empty_dirs_sidecar(self.checkpoint_file, legacy_empty)
+                    except OSError as e:
+                        self.logger.warning("Could not migrate legacy empty_dirs to sidecar: %s", e)
+                    cp["empty_dirs"] = []
+                    del legacy_empty
+                # Legacy pending_dirs migration.  Older checkpoints embed
+                # the frontier as a list; rewrite it to the sidecar and
+                # release the list reference before any worker starts so
+                # the resume baseline drops back to ~queue_maxsize.  Crucially
+                # we also propagate the migrated count into
+                # ``pending_dirs_count`` so the resume bookkeeping below sees
+                # the real frontier size — without this, the legacy path
+                # leaves pending_dirs=0 and the "fresh start" branch
+                # below redundantly re-seeds the root, forcing a re-scan
+                # of the entire tree.
+                legacy_pending = cp.get("pending_dirs")
+                if legacy_pending and self.checkpoint_file is not None:
+                    try:
+                        migrated_count = write_pending_dirs_sidecar(self.checkpoint_file, legacy_pending)
+                        cp["pending_dirs_count"] = migrated_count
+                    except OSError as e:
+                        self.logger.warning("Could not migrate legacy pending_dirs to sidecar: %s", e)
+                    cp["pending_dirs"] = []
+                    del legacy_pending
+                # ``pending_dirs`` counts outstanding work in flight; it is
+                # incremented by the feeder per-pushed path and by workers
+                # per-discovered subdir, and decremented when a directory
+                # finishes scanning.  The pre-feeder initial value is
+                # therefore always 0 — the count in the main JSON is used
+                # only for progress logging (and historically also caused
+                # the race that wiped the prod checkpoint on 2026-06-04).
+                resume_pending_count_for_log = cp.get("pending_dirs_count", 0) or 0
+                # Open the sidecar (best-effort: missing sidecar means the
+                # frontier was already fully drained — Phase 2 simply
+                # exits cleanly after the root is seeded below).
+                if self.checkpoint_file is not None and pending_dirs_sidecar_path(self.checkpoint_file).exists():
+                    pending_dirs_iter = stream_pending_dirs_sidecar(self.checkpoint_file)
                 log_with_context(
                     self.logger,
                     "info",
                     "Phase 2: Resuming from checkpoint",
                     {
                         "checkpoint_file": str(self.checkpoint_file),
-                        "pending_dirs": pending_dirs,
-                        "loaded_into_queue": loaded_count,
-                        "remaining_to_load": len(remaining_checkpoint_paths),
+                        "pending_dirs": resume_pending_count_for_log,
                         "files_scanned_so_far": self.stats.get("files_scanned", 0),
                         "dirs_scanned_so_far": self.stats.get("dirs_scanned", 0),
+                        "pending_dirs_sidecar_exists": (
+                            self.checkpoint_file is not None
+                            and pending_dirs_sidecar_path(self.checkpoint_file).exists()
+                        ),
+                        "empty_dirs_sidecar_exists": (
+                            self.checkpoint_file is not None and empty_dirs_sidecar_path(self.checkpoint_file).exists()
+                        ),
                     },
                 )
-        if pending_dirs == 0:
-            # Not resuming or checkpoint invalid - start from root
+        if pending_dirs_iter is None:
+            # No feeder (not resuming, or sidecar missing).  Seed the
+            # scan from the configured root.  When a feeder is set up
+            # we never reseed root here — the feeder pushes the frontier
+            # and increments pending_dirs per path.
             scan_queue.put_nowait(self.root_path)
             pending_dirs = 1
 
@@ -2141,6 +2479,12 @@ class AsyncEFSPurger:
                 "max_concurrency_deletion": self.max_concurrency_deletion,
             },
         )
+
+        # Per-worker current directory: used to rescue in-flight dirs when workers are
+        # blocked inside EFS syscalls (run_in_executor) and cannot respond to
+        # _checkpoint_requested cooperatively.  Keyed by worker_id; value is the
+        # directory the worker is currently scanning, or None when idle.
+        worker_active_dirs: dict[int, Path | None] = {}
 
         async def _scan_worker(worker_id: int) -> None:
             """Worker that scans directories from queue and processes files."""
@@ -2172,6 +2516,10 @@ class AsyncEFSPurger:
                     if scan_done.is_set():
                         break
                     continue
+
+                # Record current dir so the gather loop can rescue it if this worker
+                # gets stuck on an EFS syscall and cannot exit cooperatively.
+                worker_active_dirs[worker_id] = directory
 
                 # Track this directory as active (for stuck detection diagnostics)
                 async with self.active_directories_lock:
@@ -2303,48 +2651,220 @@ class AsyncEFSPurger:
                     async with self.active_directories_lock:
                         self.active_directories.discard(directory)
 
-                    # Decrement pending counter; when zero, all work is done
+                    # Clear the per-worker active-dir tracker now that this dir is done
+                    worker_active_dirs[worker_id] = None
+
+                    # Decrement pending counter; when zero AND the feeder has
+                    # finished, all work is done.  Gating on feeder_done
+                    # prevents a transient ``pending_dirs == 0`` (workers
+                    # racing ahead of the feeder) from terminating Phase 2
+                    # while the feeder still holds sidecar entries.
                     async with pending_lock:
                         pending_dirs -= 1
-                        if pending_dirs == 0:
+                        if pending_dirs == 0 and feeder_done.is_set():
                             scan_done.set()
 
-        # Loader task: feed remaining checkpoint paths into queue as workers drain it.
-        # When queue is full we sleep briefly and recheck _checkpoint_requested so we don't
-        # block forever when workers have exited (memory-critical path). Paths not yet put
-        # are stored in loader_remaining for inclusion in the checkpoint.
-        loader_remaining: list[Path] = []
+        # Pending-dirs feeder: stream the frontier sidecar line-by-line
+        # into ``scan_queue``.  Replaces the prior "load whole list, slice
+        # remainder, drain via loader task" pattern, which forced a
+        # ~30 M-string materialisation at resume time and was the cause of
+        # the second-wave death-spiral observed on 2026-06-04.
+        #
+        # The feeder always holds at most one in-flight path ``_unsent``
+        # in addition to the open file handle.  On checkpoint exit the
+        # caller pipes ``_unsent`` + the file iterator's unread tail into
+        # the new sidecar via ``feeder_tail()`` — see the rescue/cooperative
+        # checkpoint paths below for the merge point.
+        feeder_unsent: list[str] = []  # 0- or 1-element holder
 
-        async def _checkpoint_loader() -> None:
-            for i, p in enumerate(remaining_checkpoint_paths):
-                if self._checkpoint_requested or scan_done.is_set():
-                    loader_remaining.extend(remaining_checkpoint_paths[i:])
+        def feeder_tail() -> Iterator[str]:
+            """Yield (in order): the path the feeder pulled but never
+            enqueued, then the remainder of the sidecar from the feeder's
+            current file position.  Safe to call after the feeder has
+            exited.  Yields nothing when the feeder consumed the whole
+            sidecar cleanly.
+            """
+            if feeder_unsent:
+                yield feeder_unsent.pop()
+            if pending_dirs_iter is not None:
+                yield from pending_dirs_iter
+
+        async def _pending_dirs_feeder() -> None:
+            nonlocal pending_dirs
+            try:
+                if pending_dirs_iter is None:
                     return
-                try:
-                    scan_queue.put_nowait(p)
-                except asyncio.QueueFull:
-                    # Back-pressure: wait and recheck so we can exit when checkpoint requested
+                for p in pending_dirs_iter:
+                    if self._checkpoint_requested or scan_done.is_set():
+                        feeder_unsent.append(p)
+                        return
+                    # Reserve the slot in pending_dirs BEFORE pushing so a
+                    # worker can't grab the path and decrement before the
+                    # increment lands (which would let pending_dirs hit 0
+                    # transiently and — with the feeder_done gate clear —
+                    # fire scan_done prematurely).
+                    async with pending_lock:
+                        pending_dirs += 1
+                    # put_nowait + back-off polling keeps the feeder responsive
+                    # to the checkpoint flag even when workers have exited and
+                    # the queue can no longer drain.
                     while True:
-                        if self._checkpoint_requested or scan_done.is_set():
-                            loader_remaining.extend(remaining_checkpoint_paths[i:])
-                            return
-                        await asyncio.sleep(0.1)
                         try:
-                            scan_queue.put_nowait(p)
+                            scan_queue.put_nowait(Path(p))
                             break
                         except asyncio.QueueFull:
-                            continue
+                            if self._checkpoint_requested or scan_done.is_set():
+                                # Roll back the slot we reserved; this path
+                                # is captured via feeder_unsent and saved to
+                                # the new sidecar by the checkpoint code.
+                                async with pending_lock:
+                                    pending_dirs -= 1
+                                feeder_unsent.append(p)
+                                return
+                            await asyncio.sleep(0.1)
+            finally:
+                # Always signal feeder completion so the worker decrement
+                # check can fire ``scan_done`` once pending_dirs hits 0.
+                feeder_done.set()
+                # If workers are quiesced (pending_dirs==0 because they
+                # raced ahead while the feeder was queue-blocked or sleeping),
+                # they're stuck in ``scan_queue.get()`` with a 1s timeout
+                # and won't notice the queue is now permanently empty until
+                # something flips ``scan_done``.  Flip it here.
+                async with pending_lock:
+                    if pending_dirs == 0:
+                        scan_done.set()
 
-        # Launch workers and optionally the checkpoint loader
+        # Launch workers and (when resuming with a sidecar) the feeder.
+        # When there is no feeder, signal ``feeder_done`` immediately so the
+        # worker decrement check can fire ``scan_done`` on the normal
+        # single-pass path (Phase 2 from scratch / no resume).
         workers = [asyncio.create_task(_scan_worker(i)) for i in range(num_workers)]
-        loader_task = asyncio.create_task(_checkpoint_loader()) if remaining_checkpoint_paths else None
+        # Maps task object-id → worker_id so we can look up worker_active_dirs on cancel
+        task_to_worker_id: dict[int, int] = {id(task): i for i, task in enumerate(workers)}
+        if pending_dirs_iter is not None:
+            loader_task: asyncio.Task | None = asyncio.create_task(_pending_dirs_feeder())
+        else:
+            feeder_done.set()
+            loader_task = None
 
-        # Wait for workers and loader to complete
+        # Wait for workers and loader to complete.
+        # On the checkpoint path, workers stuck inside EFS syscalls (run_in_executor) cannot
+        # respond to _checkpoint_requested. After _STUCK_WORKER_CANCEL_TIMEOUT seconds we
+        # cancel them (after stuck_worker_cancel_timeout seconds), rescue their in-flight
+        # directory into _checkpoint_pending for retry on the next run, then proceed to
+        # save the checkpoint normally.
+        pending_tasks: set[asyncio.Task] = set(workers)
+        if loader_task is not None:
+            pending_tasks.add(loader_task)
+        # Checkpoint write task started early (before finally overhead) on the rescue path.
+        # Initialised here so the post-finally block can always reference it.
+        _cp_task_early: asyncio.Future | None = None
+        _cp_pending_count: int = 0
         try:
-            if loader_task is not None:
-                await asyncio.gather(*workers, loader_task)
-            else:
-                await asyncio.gather(*workers)
+            while pending_tasks:
+                done, pending_tasks = await asyncio.wait(pending_tasks, timeout=1.0)
+                if self._checkpoint_requested and pending_tasks:
+                    # Give remaining tasks up to stuck_worker_cancel_timeout to exit
+                    # cooperatively (normal workers check the flag each loop iteration).
+                    _, still_stuck = await asyncio.wait(pending_tasks, timeout=self.stuck_worker_cancel_timeout)
+                    if still_stuck:
+                        for task in still_stuck:
+                            wid = task_to_worker_id.get(id(task))
+                            if wid is not None:
+                                stuck_dir = worker_active_dirs.get(wid)
+                                if stuck_dir is not None:
+                                    async with self._checkpoint_lock:
+                                        self._checkpoint_pending.append(stuck_dir)
+                                    log_with_context(
+                                        self.logger,
+                                        "warning",
+                                        "Worker stuck on EFS syscall, rescued in-flight directory for checkpoint retry",
+                                        {
+                                            "worker_id": wid,
+                                            "directory": str(stuck_dir),
+                                        },
+                                    )
+                        for task in still_stuck:
+                            task.cancel()
+                        # Do NOT await still_stuck here: run_in_executor threads blocked on EFS
+                        # cannot be cancelled (cf_future.cancel() returns False for running
+                        # threads), so asyncio.gather would block indefinitely.  os._exit(75)
+                        # will kill the threads when the process exits after saving the checkpoint.
+                    pending_tasks.clear()
+
+                    # START CHECKPOINT WRITE EARLY — before the finally-block worker cleanup.
+                    # The finally block waits up to 5 s for cooperative workers + 5 s for the
+                    # feeder; starting the write here means it runs concurrently with that
+                    # cleanup, gaining ~10 s of NFS write time before the OOM killer fires.
+                    #
+                    # Why it's safe to drain the queue here:
+                    #   - cooperative workers already exited (they responded to _checkpoint_requested
+                    #     during the stuck_worker_cancel_timeout wait above)
+                    #   - stuck workers are blocked inside run_in_executor and cannot push to queue
+                    #   - the feeder has had >= stuck_worker_cancel_timeout seconds to see the flag
+                    #     and store its unsent path in feeder_unsent; we do a brief extra wait to confirm
+                    if self.checkpoint_file:
+                        # Brief wait for feeder to park its unsent path.  After
+                        # stuck_worker_cancel_timeout seconds with the flag set the feeder
+                        # has almost certainly already exited cooperatively; this is a safety net.
+                        if loader_task is not None and not loader_task.done():
+                            await asyncio.wait({loader_task}, timeout=1.0)
+                        # Drain the bounded queue (≤ queue_maxsize entries).
+                        _in_flight: list[Path] = []
+                        while True:
+                            try:
+                                _in_flight.append(scan_queue.get_nowait())
+                            except asyncio.QueueEmpty:
+                                break
+                        async with self._checkpoint_lock:
+                            _in_flight.extend(self._checkpoint_pending)
+                        _in_flight_count = len(_in_flight)
+
+                        def _pending_iter() -> Iterator[str]:
+                            for p in _in_flight:
+                                yield str(p)
+                            # feeder_tail() yields feeder_unsent (≤ 1) and then
+                            # streams the sidecar's unread tail line-by-line.
+                            # Crucially this never materialises the whole tail
+                            # in Python — even at 30 M+ entries, peak memory
+                            # stays at queue_maxsize Path objects.
+                            yield from feeder_tail()
+
+                        # Count is best-effort for logging: known lower bound is
+                        # the in-flight count plus the prior checkpoint's
+                        # ``pending_dirs_count`` from the cp dict.  We don't pre-
+                        # count the feeder tail because doing so would require
+                        # iterating it twice.
+                        _cp_pending_count = _in_flight_count + len(feeder_unsent)
+                        _loop = asyncio.get_running_loop()
+                        _empty_strs = [str(p) for p in self.empty_dirs]
+                        _cp_task_early = asyncio.ensure_future(
+                            _loop.run_in_executor(
+                                None,
+                                lambda: save_checkpoint(
+                                    self.checkpoint_file,
+                                    str(self.root_path),
+                                    _pending_iter(),
+                                    dict(self.stats),
+                                    {
+                                        "max_age_days": self.max_age_days,
+                                        "root_path": str(self.root_path),
+                                    },
+                                    empty_dirs=_empty_strs,
+                                ),
+                            )
+                        )
+                        log_with_context(
+                            self.logger,
+                            "info",
+                            "Checkpoint write started early (concurrent with worker cleanup)",
+                            {
+                                "in_flight_pending": _in_flight_count,
+                                "checkpoint_file": str(self.checkpoint_file),
+                            },
+                        )
+                    break
         finally:
             # Ensure clean shutdown: signal workers and cancel any still running
             scan_done.set()
@@ -2353,45 +2873,123 @@ class AsyncEFSPurger:
                     w.cancel()
             if loader_task is not None and not loader_task.done():
                 loader_task.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
+            # Brief timeout: cooperative workers finish quickly; stuck EFS threads cannot be
+            # cancelled and will be killed by os._exit — don't block indefinitely waiting for them.
+            # NOTE: asyncio.wait_for is intentionally NOT used here. In Python 3.12, wait_for
+            # after its timeout fires calls fut.cancel() and then awaits cancellation acknowledgment
+            # before raising TimeoutError. Since run_in_executor threads blocked on EFS cannot
+            # acknowledge cancellation, wait_for would hang indefinitely. asyncio.wait(timeout=N)
+            # simply returns (done, pending) after N seconds without attempting to cancel anything.
+            await asyncio.wait(set(workers), timeout=5.0)
             if loader_task is not None:
-                await asyncio.gather(loader_task, return_exceptions=True)
+                await asyncio.wait({loader_task}, timeout=5.0)
 
-        # If checkpoint was requested (memory critical), save and exit for resume
+        # If checkpoint was requested (memory critical), wait for the in-progress write
+        # (started early in the rescue path) or start one now (cooperative-exit path where
+        # all workers finished before the stuck-worker cancel timeout fired).
         if self._checkpoint_requested and self.checkpoint_file:
-            # Collect all pending dirs: queue contents + workers' contributions + loader's remainder
-            all_pending: list[Path] = []
-            while True:
-                try:
-                    p = scan_queue.get_nowait()
-                    all_pending.append(p)
-                except asyncio.QueueEmpty:
-                    break
-            async with self._checkpoint_lock:
-                all_pending.extend(self._checkpoint_pending)
-            all_pending.extend(loader_remaining)
-            # Dedupe not needed - BFS can have same dir from different parents, but we'll process
-            # each once; duplicates just mean redundant scans. Keep order for simplicity.
-            save_checkpoint(
-                self.checkpoint_file,
-                str(self.root_path),
-                [str(p) for p in all_pending],
-                dict(self.stats),
-                {
-                    "max_age_days": self.max_age_days,
-                    "root_path": str(self.root_path),
-                },
-            )
-            log_with_context(
-                self.logger,
-                "info",
-                "Checkpoint saved, exit for resume. Run with --resume to continue.",
-                {
-                    "checkpoint_file": str(self.checkpoint_file),
-                    "pending_dirs_count": len(all_pending),
-                },
-            )
-            raise CheckpointExit("Memory critical, checkpoint saved. Run with --resume to continue.")
+            if _cp_task_early is not None:
+                # Write was started before the finally block.  The finally block took up to 10 s
+                # (5 s worker wait + 5 s feeder wait); give the remaining budget of ~50 s.
+                done, _ = await asyncio.wait({_cp_task_early}, timeout=50.0)
+                if _cp_task_early in done:
+                    try:
+                        written = _cp_task_early.result()  # re-raises if save_checkpoint threw
+                        log_with_context(
+                            self.logger,
+                            "info",
+                            "Checkpoint saved, exit for resume. Run with --resume to continue.",
+                            {
+                                "checkpoint_file": str(self.checkpoint_file),
+                                "pending_dirs_count": written,
+                            },
+                        )
+                    except Exception as exc:
+                        log_with_context(
+                            self.logger,
+                            "warning",
+                            "Checkpoint write failed (NFS error). Old checkpoint preserved — will retry on next run.",
+                            {
+                                "checkpoint_file": str(self.checkpoint_file),
+                                "error": str(exc),
+                            },
+                        )
+                else:
+                    log_with_context(
+                        self.logger,
+                        "warning",
+                        "Checkpoint write timed out (EFS NFS open/write syscall hung). "
+                        "Old checkpoint preserved — will retry on next run.",
+                        {"checkpoint_file": str(self.checkpoint_file)},
+                    )
+            else:
+                # Cooperative-exit path: all workers finished before stuck_worker_cancel_timeout
+                # fired, so no early write was started.  Start one now.
+                # (Same executor + asyncio.wait pattern — see rationale in the rescue path above.)
+                _coop_in_flight: list[Path] = []
+                while True:
+                    try:
+                        _coop_in_flight.append(scan_queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                async with self._checkpoint_lock:
+                    _coop_in_flight.extend(self._checkpoint_pending)
+                loop = asyncio.get_running_loop()
+                empty_dirs_strs = [str(p) for p in self.empty_dirs]
+
+                def _coop_pending_iter() -> Iterator[str]:
+                    for p in _coop_in_flight:
+                        yield str(p)
+                    yield from feeder_tail()
+
+                cp_task = asyncio.ensure_future(
+                    loop.run_in_executor(
+                        None,
+                        lambda: save_checkpoint(
+                            self.checkpoint_file,
+                            str(self.root_path),
+                            _coop_pending_iter(),
+                            dict(self.stats),
+                            {
+                                "max_age_days": self.max_age_days,
+                                "root_path": str(self.root_path),
+                            },
+                            empty_dirs=empty_dirs_strs,
+                        ),
+                    ),
+                )
+                done, _ = await asyncio.wait({cp_task}, timeout=60.0)
+                if cp_task in done:
+                    try:
+                        written = cp_task.result()  # re-raises if save_checkpoint threw
+                        log_with_context(
+                            self.logger,
+                            "info",
+                            "Checkpoint saved, exit for resume. Run with --resume to continue.",
+                            {
+                                "checkpoint_file": str(self.checkpoint_file),
+                                "pending_dirs_count": written,
+                            },
+                        )
+                    except Exception as exc:
+                        log_with_context(
+                            self.logger,
+                            "warning",
+                            "Checkpoint write failed (NFS error). Old checkpoint preserved — will retry on next run.",
+                            {
+                                "checkpoint_file": str(self.checkpoint_file),
+                                "error": str(exc),
+                            },
+                        )
+                else:
+                    log_with_context(
+                        self.logger,
+                        "warning",
+                        "Checkpoint write timed out (EFS NFS open/write syscall hung). "
+                        "Old checkpoint preserved — will retry on next run.",
+                        {"checkpoint_file": str(self.checkpoint_file)},
+                    )
+            raise CheckpointExit("Memory critical, checkpoint save attempted. Run with --resume to continue.")
 
     async def _background_progress_reporter(self) -> None:
         """
@@ -2709,19 +3307,20 @@ class AsyncEFSPurger:
             if self.remove_empty_dirs and not self.resume:
                 await self._purge_empty_directories_standalone()
 
-            # Phase 2: Scan and purge files (BFS queue + worker pool)
-            self.current_phase = "scanning"
-            self.rate_tracker.set_phase_start("scanning")
-            await self._scan_and_purge_files()
+            if not self.phase1_only:
+                # Phase 2: Scan and purge files (BFS queue + worker pool)
+                self.current_phase = "scanning"
+                self.rate_tracker.set_phase_start("scanning")
+                await self._scan_and_purge_files()
 
-            # Mark scanning phase as complete (for accurate overall rate calculation)
-            self.scanning_end_time = time.time()
+                # Mark scanning phase as complete (for accurate overall rate calculation)
+                self.scanning_end_time = time.time()
 
-            # Phase 3: Post-scan empty directory cleanup
-            # After purging files, some directories may have become empty.
-            # Run the existing post-order deletion to catch these.
-            if self.remove_empty_dirs:
-                await self._remove_empty_directories()
+                # Phase 3: Post-scan empty directory cleanup
+                # After purging files, some directories may have become empty.
+                # Run the existing post-order deletion to catch these.
+                if self.remove_empty_dirs:
+                    await self._remove_empty_directories()
 
             # Purge completed successfully - remove checkpoint file so a future
             # run with --resume won't mistakenly resume from stale state.
@@ -2741,6 +3340,13 @@ class AsyncEFSPurger:
                         "Could not remove checkpoint file after successful purge",
                         {"checkpoint_file": str(self.checkpoint_file), "error": str(e)},
                     )
+            # Also remove the empty-dirs and pending-dirs sidecars (written
+            # next to the checkpoint to keep carry-over off the Phase 2
+            # heap).  Best-effort: a stale sidecar with no matching
+            # checkpoint is harmless because the next purge starts fresh.
+            if self.checkpoint_file is not None:
+                remove_empty_dirs_sidecar(self.checkpoint_file)
+                remove_pending_dirs_sidecar(self.checkpoint_file)
         finally:
             # Cancel background reporter
             progress_task.cancel()
@@ -2878,6 +3484,10 @@ async def async_main(
     max_entries_per_dir: int = 0,
     checkpoint_file: str | Path | None = None,
     resume: bool = False,
+    dir_deletion_checkpoint_file: str | Path | None = None,
+    dir_deletion_resume: bool = False,
+    phase1_only: bool = False,
+    backpressure_checkpoint_timeout: int = 600,
 ) -> dict:
     """
     Async entry point for the purger.
@@ -2900,6 +3510,10 @@ async def async_main(
         max_entries_per_dir: Cap entries per directory in Phase 1a (0 = no limit) to avoid one huge dir stalling workers
         checkpoint_file: Path to save checkpoint when memory critical (enables auto-checkpoint)
         resume: If True, load checkpoint and resume Phase 2 from saved state
+        dir_deletion_checkpoint_file: Path to save/load Phase 1a BFS frontier checkpoint on memory abort
+        dir_deletion_resume: If True, resume Phase 1a discovery from dir_deletion_checkpoint_file
+        backpressure_checkpoint_timeout: Seconds of sustained back-pressure before forcing checkpoint exit
+            (default: 600)
 
     Returns:
         Operation statistics
@@ -2922,6 +3536,10 @@ async def async_main(
         max_entries_per_dir=max_entries_per_dir,
         checkpoint_file=checkpoint_file,
         resume=resume,
+        dir_deletion_checkpoint_file=dir_deletion_checkpoint_file,
+        dir_deletion_resume=dir_deletion_resume,
+        phase1_only=phase1_only,
+        backpressure_checkpoint_timeout=backpressure_checkpoint_timeout,
     )
 
     return await purger.purge()

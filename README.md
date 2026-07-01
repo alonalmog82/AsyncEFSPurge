@@ -6,6 +6,61 @@ High-performance asynchronous file purger designed for AWS EFS and network files
 [![Docker](https://github.com/alonalmog82/AsyncEFSPurge/workflows/Docker/badge.svg)](https://github.com/alonalmog82/AsyncEFSPurge/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+## Why This Exists
+
+The intuitive solution for purging old files is a one-liner:
+
+```bash
+find /mnt/efs -mtime +30 -delete
+```
+
+At small scale on a local disk, this works fine. At large scale on a network filesystem like AWS EFS, it fails in ways that are non-obvious and hard to diagnose.
+
+### The problems you will hit
+
+**1. NFS directory listing saturates the mount**
+
+`find` calls `getdents()` to list directory contents. On EFS, each `getdents()` call crosses the network and holds kernel NFS page-cache buffers for the duration. With millions of directories, worker threads pile up inside the kernel syscall — memory climbs, I/O throughput collapses, and eventually the process is OOMKilled. Sequential `find` is slow enough that it usually escapes this; anything that parallelises the scan (e.g., backgrounding one `find` per subdirectory) makes it dramatically worse.
+
+**2. `ionice` does not help on NFS**
+
+`ionice` sets the Linux I/O scheduler priority for a process. The I/O scheduler only applies to local block devices (HDDs, SSDs). NFS traffic goes through the network stack and bypasses it entirely. A common suggestion — `ionice -c 3 find ...` — provides zero protection against EFS saturation.
+
+**3. Parallelising naively worsens the problem**
+
+Running one `find` per top-level directory in the background feels like a throughput win:
+
+```bash
+for dir in /mnt/efs/*/; do
+  ionice -c 3 find "$dir" -mtime +30 -delete &
+done
+wait
+```
+
+With hundreds of top-level directories this spawns hundreds of concurrent `getdents()` calls simultaneously, which is exactly the pattern that saturates EFS. The controlled worker pool in this tool (default: 20 workers) exists specifically to cap NFS concurrency at a level the mount can sustain.
+
+**4. No checkpoint means no recovery**
+
+A run over tens of millions of directories takes hours. In a containerised environment (Kubernetes, ECS) the process will be OOMKilled before it finishes. Without a checkpoint there is no way to resume — every restart starts from scratch, making forward progress impossible. This tool saves a compressed checkpoint when memory pressure is detected and resumes from it on the next run, allowing incremental progress across many restarts.
+
+**5. Memory grows unboundedly during traversal**
+
+Tracking the entire pending directory tree in memory — even as a flat list — is expensive at scale. A Python `Path` object is ~300–400 bytes; 10 million pending directories consume 3–4 GB before a single file is deleted. This tool keeps only a bounded queue in memory, loading the remainder lazily from the checkpoint file, and applies back-pressure to scanning when memory approaches the container limit.
+
+### When the simple approach is fine
+
+- Local disk (not NFS/EFS)
+- File counts under ~100K
+- Short-lived or easily-restartable workloads with no memory constraints
+- One-off manual cleanup where you can wait and re-run if it fails
+
+### When you need this tool
+
+- AWS EFS or other NFS mounts
+- Millions of files or directories
+- Containerised workloads with memory limits
+- Scheduled/automated cleanup that must make forward progress across restarts
+
 ## Features
 
 - ⚡ **High Performance** - Async I/O with configurable concurrency (handles 1000+ files/sec)

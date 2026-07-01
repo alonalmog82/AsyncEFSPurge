@@ -5,7 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.0.4] - Unreleased
+## [2.2.0] - 2026-07-01
+
+### Fixed
+- **Phase 2 second-wave death spiral (sidecar chain for `pending_dirs`)** — On checkpoint/resume against a ~1.5 B-directory production EFS filesystem, the accumulated Phase 2 pending frontier grew into the hundreds of millions of paths. Serialising it inside the JSON checkpoint on every save pushed peak RSS above the 16 GiB pod limit and re-triggered a save on the next tick, producing a checkpoint-loop "death spiral" with no forward progress. `pending_dirs` is now streamed to a gzip sidecar file alongside the JSON checkpoint (`<checkpoint>.pending_dirs.gz`) instead of being held in the JSON payload. The main JSON stays small and cheap to write; the sidecar is streamed line-by-line on save and on load, so RAM never holds the full frontier as a Python list.
+- **Phase 2 empty-dirs frontier bloat (sidecar for `empty_dirs`)** — The Phase 2 empty-dirs list had the same growth pattern as `pending_dirs` — carried across checkpoint cycles as a Python set of `Path` objects, it inflated the checkpoint payload and drove the resume baseline higher on every cycle. `empty_dirs` is now persisted to a companion gzip sidecar (`<checkpoint>.empty_dirs.gz`) with the same streaming save/load path, breaking the baseline spiral.
+- **Premature Phase 2 exit on checkpoint resume (`scan_done` race)** — When resuming from a checkpoint, the sentinel that told workers "no more directories are coming" could fire before the checkpoint-loader task had finished feeding all pending paths back into the queue. Workers observed `scan_done` and exited while paths were still queued for delivery, silently truncating the frontier. `scan_done` is now gated on feeder completion, so it can only be set once every pending path from the sidecar has been enqueued.
+- **Legacy-checkpoint resume undercounts `pending_dirs`** — Checkpoints written by pre-2.2.0 versions store `pending_dirs` inline. On upgrade, the loader migrated those paths into the new sidecar-backed queue but did not propagate the migrated count to the runtime `pending_dirs` metric, so post-migration progress logs showed a wildly-too-low pending count and confused external monitors. The migrated count is now propagated correctly on the first tick after resume.
+- **~1.5 GB Path-object allocation on checkpoint resume** — When resuming with a very large pending frontier, the previous code materialised the entire sidecar into a Python list of `Path` objects in one pass, spiking RSS by roughly 1.5 GB before the first worker started. The loader now streams paths into the bounded queue as workers drain it, so peak RSS during resume is dominated by the queue's `queue_maxsize`, not the size of the on-disk frontier.
+
+### Operational
+- Validated in production for 3 days at 16 GiB pod memory / 14000 MB internal back-pressure trigger against a ~1.5 B-directory EFS filesystem: no death spirals, back-pressure firing only occasionally, and actual file purges observed across the run (image: `ghcr.io/alonalmog82/asyncefspurge:snapshot-pr-45`).
+
+## [2.1.0] - Unreleased
+
+### Added
+- **Phase 1a checkpoint/resume (`--dir-deletion-checkpoint-file` / `EFSPURGE_DIR_DELETION_CHECKPOINT_FILE`)** — When Phase 1a (directory discovery) exhausts memory mid-BFS, it now saves the unscanned BFS frontier to a checkpoint file, runs Phase 1b immediately on whatever empty dirs were found so far, then exits 75. On the next run with `--dir-deletion-resume` / `EFSPURGE_DIR_DELETION_RESUME=1`, discovery resumes from the saved frontier rather than restarting from the root. This enables progressive empty-dir cleanup across arbitrarily large directory trees without requiring the full tree to fit in memory at once. Uses a separate file from the Phase 2 `--checkpoint-file` to avoid conflicts with the daily purge job.
+
+### Fixed
+- **Phase 2 empty dirs lost on checkpoint** — When Phase 2 hit the 95% memory threshold mid-scan and saved a checkpoint, `self.empty_dirs` (directories found to be empty during the scan, used by Phase 3) was not included in the checkpoint. On resume, Phase 3 had no knowledge of dirs that became empty during the previous run. Empty dirs are now saved in the checkpoint under `empty_dirs` and restored on resume, so Phase 3 accumulates all empty dirs across multiple checkpoint/resume cycles.
+
+## [2.0.4] - 2026-03-20
 
 ### Fixed
 - **Phase 3 worker count causes multi-minute hangs** — `_remove_empty_directories()` (Phase 3, post-scan empty dir cleanup) used `max_concurrency_deletion` as the number of worker coroutines in both the first pass and each cascading iteration. With values like 4000, this spawned thousands of tasks simultaneously, each calling `async_scandir(parent)` to check whether the parent became empty. The scandir executor only has `scandir_executor_threads` (default: 100) slots, so 3,900+ coroutines queued waiting for executor slots — saturating the thread pool and stalling progress for minutes per iteration. The `deletion_semaphore` already bounds concurrent `rmdir` I/O; worker count is now capped at `max_concurrent_discovery` (default: 20), consistent with Phase 1a/1b.

@@ -14,12 +14,21 @@ from efspurge.checkpoint import (
     CHECKPOINT_VERSION,
     load_checkpoint,
     save_checkpoint,
+    stream_pending_dirs_sidecar,
 )
 from efspurge.purger import AsyncEFSPurger
 
 
 def test_save_checkpoint_creates_valid_json(tmp_path):
-    """save_checkpoint writes valid JSON with expected keys."""
+    """save_checkpoint writes the main JSON plus a pending-dirs sidecar.
+
+    The main JSON carries only the *count* of pending dirs; the paths
+    themselves live in ``<cp>.pending_dirs.gz`` so the resume baseline
+    isn't dominated by a Python list of millions of strings (the cause of
+    the death-spiral re-occurrence on 2026-06-04).
+    """
+    import gzip
+
     cp = tmp_path / "checkpoint.json"
     save_checkpoint(
         filepath=cp,
@@ -29,17 +38,21 @@ def test_save_checkpoint_creates_valid_json(tmp_path):
         config={"max_age_days": 30},
     )
     assert cp.exists()
-    data = json.loads(cp.read_text())
+    with gzip.open(cp, "rt") as f:
+        data = json.loads(f.read())
     assert data["version"] == CHECKPOINT_VERSION
     assert data["phase"] == "phase2"
     assert data["root_path"] == "/data/root"
-    assert data["pending_dirs"] == ["/data/root/a", "/data/root/b"]
+    # Frontier paths are in the sidecar, not inline.
+    assert "pending_dirs" not in data or not data["pending_dirs"]
+    assert data["pending_dirs_count"] == 2
+    assert list(stream_pending_dirs_sidecar(cp)) == ["/data/root/a", "/data/root/b"]
     assert data["stats"]["files_scanned"] == 10
     assert data["config"]["max_age_days"] == 30
 
 
 def test_load_checkpoint_roundtrip(tmp_path):
-    """load_checkpoint returns data saved by save_checkpoint."""
+    """load_checkpoint returns the stats/config; frontier paths come from the sidecar stream."""
     cp = tmp_path / "checkpoint.json"
     save_checkpoint(
         filepath=cp,
@@ -51,7 +64,11 @@ def test_load_checkpoint_roundtrip(tmp_path):
     loaded = load_checkpoint(cp)
     assert loaded is not None
     assert loaded["root_path"] == "/data/api_files"
-    assert loaded["pending_dirs"] == ["/data/api_files/org1", "/data/api_files/org2"]
+    assert loaded["pending_dirs_count"] == 2
+    assert list(stream_pending_dirs_sidecar(cp)) == [
+        "/data/api_files/org1",
+        "/data/api_files/org2",
+    ]
     assert loaded["stats"]["files_scanned"] == 100
     assert loaded["config"]["max_age_days"] == 30
 

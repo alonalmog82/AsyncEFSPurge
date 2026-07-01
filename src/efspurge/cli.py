@@ -12,7 +12,7 @@ from .purger import CheckpointExit, async_main
 logger = logging.getLogger("efspurge")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(args=None) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         description="AsyncEFSPurge - High-performance async file purger for AWS EFS",
@@ -75,6 +75,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.getenv("EFSPURGE_MEMORY_LIMIT_MB", "800")),
         help="Soft memory limit in MB (triggers back-pressure, 0 = no limit)",
+    )
+
+    parser.add_argument(
+        "--backpressure-checkpoint-timeout",
+        type=int,
+        default=int(os.getenv("EFSPURGE_BACKPRESSURE_CHECKPOINT_TIMEOUT", "600")),
+        help="Seconds of sustained back-pressure before forcing a checkpoint exit (default: 600, 0 = disabled)",
     )
 
     parser.add_argument(
@@ -168,6 +175,38 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--dir-deletion-checkpoint-file",
+        type=str,
+        default=os.getenv("EFSPURGE_DIR_DELETION_CHECKPOINT_FILE", ""),
+        help=(
+            "Path to save/load Phase 1a (directory discovery) checkpoint when memory is critical. "
+            "On memory abort: saves BFS frontier, runs Phase 1b on dirs found so far, exits 75. "
+            "Use with --dir-deletion-resume to continue from where discovery stopped."
+        ),
+    )
+
+    parser.add_argument(
+        "--dir-deletion-resume",
+        action="store_true",
+        default=os.getenv("EFSPURGE_DIR_DELETION_RESUME", "").lower() in ("1", "true", "yes"),
+        help=(
+            "Resume Phase 1a directory discovery from checkpoint (requires --dir-deletion-checkpoint-file). "
+            "Restores the BFS frontier and continues scanning from where the previous run stopped."
+        ),
+    )
+
+    parser.add_argument(
+        "--phase1-only",
+        action="store_true",
+        default=os.getenv("EFSPURGE_PHASE1_ONLY", "").lower() in ("1", "true", "yes"),
+        help=(
+            "Run Phase 1 (empty directory cleanup) only, skipping Phase 2 file scan and Phase 3. "
+            "Use with --remove-empty-dirs and --dir-deletion-checkpoint-file for iterative "
+            "empty-dir cleanup across large trees. Set EFSPURGE_PHASE1_ONLY=1 to enable via env var."
+        ),
+    )
+
+    parser.add_argument(
         "--no-uvloop",
         action="store_true",
         default=os.getenv("EFSPURGE_UVLOOP", "true").lower() in ("0", "false", "no"),
@@ -185,7 +224,7 @@ def parse_args() -> argparse.Namespace:
         version=f"efspurge {__version__}",
     )
 
-    return parser.parse_args()
+    return parser.parse_args(args)
 
 
 def main() -> None:
@@ -205,49 +244,69 @@ def main() -> None:
             stacklevel=2,
         )
 
-    # Determine event loop factory: use uvloop by default on Linux/macOS
-    loop_factory = None
+    # Determine whether to use uvloop
+    use_uvloop = False
     if not args.no_uvloop:
         try:
-            import uvloop
+            import uvloop  # noqa: F401
 
-            loop_factory = uvloop.new_event_loop
+            use_uvloop = True
         except ImportError:
             # uvloop not installed (e.g. Windows, or minimal install)
             pass
 
+    coro = async_main(
+        path=args.path,
+        max_age_days=args.max_age_days,
+        max_concurrency=args.max_concurrency,
+        max_concurrency_scanning=args.max_concurrency_scanning,
+        max_concurrency_deletion=args.max_concurrency_deletion,
+        dry_run=args.dry_run,
+        log_level=args.log_level,
+        memory_limit_mb=args.memory_limit_mb,
+        task_batch_size=args.task_batch_size,
+        remove_empty_dirs=args.remove_empty_dirs,
+        max_empty_dirs_to_delete=args.max_empty_dirs_to_delete,
+        max_discovery_dirs=args.max_discovery_dirs,
+        max_concurrent_discovery=args.max_concurrent_discovery,
+        queue_maxsize=args.queue_maxsize,
+        max_entries_per_dir=args.max_entries_per_dir,
+        checkpoint_file=args.checkpoint_file or None,
+        resume=args.resume,
+        dir_deletion_checkpoint_file=args.dir_deletion_checkpoint_file or None,
+        dir_deletion_resume=args.dir_deletion_resume,
+        phase1_only=args.phase1_only,
+        backpressure_checkpoint_timeout=args.backpressure_checkpoint_timeout,
+    )
+
     try:
-        # Run the async purger
-        asyncio.run(
-            async_main(
-                path=args.path,
-                max_age_days=args.max_age_days,
-                max_concurrency=args.max_concurrency,
-                max_concurrency_scanning=args.max_concurrency_scanning,
-                max_concurrency_deletion=args.max_concurrency_deletion,
-                dry_run=args.dry_run,
-                log_level=args.log_level,
-                memory_limit_mb=args.memory_limit_mb,
-                task_batch_size=args.task_batch_size,
-                remove_empty_dirs=args.remove_empty_dirs,
-                max_empty_dirs_to_delete=args.max_empty_dirs_to_delete,
-                max_discovery_dirs=args.max_discovery_dirs,
-                max_concurrent_discovery=args.max_concurrent_discovery,
-                queue_maxsize=args.queue_maxsize,
-                max_entries_per_dir=args.max_entries_per_dir,
-                checkpoint_file=args.checkpoint_file or None,
-                resume=args.resume,
-            ),
-            loop_factory=loop_factory,
-        )
+        # Run the async purger.
+        # Use uvloop.run() when available (works on Python 3.11+).
+        # asyncio.run(loop_factory=...) only exists on Python 3.12+.
+        if use_uvloop:
+            import uvloop
+
+            uvloop.run(coro)
+        else:
+            asyncio.run(coro)
 
         # Exit with success
         sys.exit(0)
 
     except CheckpointExit as e:
         print(f"\n{e}", file=sys.stderr)
-        print("Run with --resume to continue from checkpoint.", file=sys.stderr)
-        sys.exit(75)  # EX_TEMPFAIL - checkpoint saved, resume suggested
+        print(
+            "Run with --resume to continue Phase 2 from checkpoint, "
+            "or --dir-deletion-resume to continue Phase 1a directory discovery.",
+            file=sys.stderr,
+        )
+        sys.stderr.flush()
+        sys.stdout.flush()
+        # Use os._exit(75) instead of sys.exit(75) to bypass atexit handlers.
+        # sys.exit() triggers ThreadPoolExecutor's atexit which waits for all
+        # in-flight threads (EFS scandir calls) — causing multi-minute hangs.
+        # The checkpoint is already safely on disk; we can exit immediately.
+        os._exit(75)
     except KeyboardInterrupt:
         print("\nOperation cancelled by user", file=sys.stderr)
         sys.exit(130)

@@ -46,3 +46,19 @@ coverage.xml
 # Logs
 *.log
 
+# Monitor artifacts (live snapshots / diagnoses contain pod logs and EFS paths)
+monitor/
+
+# Local session / analysis scratch (per-run notes, not repo content)
+.claude/
+CLAUDE.md
+ARTICLE.md
+JOB_ANALYSIS_*.md
+RUN_ANALYSIS_*.md
+
+# Local operator scripts coupled to monitor/ artifacts (not portable)
+scripts/diagnose.py
+scripts/parse-job-status.py
+scripts/snapshot-prod.sh
+scripts/status-table.py
+scripts/trigger-manual-run.sh

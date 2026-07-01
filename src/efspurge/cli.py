@@ -207,6 +207,19 @@ def parse_args(args=None) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--phase3-only",
+        action="store_true",
+        default=os.getenv("EFSPURGE_PHASE3_ONLY", "").lower() in ("1", "true", "yes"),
+        help=(
+            "Run Phase 3 (post-scan empty-dir cleanup) only, draining the empty_dirs sidecar "
+            "written by a prior Phase 2 run.  Skips Phase 1 and Phase 2 entirely.  Preserves "
+            "the main checkpoint file and the pending_dirs sidecar so a subsequent --resume "
+            "continues Phase 2 where it left off.  Requires --remove-empty-dirs.  Mutually "
+            "exclusive with --phase1-only.  Set EFSPURGE_PHASE3_ONLY=1 to enable via env var."
+        ),
+    )
+
+    parser.add_argument(
         "--no-uvloop",
         action="store_true",
         default=os.getenv("EFSPURGE_UVLOOP", "true").lower() in ("0", "false", "no"),
@@ -230,6 +243,15 @@ def parse_args(args=None) -> argparse.Namespace:
 def main() -> None:
     """Main entry point for the CLI."""
     args = parse_args()
+
+    # Validate phase-only flag combinations early (constructor also enforces this,
+    # but failing here surfaces a friendly parser-style error before asyncio spins up).
+    if args.phase1_only and args.phase3_only:
+        print("error: --phase1-only and --phase3-only are mutually exclusive", file=sys.stderr)
+        sys.exit(2)
+    if args.phase3_only and not args.remove_empty_dirs:
+        print("error: --phase3-only requires --remove-empty-dirs", file=sys.stderr)
+        sys.exit(2)
 
     # Warn if deprecated --max-concurrency is explicitly set (not just from env var)
     if args.max_concurrency is not None:
@@ -276,6 +298,7 @@ def main() -> None:
         dir_deletion_checkpoint_file=args.dir_deletion_checkpoint_file or None,
         dir_deletion_resume=args.dir_deletion_resume,
         phase1_only=args.phase1_only,
+        phase3_only=args.phase3_only,
         backpressure_checkpoint_timeout=args.backpressure_checkpoint_timeout,
     )
 

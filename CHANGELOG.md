@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-07-01
+
+### Added
+- **`--phase3-only` mode (env: `EFSPURGE_PHASE3_ONLY=1`)** — Standalone invocation of Phase 3 (post-scan empty-directory cleanup) that drains the existing `<checkpoint>.empty_dirs.gz` sidecar written by a prior Phase 2 run WITHOUT re-running Phase 1 or Phase 2.  On completion the empty-dirs sidecar is removed, but the main checkpoint file and the `.pending_dirs.gz` sidecar are **preserved**, so a subsequent `--resume` continues Phase 2 exactly where it left off.  Enables operators to realize accumulated empty-dir cleanup work mid-scan (e.g. before starting a sharded re-scan) without discarding Phase 2 progress.  Requires `--remove-empty-dirs`; mutually exclusive with `--phase1-only`.
+
 ## [2.2.0] - 2026-07-01
 
 ### Fixed

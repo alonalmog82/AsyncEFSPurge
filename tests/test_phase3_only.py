@@ -39,6 +39,7 @@ def _make_purger(
     dry_run: bool = False,
     phase3_only: bool = True,
     remove_empty_dirs: bool = True,
+    phase3_batch_size: int = 0,
 ) -> AsyncEFSPurger:
     return AsyncEFSPurger(
         root_path=str(root),
@@ -46,6 +47,7 @@ def _make_purger(
         dry_run=dry_run,
         remove_empty_dirs=remove_empty_dirs,
         phase3_only=phase3_only,
+        phase3_batch_size=phase3_batch_size,
         checkpoint_file=str(tmp_path / "cp.json"),
     )
 
@@ -234,3 +236,150 @@ def test_cli_rejects_phase3_without_remove_empty_dirs(tmp_path):
     )
     assert result.returncode != 0
     assert "requires --remove-empty-dirs" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Bug-fix: sidecar preserved on abort (regression for 2.3.0 defect where the
+# empty-dirs sidecar was removed regardless of whether the deletion pass
+# actually completed).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_phase3_only_preserves_sidecar_on_memory_abort(tmp_path, monkeypatch):
+    """If _remove_empty_directories aborts on memory-critical, the sidecar
+    must remain on disk so a retry can pick up the unprocessed entries."""
+    root = tmp_path / "root"
+    root.mkdir()
+    empty = root / "abort-me"
+    empty.mkdir()
+
+    cp = tmp_path / "cp.json"
+    append_empty_dirs_sidecar(cp, [str(empty)])
+
+    purger = _make_purger(tmp_path, root)
+
+    original = AsyncEFSPurger._remove_empty_directories
+
+    async def fake_remove(self):
+        # Simulate the memory-critical circuit breaker firing — set the
+        # flag but do NOT actually delete anything.
+        self._checkpoint_requested = True
+
+    monkeypatch.setattr(AsyncEFSPurger, "_remove_empty_directories", fake_remove)
+    try:
+        await purger.purge()
+    finally:
+        monkeypatch.setattr(AsyncEFSPurger, "_remove_empty_directories", original)
+
+    # The directory was NOT deleted (we short-circuited) and the sidecar
+    # must still be there.
+    assert empty.exists(), "abort path must not delete anything"
+    assert empty_dirs_sidecar_path(cp).exists(), "sidecar must be preserved on abort so the operator can retry"
+
+
+# ---------------------------------------------------------------------------
+# Iterative mode: memory-bounded drain via --phase3-batch-size
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_phase3_only_iterative_processes_multiple_batches(tmp_path):
+    """With phase3_batch_size < total unique entries, all get processed."""
+    root = tmp_path / "root"
+    root.mkdir()
+    dirs = []
+    for i in range(23):
+        d = root / f"leaf{i:03d}"
+        d.mkdir()
+        dirs.append(d)
+
+    cp = tmp_path / "cp.json"
+    # Deliberately double the sidecar entries — the loader should dedup
+    # per-batch and repeat deletions must be harmless (ENOENT).
+    append_empty_dirs_sidecar(cp, [str(d) for d in dirs])
+    append_empty_dirs_sidecar(cp, [str(d) for d in dirs])
+
+    purger = _make_purger(tmp_path, root, phase3_batch_size=5)
+    await purger.purge()
+
+    for d in dirs:
+        assert not d.exists(), f"{d} should have been deleted across batches"
+    assert not empty_dirs_sidecar_path(cp).exists(), "sidecar removed after full drain across batches"
+
+
+@pytest.mark.asyncio
+async def test_phase3_only_iterative_preserves_sidecar_on_abort(tmp_path, monkeypatch):
+    """Iterative drain: if a batch aborts on memory-critical, sidecar is preserved."""
+    root = tmp_path / "root"
+    root.mkdir()
+    for i in range(6):
+        (root / f"d{i}").mkdir()
+
+    cp = tmp_path / "cp.json"
+    append_empty_dirs_sidecar(cp, [str(root / f"d{i}") for i in range(6)])
+
+    purger = _make_purger(tmp_path, root, phase3_batch_size=2)
+
+    original = AsyncEFSPurger._remove_empty_directories
+    call_counter = {"n": 0}
+
+    async def fake_remove(self):
+        call_counter["n"] += 1
+        # First batch: succeed silently.  Second batch: trip memory-critical.
+        if call_counter["n"] >= 2:
+            self._checkpoint_requested = True
+
+    monkeypatch.setattr(AsyncEFSPurger, "_remove_empty_directories", fake_remove)
+    try:
+        await purger.purge()
+    finally:
+        monkeypatch.setattr(AsyncEFSPurger, "_remove_empty_directories", original)
+
+    assert empty_dirs_sidecar_path(cp).exists(), "sidecar must be preserved when any batch aborts"
+    # We aborted on the SECOND batch, so at least the first batch worth of
+    # calls happened.  This also confirms we actually did iterate batches
+    # rather than falling back to load-all.
+    assert call_counter["n"] >= 2, "iterative mode must call the deletion helper per-batch"
+
+
+@pytest.mark.asyncio
+async def test_phase3_only_iterative_batch_size_zero_uses_load_all(tmp_path, monkeypatch):
+    """batch_size=0 must NOT enter the iterative path — behavior identical to pre-fix."""
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "one").mkdir()
+    cp = tmp_path / "cp.json"
+    append_empty_dirs_sidecar(cp, [str(root / "one")])
+
+    purger = _make_purger(tmp_path, root, phase3_batch_size=0)
+
+    iterative_called = {"yes": False}
+
+    async def fake_iterative(self, batch_size):
+        iterative_called["yes"] = True
+        return True
+
+    monkeypatch.setattr(AsyncEFSPurger, "_drain_empty_dirs_sidecar_iterative", fake_iterative)
+    await purger.purge()
+
+    assert not iterative_called["yes"], "with batch_size=0, iterative drain must not be invoked"
+
+
+def test_cli_accepts_phase3_batch_size(tmp_path):
+    """CLI parses --phase3-batch-size and forwards it as an int."""
+    from efspurge.cli import parse_args
+
+    args = parse_args(
+        [
+            str(tmp_path),
+            "--max-age-days",
+            "30",
+            "--remove-empty-dirs",
+            "--phase3-only",
+            "--phase3-batch-size",
+            "12345",
+        ]
+    )
+    assert args.phase3_only is True
+    assert args.phase3_batch_size == 12345

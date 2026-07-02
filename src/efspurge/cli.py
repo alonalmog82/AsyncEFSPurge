@@ -220,6 +220,21 @@ def parse_args(args=None) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--phase3-batch-size",
+        type=int,
+        default=int(os.getenv("EFSPURGE_PHASE3_BATCH_SIZE", "0") or "0"),
+        help=(
+            "Batch size (unique paths per pass) for --phase3-only iterative drain.  When >0, "
+            "the sidecar is streamed in batches so peak memory is bounded to roughly "
+            "batch_size * ~500 bytes/Path instead of the full sidecar (avoids OOM when the "
+            "sidecar has grown to millions of entries).  Duplicate entries across batches are "
+            "safe (a repeat delete on an already-removed dir is a no-op).  0 (default) keeps "
+            "the historical load-all behaviour.  Recommended: 100000 for sidecars in the "
+            "1M-10M range.  Env var: EFSPURGE_PHASE3_BATCH_SIZE."
+        ),
+    )
+
+    parser.add_argument(
         "--no-uvloop",
         action="store_true",
         default=os.getenv("EFSPURGE_UVLOOP", "true").lower() in ("0", "false", "no"),
@@ -299,6 +314,7 @@ def main() -> None:
         dir_deletion_resume=args.dir_deletion_resume,
         phase1_only=args.phase1_only,
         phase3_only=args.phase3_only,
+        phase3_batch_size=args.phase3_batch_size,
         backpressure_checkpoint_timeout=args.backpressure_checkpoint_timeout,
     )
 

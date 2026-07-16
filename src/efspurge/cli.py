@@ -220,6 +220,25 @@ def parse_args(args=None) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--phase3-deletion-workers",
+        type=int,
+        default=int(os.getenv("EFSPURGE_PHASE3_DELETION_WORKERS", "0") or "0"),
+        help=(
+            "Number of concurrent worker coroutines during Phase 3 empty-directory deletion "
+            "(both first pass and cascading iterations).  Default 0 keeps the historical "
+            "behavior of using --max-concurrent-discovery (default 20), which is a safe cap "
+            "against the scandir-executor-flood stall documented in the 2.0.4 changelog. "
+            "Operators cleaning up very large accumulated empty-dir backlogs (e.g. multi-million "
+            "dirs left over from a whale first-pass) can raise this to 50-200 to speed up "
+            "Phase 3 deletion throughput.  IMPORTANT: when raising this above ~50, also raise "
+            "--scandir-executor-threads / EFSPURGE_SCANDIR_EXECUTOR_THREADS in proportion "
+            "(rule of thumb: at least 2x this value) — each Phase 3 worker calls scandir on "
+            "the parent after rmdir to check for cascading, and if there aren't enough executor "
+            "threads the workers queue up and stall.  Env var: EFSPURGE_PHASE3_DELETION_WORKERS."
+        ),
+    )
+
+    parser.add_argument(
         "--phase3-batch-size",
         type=int,
         default=int(os.getenv("EFSPURGE_PHASE3_BATCH_SIZE", "0") or "0"),
@@ -315,6 +334,7 @@ def main() -> None:
         phase1_only=args.phase1_only,
         phase3_only=args.phase3_only,
         phase3_batch_size=args.phase3_batch_size,
+        phase3_deletion_workers=args.phase3_deletion_workers,
         backpressure_checkpoint_timeout=args.backpressure_checkpoint_timeout,
     )
 

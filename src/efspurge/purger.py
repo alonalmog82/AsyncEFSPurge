@@ -463,6 +463,7 @@ class AsyncEFSPurger:
         phase1_only: bool = False,
         phase3_only: bool = False,
         phase3_batch_size: int = 0,
+        phase3_deletion_workers: int = 0,
         backpressure_checkpoint_timeout: int = 600,
         stuck_worker_cancel_timeout: int = 30,
     ):
@@ -611,6 +612,7 @@ class AsyncEFSPurger:
         self.phase1_only = phase1_only
         self.phase3_only = phase3_only
         self.phase3_batch_size = max(0, phase3_batch_size)
+        self.phase3_deletion_workers = max(0, phase3_deletion_workers)
         if phase1_only and phase3_only:
             raise ValueError("--phase1-only and --phase3-only are mutually exclusive")
         if phase3_only and not remove_empty_dirs:
@@ -1218,11 +1220,16 @@ class AsyncEFSPurger:
                     await self.update_stats(errors=1)
                     directory_queue.task_done()
 
-        # Worker count is capped at max_concurrent_discovery (default: 20), not max_concurrency_deletion.
+        # Worker count defaults to max_concurrent_discovery (default: 20), NOT max_concurrency_deletion.
         # Each worker calls async_scandir(parent) after rmdir to check for cascading empty parents.
         # Spawning max_concurrency_deletion (e.g. 4000) workers floods the scandir executor and
         # causes multi-minute hangs. The deletion_semaphore already caps concurrent rmdir I/O.
-        num_workers = self.max_concurrent_discovery
+        #
+        # Operators cleaning up very large accumulated empty-dir backlogs can raise this via
+        # --phase3-deletion-workers / EFSPURGE_PHASE3_DELETION_WORKERS.  When doing so, also
+        # bump scandir_executor_threads in proportion (rule of thumb: at least 2x worker count)
+        # to prevent the same scandir-executor-flood stall.
+        num_workers = self.phase3_deletion_workers or self.max_concurrent_discovery
         workers = [asyncio.create_task(worker()) for _ in range(num_workers)]
 
         # Producer: Feed directories to queue in batches, checking memory/rate limits
@@ -1507,8 +1514,9 @@ class AsyncEFSPurger:
                         await self.update_stats(errors=1)
                         parent_queue.task_done()
 
-            # Same cap as first pass: use max_concurrent_discovery, not max_concurrency_deletion.
-            num_workers = self.max_concurrent_discovery
+            # Same worker count as first pass: honor --phase3-deletion-workers override
+            # if set, otherwise fall back to max_concurrent_discovery.
+            num_workers = self.phase3_deletion_workers or self.max_concurrent_discovery
             workers = [asyncio.create_task(parent_worker()) for _ in range(num_workers)]
 
             # Producer: Feed parents to queue
@@ -3648,6 +3656,7 @@ async def async_main(
     phase1_only: bool = False,
     phase3_only: bool = False,
     phase3_batch_size: int = 0,
+    phase3_deletion_workers: int = 0,
     backpressure_checkpoint_timeout: int = 600,
 ) -> dict:
     """
@@ -3702,6 +3711,7 @@ async def async_main(
         phase1_only=phase1_only,
         phase3_only=phase3_only,
         phase3_batch_size=phase3_batch_size,
+        phase3_deletion_workers=phase3_deletion_workers,
         backpressure_checkpoint_timeout=backpressure_checkpoint_timeout,
     )
 

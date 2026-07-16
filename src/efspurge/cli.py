@@ -207,6 +207,53 @@ def parse_args(args=None) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--phase3-only",
+        action="store_true",
+        default=os.getenv("EFSPURGE_PHASE3_ONLY", "").lower() in ("1", "true", "yes"),
+        help=(
+            "Run Phase 3 (post-scan empty-dir cleanup) only, draining the empty_dirs sidecar "
+            "written by a prior Phase 2 run.  Skips Phase 1 and Phase 2 entirely.  Preserves "
+            "the main checkpoint file and the pending_dirs sidecar so a subsequent --resume "
+            "continues Phase 2 where it left off.  Requires --remove-empty-dirs.  Mutually "
+            "exclusive with --phase1-only.  Set EFSPURGE_PHASE3_ONLY=1 to enable via env var."
+        ),
+    )
+
+    parser.add_argument(
+        "--phase3-deletion-workers",
+        type=int,
+        default=int(os.getenv("EFSPURGE_PHASE3_DELETION_WORKERS", "0") or "0"),
+        help=(
+            "Number of concurrent worker coroutines during Phase 3 empty-directory deletion "
+            "(both first pass and cascading iterations).  Default 0 keeps the historical "
+            "behavior of using --max-concurrent-discovery (default 20), which is a safe cap "
+            "against the scandir-executor-flood stall documented in the 2.0.4 changelog. "
+            "Operators cleaning up very large accumulated empty-dir backlogs (e.g. multi-million "
+            "dirs left over from a whale first-pass) can raise this to 50-200 to speed up "
+            "Phase 3 deletion throughput.  IMPORTANT: when raising this above ~50, also raise "
+            "--scandir-executor-threads / EFSPURGE_SCANDIR_EXECUTOR_THREADS in proportion "
+            "(rule of thumb: at least 2x this value) — each Phase 3 worker calls scandir on "
+            "the parent after rmdir to check for cascading, and if there aren't enough executor "
+            "threads the workers queue up and stall.  Env var: EFSPURGE_PHASE3_DELETION_WORKERS."
+        ),
+    )
+
+    parser.add_argument(
+        "--phase3-batch-size",
+        type=int,
+        default=int(os.getenv("EFSPURGE_PHASE3_BATCH_SIZE", "0") or "0"),
+        help=(
+            "Batch size (unique paths per pass) for --phase3-only iterative drain.  When >0, "
+            "the sidecar is streamed in batches so peak memory is bounded to roughly "
+            "batch_size * ~500 bytes/Path instead of the full sidecar (avoids OOM when the "
+            "sidecar has grown to millions of entries).  Duplicate entries across batches are "
+            "safe (a repeat delete on an already-removed dir is a no-op).  0 (default) keeps "
+            "the historical load-all behaviour.  Recommended: 100000 for sidecars in the "
+            "1M-10M range.  Env var: EFSPURGE_PHASE3_BATCH_SIZE."
+        ),
+    )
+
+    parser.add_argument(
         "--no-uvloop",
         action="store_true",
         default=os.getenv("EFSPURGE_UVLOOP", "true").lower() in ("0", "false", "no"),
@@ -230,6 +277,15 @@ def parse_args(args=None) -> argparse.Namespace:
 def main() -> None:
     """Main entry point for the CLI."""
     args = parse_args()
+
+    # Validate phase-only flag combinations early (constructor also enforces this,
+    # but failing here surfaces a friendly parser-style error before asyncio spins up).
+    if args.phase1_only and args.phase3_only:
+        print("error: --phase1-only and --phase3-only are mutually exclusive", file=sys.stderr)
+        sys.exit(2)
+    if args.phase3_only and not args.remove_empty_dirs:
+        print("error: --phase3-only requires --remove-empty-dirs", file=sys.stderr)
+        sys.exit(2)
 
     # Warn if deprecated --max-concurrency is explicitly set (not just from env var)
     if args.max_concurrency is not None:
@@ -276,6 +332,9 @@ def main() -> None:
         dir_deletion_checkpoint_file=args.dir_deletion_checkpoint_file or None,
         dir_deletion_resume=args.dir_deletion_resume,
         phase1_only=args.phase1_only,
+        phase3_only=args.phase3_only,
+        phase3_batch_size=args.phase3_batch_size,
+        phase3_deletion_workers=args.phase3_deletion_workers,
         backpressure_checkpoint_timeout=args.backpressure_checkpoint_timeout,
     )
 

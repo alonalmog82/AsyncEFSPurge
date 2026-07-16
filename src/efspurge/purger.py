@@ -461,6 +461,9 @@ class AsyncEFSPurger:
         dir_deletion_checkpoint_file: str | Path | None = None,
         dir_deletion_resume: bool = False,
         phase1_only: bool = False,
+        phase3_only: bool = False,
+        phase3_batch_size: int = 0,
+        phase3_deletion_workers: int = 0,
         backpressure_checkpoint_timeout: int = 600,
         stuck_worker_cancel_timeout: int = 30,
     ):
@@ -607,6 +610,16 @@ class AsyncEFSPurger:
         self.dir_deletion_checkpoint_file = Path(dir_deletion_checkpoint_file) if dir_deletion_checkpoint_file else None
         self.dir_deletion_resume = dir_deletion_resume
         self.phase1_only = phase1_only
+        self.phase3_only = phase3_only
+        self.phase3_batch_size = max(0, phase3_batch_size)
+        self.phase3_deletion_workers = max(0, phase3_deletion_workers)
+        if phase1_only and phase3_only:
+            raise ValueError("--phase1-only and --phase3-only are mutually exclusive")
+        if phase3_only and not remove_empty_dirs:
+            raise ValueError("--phase3-only requires --remove-empty-dirs")
+        # Skip flag used by iterative phase-3-only drain to prevent
+        # _remove_empty_directories() from re-reading the sidecar on every batch.
+        self._skip_sidecar_load = False
         self.backpressure_checkpoint_timeout = backpressure_checkpoint_timeout
         self.stuck_worker_cancel_timeout = stuck_worker_cancel_timeout
 
@@ -916,6 +929,94 @@ class AsyncEFSPurger:
             async with self.active_tasks_lock:
                 self.active_tasks -= 1
 
+    async def _drain_empty_dirs_sidecar_iterative(self, batch_size: int) -> bool:
+        """Memory-bounded drain of the empty-dirs sidecar for --phase3-only.
+
+        Streams the sidecar in batches of ``batch_size`` unique paths.  For
+        each batch: pre-populates ``self.empty_dirs`` and calls the existing
+        ``_remove_empty_directories`` deletion pass (with sidecar-load
+        suppressed via ``_skip_sidecar_load``).  Returns True if every batch
+        completed without triggering the memory-critical circuit breaker,
+        False if any batch aborted early.
+
+        Duplicate entries across batches are harmless because the deletion
+        pass tolerates ENOENT — a second attempt on an already-deleted dir
+        is a no-op.  So we deliberately do NOT hold a global "seen" set,
+        which is the whole point of batching (memory bound = batch_size).
+
+        Cascade discovery within a batch (bottom-up parent walk) still
+        works; parents in later batches may already be gone by the time
+        their batch runs, which just yields ENOENT and is fine.
+        """
+        if self.checkpoint_file is None:
+            return True
+        sidecar = empty_dirs_sidecar_path(self.checkpoint_file)
+        if not sidecar.exists():
+            return True
+
+        # Ensure a clean slate: any prior _checkpoint_requested from an
+        # earlier phase must not veto sidecar removal here.  Phase-3-only
+        # is a standalone entry point; no other phase has run before.
+        self._checkpoint_requested = False
+        self._skip_sidecar_load = True
+        completed_ok = True
+        batches_processed = 0
+        total_raw = 0
+        try:
+            batch: set[Path] = set()
+            for path_str in stream_empty_dirs_sidecar(self.checkpoint_file):
+                total_raw += 1
+                batch.add(Path(path_str))
+                if len(batch) >= batch_size:
+                    log_with_context(
+                        self.logger,
+                        "info",
+                        "Phase 3 standalone: draining batch",
+                        {
+                            "batch_index": batches_processed,
+                            "batch_unique_size": len(batch),
+                            "raw_lines_read_so_far": total_raw,
+                        },
+                    )
+                    self.empty_dirs = batch
+                    await self._remove_empty_directories()
+                    batches_processed += 1
+                    if self._checkpoint_requested:
+                        completed_ok = False
+                        break
+                    batch = set()
+            if batch and completed_ok:
+                log_with_context(
+                    self.logger,
+                    "info",
+                    "Phase 3 standalone: draining final batch",
+                    {
+                        "batch_index": batches_processed,
+                        "batch_unique_size": len(batch),
+                        "raw_lines_read_so_far": total_raw,
+                    },
+                )
+                self.empty_dirs = batch
+                await self._remove_empty_directories()
+                batches_processed += 1
+                if self._checkpoint_requested:
+                    completed_ok = False
+        finally:
+            self._skip_sidecar_load = False
+
+        log_with_context(
+            self.logger,
+            "info",
+            "Phase 3 standalone: drain summary",
+            {
+                "batches_processed": batches_processed,
+                "raw_lines_read": total_raw,
+                "completed_ok": completed_ok,
+                "batch_size": batch_size,
+            },
+        )
+        return completed_ok
+
     async def _remove_empty_directories(self) -> None:
         """
         Phase 3: Remove directories that became empty after file purging.
@@ -930,7 +1031,12 @@ class AsyncEFSPurger:
         # streamed from the sidecar file written by save_checkpoint() so they
         # never have to sit in Phase 2 memory.  Phase 3 has the queue and
         # workers torn down, so converting to Path here is safe.
-        if self.checkpoint_file is not None:
+        #
+        # The iterative phase-3-only drain path pre-populates self.empty_dirs
+        # with a single batch and sets _skip_sidecar_load so this loader
+        # doesn't re-hydrate the full sidecar on every batch (which would
+        # defeat the memory-bounded purpose of batching).
+        if not self._skip_sidecar_load and self.checkpoint_file is not None:
             sidecar = empty_dirs_sidecar_path(self.checkpoint_file)
             if sidecar.exists():
                 loaded_from_sidecar = 0
@@ -1114,11 +1220,16 @@ class AsyncEFSPurger:
                     await self.update_stats(errors=1)
                     directory_queue.task_done()
 
-        # Worker count is capped at max_concurrent_discovery (default: 20), not max_concurrency_deletion.
+        # Worker count defaults to max_concurrent_discovery (default: 20), NOT max_concurrency_deletion.
         # Each worker calls async_scandir(parent) after rmdir to check for cascading empty parents.
         # Spawning max_concurrency_deletion (e.g. 4000) workers floods the scandir executor and
         # causes multi-minute hangs. The deletion_semaphore already caps concurrent rmdir I/O.
-        num_workers = self.max_concurrent_discovery
+        #
+        # Operators cleaning up very large accumulated empty-dir backlogs can raise this via
+        # --phase3-deletion-workers / EFSPURGE_PHASE3_DELETION_WORKERS.  When doing so, also
+        # bump scandir_executor_threads in proportion (rule of thumb: at least 2x worker count)
+        # to prevent the same scandir-executor-flood stall.
+        num_workers = self.phase3_deletion_workers or self.max_concurrent_discovery
         workers = [asyncio.create_task(worker()) for _ in range(num_workers)]
 
         # Producer: Feed directories to queue in batches, checking memory/rate limits
@@ -1403,8 +1514,9 @@ class AsyncEFSPurger:
                         await self.update_stats(errors=1)
                         parent_queue.task_done()
 
-            # Same cap as first pass: use max_concurrent_discovery, not max_concurrency_deletion.
-            num_workers = self.max_concurrent_discovery
+            # Same worker count as first pass: honor --phase3-deletion-workers override
+            # if set, otherwise fall back to max_concurrent_discovery.
+            num_workers = self.phase3_deletion_workers or self.max_concurrent_discovery
             workers = [asyncio.create_task(parent_worker()) for _ in range(num_workers)]
 
             # Producer: Feed parents to queue
@@ -3302,51 +3414,106 @@ class AsyncEFSPurger:
         progress_task = asyncio.create_task(self._background_progress_reporter())
 
         try:
-            # Phase 1: Remove empty directories FIRST (standalone, efficient walker)
-            # Skip when resuming - we already ran Phase 1 before the checkpoint.
-            if self.remove_empty_dirs and not self.resume:
-                await self._purge_empty_directories_standalone()
-
-            if not self.phase1_only:
-                # Phase 2: Scan and purge files (BFS queue + worker pool)
-                self.current_phase = "scanning"
-                self.rate_tracker.set_phase_start("scanning")
-                await self._scan_and_purge_files()
-
-                # Mark scanning phase as complete (for accurate overall rate calculation)
-                self.scanning_end_time = time.time()
-
-                # Phase 3: Post-scan empty directory cleanup
-                # After purging files, some directories may have become empty.
-                # Run the existing post-order deletion to catch these.
-                if self.remove_empty_dirs:
+            if self.phase3_only:
+                # Phase 3 standalone: drain the empty-dirs sidecar written by a
+                # prior Phase 2 run WITHOUT re-running Phases 1 or 2.  Used to
+                # realize accumulated empty-dir cleanup mid-scan (e.g. before a
+                # sharded re-scan).  We deliberately preserve the pending_dirs
+                # sidecar and the main checkpoint file so a subsequent
+                # --resume continues Phase 2 where it left off.
+                log_with_context(
+                    self.logger,
+                    "info",
+                    "Phase 3 standalone: draining empty-dirs sidecar only",
+                    {
+                        "checkpoint_file": str(self.checkpoint_file) if self.checkpoint_file else None,
+                        "batch_size": self.phase3_batch_size,
+                    },
+                )
+                # Reset the memory-critical flag so we can detect an abort
+                # that fires DURING this drain (as opposed to leftover state
+                # from an earlier run).
+                self._checkpoint_requested = False
+                if self.phase3_batch_size > 0:
+                    completed_ok = await self._drain_empty_dirs_sidecar_iterative(self.phase3_batch_size)
+                else:
                     await self._remove_empty_directories()
-
-            # Purge completed successfully - remove checkpoint file so a future
-            # run with --resume won't mistakenly resume from stale state.
-            if self.checkpoint_file and self.checkpoint_file.exists():
-                try:
-                    self.checkpoint_file.unlink()
+                    completed_ok = not self._checkpoint_requested
+                # Sidecar removal is CONDITIONAL on the drain actually
+                # completing.  Removing it when the run aborted early would
+                # silently lose the unprocessed candidates (bug fixed in
+                # 2.3.0: the empty-dirs sidecar was being removed regardless
+                # of whether _remove_empty_directories() actually finished).
+                if completed_ok and self.checkpoint_file is not None:
+                    remove_empty_dirs_sidecar(self.checkpoint_file)
                     log_with_context(
                         self.logger,
                         "info",
-                        "Checkpoint file removed after successful purge",
+                        "Phase 3 standalone: sidecar drained and removed",
                         {"checkpoint_file": str(self.checkpoint_file)},
                     )
-                except OSError as e:
+                elif not completed_ok:
                     log_with_context(
                         self.logger,
                         "warning",
-                        "Could not remove checkpoint file after successful purge",
-                        {"checkpoint_file": str(self.checkpoint_file), "error": str(e)},
+                        "Phase 3 standalone: aborted early, sidecar preserved for retry",
+                        {
+                            "checkpoint_file": str(self.checkpoint_file) if self.checkpoint_file else None,
+                            "hint": "Increase --phase3-batch-size headroom, raise the container memory limit, "
+                            "or drop --phase3-batch-size to 0 to retry with load-all mode.",
+                        },
                     )
-            # Also remove the empty-dirs and pending-dirs sidecars (written
-            # next to the checkpoint to keep carry-over off the Phase 2
-            # heap).  Best-effort: a stale sidecar with no matching
-            # checkpoint is harmless because the next purge starts fresh.
-            if self.checkpoint_file is not None:
-                remove_empty_dirs_sidecar(self.checkpoint_file)
-                remove_pending_dirs_sidecar(self.checkpoint_file)
+            else:
+                # Phase 1: Remove empty directories FIRST (standalone, efficient walker)
+                # Skip when resuming - we already ran Phase 1 before the checkpoint.
+                if self.remove_empty_dirs and not self.resume:
+                    await self._purge_empty_directories_standalone()
+
+                if not self.phase1_only:
+                    # Phase 2: Scan and purge files (BFS queue + worker pool)
+                    self.current_phase = "scanning"
+                    self.rate_tracker.set_phase_start("scanning")
+                    await self._scan_and_purge_files()
+
+                    # Mark scanning phase as complete (for accurate overall rate calculation)
+                    self.scanning_end_time = time.time()
+
+                    # Phase 3: Post-scan empty directory cleanup
+                    # After purging files, some directories may have become empty.
+                    # Run the existing post-order deletion to catch these.
+                    if self.remove_empty_dirs:
+                        await self._remove_empty_directories()
+
+            # Purge completed successfully - remove checkpoint file so a future
+            # run with --resume won't mistakenly resume from stale state.
+            # Phase-3-only mode deliberately preserves the checkpoint + pending
+            # sidecar (Phase 2 progress is intentionally not touched — a later
+            # --resume must still find it).  The empty-dirs sidecar was already
+            # consumed and removed inside the phase3-only branch above.
+            if not self.phase3_only:
+                if self.checkpoint_file and self.checkpoint_file.exists():
+                    try:
+                        self.checkpoint_file.unlink()
+                        log_with_context(
+                            self.logger,
+                            "info",
+                            "Checkpoint file removed after successful purge",
+                            {"checkpoint_file": str(self.checkpoint_file)},
+                        )
+                    except OSError as e:
+                        log_with_context(
+                            self.logger,
+                            "warning",
+                            "Could not remove checkpoint file after successful purge",
+                            {"checkpoint_file": str(self.checkpoint_file), "error": str(e)},
+                        )
+                # Also remove the empty-dirs and pending-dirs sidecars (written
+                # next to the checkpoint to keep carry-over off the Phase 2
+                # heap).  Best-effort: a stale sidecar with no matching
+                # checkpoint is harmless because the next purge starts fresh.
+                if self.checkpoint_file is not None:
+                    remove_empty_dirs_sidecar(self.checkpoint_file)
+                    remove_pending_dirs_sidecar(self.checkpoint_file)
         finally:
             # Cancel background reporter
             progress_task.cancel()
@@ -3487,6 +3654,9 @@ async def async_main(
     dir_deletion_checkpoint_file: str | Path | None = None,
     dir_deletion_resume: bool = False,
     phase1_only: bool = False,
+    phase3_only: bool = False,
+    phase3_batch_size: int = 0,
+    phase3_deletion_workers: int = 0,
     backpressure_checkpoint_timeout: int = 600,
 ) -> dict:
     """
@@ -3539,6 +3709,9 @@ async def async_main(
         dir_deletion_checkpoint_file=dir_deletion_checkpoint_file,
         dir_deletion_resume=dir_deletion_resume,
         phase1_only=phase1_only,
+        phase3_only=phase3_only,
+        phase3_batch_size=phase3_batch_size,
+        phase3_deletion_workers=phase3_deletion_workers,
         backpressure_checkpoint_timeout=backpressure_checkpoint_timeout,
     )
 

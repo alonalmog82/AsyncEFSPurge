@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.1] - 2026-07-19
+
+### Fixed
+- **Phase 3: transient EACCES on `rmdir` no longer aborts the directory** (#53). EFS/NFS can transiently return `EACCES` on `rmdir` even when the caller has full permission on a root-owned, mode-0755, empty directory — verified out-of-band by hand-driving `rmdir` on paths the purger had already flagged as unremovable. Previously Phase 3 treated each `EACCES` as terminal for that directory and logged a WARNING per occurrence. On one production shard that produced **1.65 M** WARNING lines in ~4h48m with **zero** dirs actually removed. Now `rmdir` retries on `EACCES` with 100 ms / 500 ms / 2 s backoff (initial attempt + 3 retries) at all three `rmdir` sites (Phase 1b, Phase 3 first pass, Phase 3 cascade). Non-`EACCES` `OSError`s re-raise immediately with no retry.
+- **Phase 2/3: `EACCES` WARNING log is now throttled** (#53). Every `EACCES` occurrence logs at DEBUG; a summary WARNING with the accumulated count is emitted at most once per 60 s per site label (`phase2.scan`, `phase3.rmdir`, `phase3.rmdir_parent`). Mirrors the existing memory-back-pressure throttle pattern. Persistent `EACCES` still counts toward `errors` and still surfaces via the throttled WARNING — no failure is silently swallowed, only deduplicated.
+
 ## [2.3.0] - 2026-07-02
 
 ### Added

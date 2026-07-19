@@ -1,6 +1,7 @@
 """Async file purger optimized for AWS EFS and network storage."""
 
 import asyncio
+import errno
 import gc
 import logging
 import os
@@ -84,6 +85,40 @@ def get_memory_usage_mb() -> float:
         return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024  # KB to MB
     except Exception:
         return 0.0  # Return 0 if we can't measure
+
+
+# Backoffs between rmdir retries when the previous attempt returned EACCES.
+# Total attempts = 1 (initial) + len(EACCES_RETRY_BACKOFFS) retries.
+# See issue #53: EFS/NFS can transiently return EACCES on rmdir of dirs the
+# caller has full permission on; a short retry catches the transient case
+# without spamming logs or aborting Phase 3.
+EACCES_RETRY_BACKOFFS = (0.1, 0.5, 2.0)
+
+
+async def async_rmdir_with_eacces_retry(directory: Path) -> int:
+    """rmdir with bounded retry on EACCES.
+
+    EFS/NFS can transiently return EACCES on rmdir even when the caller has
+    permission (see issue #53). Retry with backoff before giving up. Non-EACCES
+    OSErrors are re-raised on the first occurrence — no retry.
+
+    Returns the total number of attempts made (1 == first-try success).
+    Raises the last OSError if every attempt fails.
+    """
+    last_err: OSError | None = None
+    # Backoffs list is prepended with 0 so the initial attempt has no sleep.
+    for attempt, backoff in enumerate((0.0, *EACCES_RETRY_BACKOFFS), start=1):
+        if backoff > 0:
+            await asyncio.sleep(backoff)
+        try:
+            await aiofiles.os.rmdir(directory)
+            return attempt
+        except OSError as e:
+            if e.errno != errno.EACCES:
+                raise
+            last_err = e
+    assert last_err is not None  # loop always sets last_err before falling through
+    raise last_err
 
 
 async def async_scandir(path: Path, executor: ThreadPoolExecutor | None = None, purger_instance=None):
@@ -727,6 +762,15 @@ class AsyncEFSPurger:
         self.memory_check_lock = asyncio.Lock()  # Prevent concurrent checks
         self._backpressure_start_time: float | None = None  # When sustained back-pressure began
 
+        # EACCES throttle (see issue #53): transient EACCES on Phase 2 scandir and
+        # Phase 3 rmdir can fire millions of times on shards with concurrent-writer
+        # activity. Log each occurrence at DEBUG and emit one WARNING summary per
+        # interval that reports the cumulative count.
+        self._eacces_count_since_warning: dict[str, int] = {}
+        self._eacces_last_warning_time: dict[str, float] = {}
+        self._eacces_warning_interval = 60.0  # once per minute per label
+        self._eacces_lock = asyncio.Lock()
+
         # Checkpoint/resume: when memory critical, save state and exit for resume
         self._checkpoint_requested = False
         self._checkpoint_pending: list[Path] = []
@@ -866,6 +910,47 @@ class AsyncEFSPurger:
                 self._backpressure_start_time = None
 
             return False, memory_mb  # Memory is OK, but return value for proactive reduction
+
+    async def _log_eacces_throttled(
+        self,
+        label: str,
+        message: str,
+        directory: Path,
+        error: BaseException,
+        attempts: int = 1,
+    ) -> None:
+        """Log a Phase 2/3 EACCES occurrence with per-label throttling.
+
+        Every occurrence is logged at DEBUG. A summary WARNING with the count
+        of occurrences since the last summary is emitted at most once per
+        ``self._eacces_warning_interval`` per label (see issue #53).
+        """
+        async with self._eacces_lock:
+            self._eacces_count_since_warning[label] = self._eacces_count_since_warning.get(label, 0) + 1
+            now = time.time()
+            last = self._eacces_last_warning_time.get(label, 0.0)
+            if now - last >= self._eacces_warning_interval:
+                count = self._eacces_count_since_warning[label]
+                self._eacces_last_warning_time[label] = now
+                self._eacces_count_since_warning[label] = 0
+            else:
+                count = None
+
+        self.logger.debug(f"{message} (EACCES): {directory} attempts={attempts} error={error!s}")
+        if count is not None:
+            log_with_context(
+                self.logger,
+                "warning",
+                f"{message} (EACCES, throttled)",
+                {
+                    "label": label,
+                    "example_directory": str(directory),
+                    "example_error": str(error),
+                    "eacces_count_since_last_warning": count,
+                    "interval_seconds": self._eacces_warning_interval,
+                    "note": f"logged once per {self._eacces_warning_interval:.0f}s to avoid spam",
+                },
+            )
 
     async def process_file(self, file_path: Path) -> None:
         """
@@ -1129,12 +1214,15 @@ class AsyncEFSPurger:
                 # Skip redundant empty check - we already know directory is empty from scanning
                 if not self.dry_run:
                     async with self.deletion_semaphore:
-                        await aiofiles.os.rmdir(directory)
+                        attempts = await async_rmdir_with_eacces_retry(directory)
                     # Counter already incremented above, just update deleted count
                     await self.update_stats(empty_dirs_deleted=1)
                     # Record sample for rate tracking
                     self.rate_tracker.record("removing_empty_dirs", "dirs", 1)
-                    self.logger.debug(f"Removed empty directory: {directory}")
+                    if attempts > 1:
+                        self.logger.debug(f"Removed empty directory after {attempts} attempts: {directory}")
+                    else:
+                        self.logger.debug(f"Removed empty directory: {directory}")
                 else:
                     # Dry run: counter already incremented above, just log
                     self.logger.debug(f"Would remove empty directory: {directory}")
@@ -1165,12 +1253,20 @@ class AsyncEFSPurger:
                 if self.max_empty_dirs_to_delete > 0:
                     async with self.stats_lock:
                         self.stats["empty_dirs_to_delete"] = max(0, self.stats.get("empty_dirs_to_delete", 0) - 1)
-                log_with_context(
-                    self.logger,
-                    "warning",
-                    "Could not remove empty directory",
-                    {"directory": str(directory), "error": str(e)},
-                )
+                if e.errno == errno.EACCES:
+                    await self._log_eacces_throttled(
+                        "phase3.rmdir",
+                        "Could not remove empty directory",
+                        directory,
+                        e,
+                    )
+                else:
+                    log_with_context(
+                        self.logger,
+                        "warning",
+                        "Could not remove empty directory",
+                        {"directory": str(directory), "error": str(e)},
+                    )
                 await self.update_stats(errors=1)
 
             return None
@@ -1453,11 +1549,14 @@ class AsyncEFSPurger:
                     # Only hold semaphore for actual deletion, not for checks
                     if not self.dry_run:
                         async with self.deletion_semaphore:
-                            await aiofiles.os.rmdir(parent)
+                            attempts = await async_rmdir_with_eacces_retry(parent)
                         await self.update_stats(empty_dirs_to_delete=1, empty_dirs_deleted=1)
                         # Record sample for rate tracking
                         self.rate_tracker.record("removing_empty_dirs", "dirs", 1)
-                        self.logger.debug(f"Removed empty parent directory: {parent}")
+                        if attempts > 1:
+                            self.logger.debug(f"Removed empty parent directory after {attempts} attempts: {parent}")
+                        else:
+                            self.logger.debug(f"Removed empty parent directory: {parent}")
                     else:
                         await self.update_stats(empty_dirs_to_delete=1)
                         self.logger.debug(f"Would remove empty parent directory: {parent}")
@@ -1477,12 +1576,20 @@ class AsyncEFSPurger:
                 except FileNotFoundError:
                     self.logger.debug(f"Empty parent directory already deleted: {parent}")
                 except OSError as e:
-                    log_with_context(
-                        self.logger,
-                        "warning",
-                        "Could not remove empty parent directory",
-                        {"directory": str(parent), "error": str(e)},
-                    )
+                    if e.errno == errno.EACCES:
+                        await self._log_eacces_throttled(
+                            "phase3.rmdir_parent",
+                            "Could not remove empty parent directory",
+                            parent,
+                            e,
+                        )
+                    else:
+                        log_with_context(
+                            self.logger,
+                            "warning",
+                            "Could not remove empty parent directory",
+                            {"directory": str(parent), "error": str(e)},
+                        )
                     await self.update_stats(errors=1)
 
                 return None
@@ -2127,7 +2234,7 @@ class AsyncEFSPurger:
 
                     # Directory is empty - delete it
                     if not self.dry_run:
-                        await aiofiles.os.rmdir(directory)
+                        await async_rmdir_with_eacces_retry(directory)
                         # Update stats: empty_dirs_to_delete tracks total attempted (for reporting)
                         # empty_dirs_deleted tracks actual deletions
                         if self.max_empty_dirs_to_delete == 0:
@@ -2736,11 +2843,11 @@ class AsyncEFSPurger:
                     _drain_pending_to_queue(scan_queue, pending_subdirs)
 
                 except PermissionError as e:
-                    log_with_context(
-                        self.logger,
-                        "warning",
+                    await self._log_eacces_throttled(
+                        "phase2.scan",
                         "Permission denied for directory",
-                        {"directory": str(directory), "error": str(e)},
+                        directory,
+                        e,
                     )
                     await self.update_stats(errors=1)
                 except Exception as e:

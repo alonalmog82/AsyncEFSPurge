@@ -10,7 +10,7 @@
 ```python
 stat = await aiofiles.os.stat(file_path)  # File exists
 # ... time passes ...
-await aiofiles.os.remove(file_path)      # File might be gone!
+await aiofiles.os.remove(file_path)  # File might be gone!
 ```
 
 **Risk**: `FileNotFoundError` is caught, but we already incremented `files_scanned`. Stats might be slightly off.

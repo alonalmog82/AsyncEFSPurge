@@ -243,13 +243,17 @@ def parse_args(args=None) -> argparse.Namespace:
         type=int,
         default=int(os.getenv("EFSPURGE_PHASE3_BATCH_SIZE", "0") or "0"),
         help=(
-            "Batch size (unique paths per pass) for --phase3-only iterative drain.  When >0, "
-            "the sidecar is streamed in batches so peak memory is bounded to roughly "
+            "Batch size (unique paths per pass) for Phase 3 iterative drain — applies to "
+            "both --phase3-only and the in-band Phase 3 that runs after Phase 2 completes.  "
+            "When >0, the sidecar is streamed in batches so peak memory is bounded to roughly "
             "batch_size * ~500 bytes/Path instead of the full sidecar (avoids OOM when the "
-            "sidecar has grown to millions of entries).  Duplicate entries across batches are "
-            "safe (a repeat delete on an already-removed dir is a no-op).  0 (default) keeps "
-            "the historical load-all behaviour.  Recommended: 100000 for sidecars in the "
-            "1M-10M range.  Env var: EFSPURGE_PHASE3_BATCH_SIZE."
+            "sidecar has grown to millions of entries).  Also avoids the load-all cascade "
+            "pathology observed on very large batches (500k+ batches hang the cascade with "
+            "zero deletions; 100k is proven-safe).  For in-band mode, current-run in-memory "
+            "empty_dirs are appended to the sidecar first so the batch stream sees them.  "
+            "Duplicate entries across batches are safe (a repeat delete on an already-removed "
+            "dir is a no-op).  0 (default) keeps the historical load-all behaviour.  "
+            "Recommended: 100000 for sidecars in the 1M+ range.  Env var: EFSPURGE_PHASE3_BATCH_SIZE."
         ),
     )
 

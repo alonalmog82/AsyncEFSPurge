@@ -239,12 +239,10 @@ if self.stuck_detection_count >= 2:
         # First stuck detection: reduce batch sizes
         self.logger.warning("Reducing batch sizes due to stuck detection...")
         # This will be picked up in next batch iteration
-    
+
     if self.stuck_detection_count >= 4:
         # Multiple stuck detections: force smaller batches
-        self.logger.error(
-            "Multiple stuck detections. Consider stopping job or checking filesystem health."
-        )
+        self.logger.error("Multiple stuck detections. Consider stopping job or checking filesystem health.")
 ```
 
 ### Fix 5: Reduce Initial Batch Sizes

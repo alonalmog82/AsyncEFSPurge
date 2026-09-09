@@ -61,7 +61,7 @@ if file_task_buffer:
 ```python
 # Buffer has 4999 items
 file_task_buffer.append(file_5000)  # Now 5000 items
-if len(file_task_buffer) >= 5000:   # True!
+if len(file_task_buffer) >= 5000:  # True!
     await self._process_file_batch(file_task_buffer)  # Processes 5000
     file_task_buffer.clear()
 

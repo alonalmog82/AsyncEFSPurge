@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.2] - 2026-09-09
+
+### Fixed
+- **In-band Phase 3 now respects `--phase3-batch-size` / `EFSPURGE_PHASE3_BATCH_SIZE`.** Previously the batched iterative drain was only available in `--phase3-only` mode; when Phase 2 completed and the in-band Phase 3 kicked in, the code path always did a load-all of the empty-dirs sidecar. On very large sidecars (billions of paths accumulated across many checkpoint cycles), the load-all path hangs the cascade with zero deletions — verified in prod 2026-09-09: `EFSPURGE_PHASE3_BATCH_SIZE=500000` and `1000000` triggered "POSSIBLE HANG DETECTED" watchdog warnings within minutes, `dirs_purged` stayed at 0 indefinitely, and no forward progress was ever made. `100000` batches work cleanly. This fix extends the existing batched-drain mechanism to the in-band Phase 3 path: when the env var/flag is set, current-run in-memory `empty_dirs` are flushed to the sidecar first, then the same `_drain_empty_dirs_sidecar_iterative` code path used by `--phase3-only` runs. Default behaviour (batch size 0 → load-all) is unchanged, so this is safe to deploy without changing operator config. Recommended: set `EFSPURGE_PHASE3_BATCH_SIZE=100000` on any Job whose shard has an accumulated sidecar in the millions-of-entries range.
+
 ## [2.3.1] - 2026-07-19
 
 ### Fixed

@@ -40,31 +40,28 @@ Implemented a hybrid approach that combines:
 async def _process_subdirs_with_constant_concurrency(self, subdirs: list[Path]) -> None:
     """
     Process subdirectories with constant concurrency using a hybrid approach.
-    
+
     - Uses semaphore to limit concurrent execution (maintains constant concurrency)
     - Creates tasks on-demand as slots become available (prevents memory explosion)
     - As tasks complete, new ones start immediately (high utilization)
     """
     remaining_subdirs = list(subdirs)
     active_tasks: list[asyncio.Task] = []
-    
+
     async def scan_with_semaphore(subdir: Path) -> None:
         async with self.subdir_semaphore:
             await self.scan_directory(subdir)
-    
+
     while remaining_subdirs or active_tasks:
         # Create tasks up to concurrency limit
         while len(active_tasks) < self.max_concurrent_subdirs and remaining_subdirs:
             subdir = remaining_subdirs.pop(0)
             task = asyncio.create_task(scan_with_semaphore(subdir))
             active_tasks.append(task)
-        
+
         # Wait for at least one to complete, then immediately start next
         if active_tasks:
-            done, pending = await asyncio.wait(
-                active_tasks,
-                return_when=asyncio.FIRST_COMPLETED
-            )
+            done, pending = await asyncio.wait(active_tasks, return_when=asyncio.FIRST_COMPLETED)
             # Remove completed tasks and create new ones
             for task in done:
                 active_tasks.remove(task)

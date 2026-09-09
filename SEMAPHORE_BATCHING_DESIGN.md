@@ -36,6 +36,7 @@ results = await asyncio.gather(*tasks, return_exceptions=True)
 # Queue holds directories (bounded by semaphore_limit + buffer)
 directory_queue = asyncio.Queue(maxsize=semaphore_limit + 100)
 
+
 # Workers pull from queue and process (semaphore limits concurrent I/O)
 async def worker():
     directory = await directory_queue.get()
@@ -96,10 +97,12 @@ directory_queue = asyncio.Queue(maxsize=max_concurrency_deletion + 100)
 results_queue = asyncio.Queue()
 workers = [create_worker() for _ in range(max_concurrency_deletion)]
 
+
 # Producer feeds directories to queue
 async def producer():
     for directory in sorted_dirs:
         await directory_queue.put(directory)  # Blocks if queue full
+
 
 # Workers process directories (semaphore limits concurrent I/O)
 async def worker():

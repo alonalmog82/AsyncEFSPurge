@@ -3589,7 +3589,28 @@ class AsyncEFSPurger:
                     # After purging files, some directories may have become empty.
                     # Run the existing post-order deletion to catch these.
                     if self.remove_empty_dirs:
-                        await self._remove_empty_directories()
+                        # When phase3_batch_size is set, use the same memory-bounded
+                        # batched drain as --phase3-only.  This avoids the load-all
+                        # pathology on very large accumulated sidecars (observed
+                        # 2026-09-09: 500k+ batch loaded via _remove_empty_directories
+                        # hangs the cascade with zero deletions; 100k works).  In-memory
+                        # empty-dir candidates from the just-finished Phase 2 are
+                        # appended to the sidecar first so the batch stream sees them.
+                        if self.phase3_batch_size > 0 and self.checkpoint_file is not None:
+                            if self.empty_dirs:
+                                async with self.stats_lock:
+                                    inmem_paths = [str(p) for p in self.empty_dirs]
+                                    self.empty_dirs.clear()
+                                appended = append_empty_dirs_sidecar(self.checkpoint_file, inmem_paths)
+                                log_with_context(
+                                    self.logger,
+                                    "info",
+                                    "In-band Phase 3: flushed in-memory empty_dirs to sidecar before batched drain",
+                                    {"appended": appended, "batch_size": self.phase3_batch_size},
+                                )
+                            await self._drain_empty_dirs_sidecar_iterative(self.phase3_batch_size)
+                        else:
+                            await self._remove_empty_directories()
 
             # Purge completed successfully - remove checkpoint file so a future
             # run with --resume won't mistakenly resume from stale state.

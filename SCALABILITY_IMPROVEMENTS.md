@@ -42,7 +42,7 @@ await asyncio.gather(*[self.scan_directory(subdir) for subdir in subdirs])  # �
 **Problem:**
 ```python
 # OLD CODE (Unbounded):
-await asyncio.gather(*tasks, return_exceptions=True)  
+await asyncio.gather(*tasks, return_exceptions=True)
 # ❌ Creates 100K task objects for 100K files = OOM kill!
 ```
 
@@ -51,7 +51,7 @@ await asyncio.gather(*tasks, return_exceptions=True)
 # NEW CODE (Batched):
 for i in range(0, len(tasks), self.task_batch_size):
     batch = tasks[i : i + self.task_batch_size]
-    await asyncio.gather(*batch, return_exceptions=True)  
+    await asyncio.gather(*batch, return_exceptions=True)
 # ✅ Creates max 5,000 tasks at a time
 ```
 
@@ -236,14 +236,15 @@ async def check_memory_pressure(self):
     if memory_mb > self.memory_limit_mb:
         # Log warning
         self.logger.warning(f"Memory high: {memory_mb} MB > {self.memory_limit_mb} MB")
-        
+
         # Pause to allow cleanup
         await asyncio.sleep(1)
-        
+
         # Force garbage collection
         import gc
+
         gc.collect()
-        
+
         # Track event
         self.stats["memory_backpressure_events"] += 1
 ```

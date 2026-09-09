@@ -21,7 +21,7 @@ Add a `max_depth` parameter to limit recursion depth.
 async def scan_directory(self, directory: Path, depth: int = 0) -> None:
     """
     Recursively scan a directory and process files.
-    
+
     Args:
         directory: Directory path to scan
         depth: Current recursion depth (0 = root)
@@ -31,17 +31,14 @@ async def scan_directory(self, directory: Path, depth: int = 0) -> None:
         self.logger.debug(f"Skipping {directory} - max depth {self.max_depth} reached")
         await self.update_stats(dirs_skipped_max_depth=1)
         return
-    
+
     # ... existing scanning code ...
-    
+
     # Process subdirectories with incremented depth
     if subdirs:
         for i in range(0, len(subdirs), self.max_concurrent_subdirs):
             batch_subdirs = subdirs[i : i + self.max_concurrent_subdirs]
-            subdir_tasks = [
-                self.scan_directory(subdir, depth + 1) 
-                for subdir in batch_subdirs
-            ]
+            subdir_tasks = [self.scan_directory(subdir, depth + 1) for subdir in batch_subdirs]
             await asyncio.gather(*subdir_tasks, return_exceptions=True)
 ```
 
@@ -59,6 +56,7 @@ def _get_depth(self, directory: Path) -> int:
         # Path is outside root_path (shouldn't happen, but handle gracefully)
         return 0
 
+
 async def scan_directory(self, directory: Path) -> None:
     # Check depth limit
     depth = self._get_depth(directory)
@@ -66,7 +64,7 @@ async def scan_directory(self, directory: Path) -> None:
         self.logger.debug(f"Skipping {directory} - depth {depth} >= max_depth {self.max_depth}")
         await self.update_stats(dirs_skipped_max_depth=1)
         return
-    
+
     # ... rest of scanning code ...
 ```
 
@@ -127,7 +125,7 @@ Track rates separately for each phase:
 ```python
 class RateTracker:
     """Track rates for different phases and time windows."""
-    
+
     def __init__(self):
         self.phase_rates = {
             "scanning": {"files": [], "dirs": []},
@@ -136,21 +134,18 @@ class RateTracker:
         }
         self.window_size = 60  # seconds
         self.samples = []  # (timestamp, phase, metric_type, count)
-    
+
     def record(self, phase: str, metric_type: str, count: int):
         """Record a metric sample."""
         self.samples.append((time.time(), phase, metric_type, count))
         # Keep only last window_size seconds
         cutoff = time.time() - self.window_size
         self.samples = [s for s in self.samples if s[0] > cutoff]
-    
+
     def get_rate(self, phase: str, metric_type: str, window_seconds: int = 60) -> float:
         """Calculate rate for a specific phase/metric over time window."""
         cutoff = time.time() - window_seconds
-        relevant = [
-            s for s in self.samples
-            if s[0] > cutoff and s[1] == phase and s[2] == metric_type
-        ]
+        relevant = [s for s in self.samples if s[0] > cutoff and s[1] == phase and s[2] == metric_type]
         if not relevant:
             return 0.0
         total = sum(s[3] for s in relevant)
@@ -168,15 +163,12 @@ Track rates over different time windows:
 ```python
 progress_data = {
     # ... existing fields ...
-    
     # Instant rates (last 10 seconds)
     "files_per_second_instant": self.rate_tracker.get_rate("scanning", "files", 10),
     "dirs_per_second_instant": self.rate_tracker.get_rate("scanning", "dirs", 10),
-    
     # Short-term rates (last 60 seconds)
     "files_per_second_short": self.rate_tracker.get_rate("scanning", "files", 60),
     "dirs_per_second_short": self.rate_tracker.get_rate("scanning", "dirs", 60),
-    
     # Overall rates (since start)
     "files_per_second_overall": self.stats["files_scanned"] / elapsed,
     "dirs_per_second_overall": self.stats["dirs_scanned"] / elapsed,
@@ -217,9 +209,9 @@ Track rates for different directory characteristics:
 # Track directory characteristics
 self.dir_stats = {
     "shallow_dirs": 0,  # depth <= 2
-    "deep_dirs": 0,     # depth > 10
-    "dense_dirs": 0,    # > 100 files
-    "sparse_dirs": 0,   # < 10 files
+    "deep_dirs": 0,  # depth > 10
+    "dense_dirs": 0,  # > 100 files
+    "sparse_dirs": 0,  # < 10 files
 }
 ```
 
@@ -243,9 +235,7 @@ await self.update_stats(bytes_scanned=file_size)
 # In progress:
 progress_data["bytes_per_second"] = self.stats["bytes_scanned"] / elapsed
 progress_data["avg_file_size_bytes"] = (
-    self.stats["bytes_scanned"] / self.stats["files_scanned"]
-    if self.stats["files_scanned"] > 0
-    else 0
+    self.stats["bytes_scanned"] / self.stats["files_scanned"] if self.stats["files_scanned"] > 0 else 0
 )
 ```
 
@@ -291,30 +281,30 @@ class RateTrendTracker:
     def __init__(self):
         self.rate_history = []  # (timestamp, rate)
         self.history_window = 300  # 5 minutes
-    
+
     def add_sample(self, rate: float):
         now = time.time()
         self.rate_history.append((now, rate))
         # Keep only last window
         cutoff = now - self.history_window
         self.rate_history = [(t, r) for t, r in self.rate_history if t > cutoff]
-    
+
     def get_trend(self) -> str:
         """Returns 'increasing', 'decreasing', or 'stable'."""
         if len(self.rate_history) < 2:
             return "stable"
-        
+
         recent = self.rate_history[-10:]  # Last 10 samples
         if len(recent) < 2:
             return "stable"
-        
+
         rates = [r for _, r in recent]
-        first_half = rates[:len(rates)//2]
-        second_half = rates[len(rates)//2:]
-        
+        first_half = rates[: len(rates) // 2]
+        second_half = rates[len(rates) // 2 :]
+
         avg_first = sum(first_half) / len(first_half)
         avg_second = sum(second_half) / len(second_half)
-        
+
         if avg_second > avg_first * 1.1:  # 10% increase
             return "increasing"
         elif avg_second < avg_first * 0.9:  # 10% decrease
@@ -365,11 +355,7 @@ Compare current rate to historical/baseline:
 - **vs theoretical max**: Compare to max_concurrency
 
 ```python
-progress_data["rate_vs_max_percent"] = (
-    (rate / self.max_concurrency) * 100
-    if self.max_concurrency > 0
-    else 0
-)
+progress_data["rate_vs_max_percent"] = (rate / self.max_concurrency) * 100 if self.max_concurrency > 0 else 0
 ```
 
 ---

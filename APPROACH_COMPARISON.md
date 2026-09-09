@@ -59,6 +59,7 @@ for entry in entries:
 file_queue = asyncio.Queue(maxsize=semaphore_limit + 100)
 workers = [worker() for _ in range(semaphore_limit)]
 
+
 # Producer: Feed files to queue
 async def producer():
     for file in all_files:  # Need to collect all files first!
@@ -97,6 +98,7 @@ async def producer():
 # All directories known upfront (from scanning phase)
 directory_queue = asyncio.Queue(maxsize=semaphore_limit + 100)
 workers = [worker() for _ in range(semaphore_limit)]
+
 
 async def worker():
     directory = await directory_queue.get()

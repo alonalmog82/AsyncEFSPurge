@@ -118,16 +118,14 @@ efspurge /tmp/test-efs --max-age-days 0 --dry-run
 import asyncio
 from efspurge.purger import AsyncEFSPurger
 
+
 async def main():
     purger = AsyncEFSPurger(
-        root_path="/tmp/test",
-        max_age_days=30,
-        max_concurrency=100,
-        dry_run=True,
-        log_level="DEBUG"
+        root_path="/tmp/test", max_age_days=30, max_concurrency=100, dry_run=True, log_level="DEBUG"
     )
     stats = await purger.purge()
     print(stats)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -210,27 +208,26 @@ import pytest
 from pathlib import Path
 from efspurge.purger import AsyncEFSPurger
 
+
 @pytest.mark.asyncio
 async def test_purge_old_files(tmp_path):
     """Test that old files are identified for purging."""
     # Setup
     test_file = tmp_path / "old_file.txt"
     test_file.touch()
-    
+
     # Make file old by modifying mtime
     import time
+
     old_time = time.time() - (60 * 86400)  # 60 days ago
     import os
+
     os.utime(test_file, (old_time, old_time))
-    
+
     # Execute
-    purger = AsyncEFSPurger(
-        root_path=str(tmp_path),
-        max_age_days=30,
-        dry_run=True
-    )
+    purger = AsyncEFSPurger(root_path=str(tmp_path), max_age_days=30, dry_run=True)
     stats = await purger.purge()
-    
+
     # Assert
     assert stats["files_scanned"] == 1
     assert stats["files_to_purge"] == 1
@@ -249,13 +246,10 @@ def test_directory(tmp_path):
             (tmp_path / d / f"file{i}.txt").touch()
     return tmp_path
 
+
 @pytest.mark.asyncio
 async def test_with_fixture(test_directory):
-    purger = AsyncEFSPurger(
-        root_path=str(test_directory),
-        max_age_days=30,
-        dry_run=True
-    )
+    purger = AsyncEFSPurger(root_path=str(test_directory), max_age_days=30, dry_run=True)
     stats = await purger.purge()
     assert stats["files_scanned"] == 30
 ```
@@ -305,20 +299,10 @@ except FileNotFoundError:
     self.logger.debug(f"File already deleted: {file_path}")
 except PermissionError as e:
     # Log with context
-    log_with_context(
-        self.logger,
-        "warning",
-        "Permission denied",
-        {"file": str(file_path), "error": str(e)}
-    )
+    log_with_context(self.logger, "warning", "Permission denied", {"file": str(file_path), "error": str(e)})
 except Exception as e:
     # Catch-all for unexpected errors
-    log_with_context(
-        self.logger,
-        "error",
-        "Unexpected error",
-        {"file": str(file_path), "error_type": type(e).__name__}
-    )
+    log_with_context(self.logger, "error", "Unexpected error", {"file": str(file_path), "error_type": type(e).__name__})
 ```
 
 ## Submitting Changes
@@ -421,21 +405,18 @@ import time
 import asyncio
 from efspurge.purger import AsyncEFSPurger
 
+
 async def benchmark():
     start = time.time()
-    
-    purger = AsyncEFSPurger(
-        root_path="/mnt/test",
-        max_age_days=30,
-        max_concurrency=1000,
-        dry_run=True
-    )
-    
+
+    purger = AsyncEFSPurger(root_path="/mnt/test", max_age_days=30, max_concurrency=1000, dry_run=True)
+
     stats = await purger.purge()
     duration = time.time() - start
-    
+
     print(f"Files/sec: {stats['files_scanned'] / duration:.2f}")
     print(f"Total time: {duration:.2f}s")
+
 
 asyncio.run(benchmark())
 ```

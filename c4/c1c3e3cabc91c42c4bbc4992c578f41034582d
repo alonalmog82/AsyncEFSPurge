@@ -1,0 +1,38 @@
+CONTRIBUTING.md
+  s_7eae92401defc7::t_4bfa6286c7167c 121,124,129,211,218,221,224,226,228,230,249,252,302,305,408,411-413,416
+  s_7eae92401defc7::t_31acbbc29b6231 420
+OOM_ANALYSIS.md
+  s_7eae92401defc7::t_4bfa6286c7167c 242,245
+SUBDIR_CONCURRENCY_FIX.md
+  s_7eae92401defc7::t_4bfa6286c7167c 43,50,54,61,64
+FEATURE_IDEAS.md
+  s_7eae92401defc7::t_4bfa6286c7167c 24,34,36,41,59,67,128,137,144,148,212-214,238,284,291,296,300,302-304,307,358
+SEMAPHORE_BATCHING_DESIGN.md
+  s_7eae92401defc7::t_4bfa6286c7167c 39,100
+  s_7eae92401defc7::t_e86dcbbece5cca 106
+APPROACH_COMPARISON.md
+  s_7eae92401defc7::t_4bfa6286c7167c 62
+  s_7eae92401defc7::t_f755220a359cea 102
+SCALABILITY_IMPROVEMENTS.md
+  s_7eae92401defc7::t_4bfa6286c7167c 45,54,239,242,245,247
+SLIDING_WINDOW_ANALYSIS.md
+  s_7eae92401defc7::t_4bfa6286c7167c 64
+EDGE_CASES.md
+  s_7eae92401defc7::t_4bfa6286c7167c 13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "c4c1c3e3cabc91c42c4bbc4992c578f41034582d",
+  "prompts": {},
+  "sessions": {
+    "s_7eae92401defc7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6ed0febf-2d86-43a5-8ffb-4062a300ab8a",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Alon Almog <alon.almog@boomi.com>"
+    }
+  }
+}

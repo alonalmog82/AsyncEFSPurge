@@ -1,0 +1,28 @@
+pyproject.toml
+  s_7eae92401defc7::t_b9406225ea6fc0 7
+src/efspurge/cli.py
+  s_7eae92401defc7::t_e7b9a2daac8712 246-248,250-256
+CHANGELOG.md
+  s_7eae92401defc7::t_d7ca611eedf4b6 8-12
+tests/test_phase3_inband_batch.py
+  s_7eae92401defc7::t_85c22a9fbd5ae1 1-103,109-119,130-132,134-136,139,141,143-168
+  s_7eae92401defc7::t_832ac596f638f9 104-108,120-129,133,137-138,140,142
+src/efspurge/purger.py
+  s_7eae92401defc7::t_1d720e0aac0453 3592-3613
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "accb93af89ef8e1aa3fcc52d63d64f30fd12e93a",
+  "prompts": {},
+  "sessions": {
+    "s_7eae92401defc7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6ed0febf-2d86-43a5-8ffb-4062a300ab8a",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Alon Almog <alon.almog@boomi.com>"
+    }
+  }
+}

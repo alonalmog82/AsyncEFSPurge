@@ -1,0 +1,853 @@
+# mysql-split.yaml — 2026-11-17
+# Splits the mysql whale across 8 Jobs, bucketed by first hex char of uuid.
+# Per uuid: bash triage — empty dirs rmdir'd directly; non-empty get one
+# efspurge run each with per-uuid checkpoint files (fresh, small sidecars).
+# Run only while efspurge-mysql-30d and efspurge-mysql-phase3-drain are stopped.
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: efspurge-mysql-shard-0
+  namespace: prod
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false
+  labels:
+    app: efspurge-mysql-shard
+    bucket: "0"
+spec:
+  backoffLimit: 20
+  activeDeadlineSeconds: 604800
+  ttlSecondsAfterFinished: 259200
+  template:
+    metadata:
+      labels:
+        app: efspurge-mysql-shard
+        bucket: "0"
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        fsGroup: 0
+        runAsUser: 0
+      containers:
+      - name: efspurge
+        image: ghcr.io/alonalmog82/asyncefspurge:2.3.2
+        imagePullPolicy: Always
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -u
+          echo "[mysql-shard-0] listing uuids (one-time, may take ~15m) @ $(date -u +%FT%TZ)"
+          ls -1 /data/api_files/mysql > /tmp/uuids.txt 2>/dev/null || true
+          total=$(wc -l < /tmp/uuids.txt)
+          mine=$(grep -cE '^[01]' /tmp/uuids.txt || true)
+          echo "[mysql-shard-0] total=$total mine=$mine"
+          n=0; ok=0; ckpt=0; fail=0; empty=0
+          for u in $(grep -E '^[01]' /tmp/uuids.txt); do
+            path="/data/api_files/mysql/$u"
+            [ -d "$path" ] || continue
+            n=$((n+1))
+            if [ $((n % 1000)) -eq 0 ]; then
+              echo "[mysql-shard-0] progress n=$n ok=$ok empty=$empty ckpt=$ckpt fail=$fail @ $(date -u +%FT%TZ)"
+            fi
+            entries=$(ls -A "$path" 2>/dev/null | head -1)
+            if [ -z "$entries" ]; then
+              rmdir "$path" 2>/dev/null && empty=$((empty+1))
+              continue
+            fi
+            EFSPURGE_CHECKPOINT_FILE="$path/.efspurge-checkpoint.json" \
+            EFSPURGE_DIR_DELETION_CHECKPOINT_FILE="$path/.efspurge-dircp.json" \
+            EFSPURGE_PHASE3_BATCH_SIZE=100000 \
+            efspurge "$path" --max-age-days 30 --remove-empty-dirs --resume --dir-deletion-resume
+            rc=$?
+            case $rc in
+              0)  ok=$((ok+1));;
+              75) ckpt=$((ckpt+1));;
+              *)  fail=$((fail+1)); echo "[mysql-shard-0] FAIL $u rc=$rc";;
+            esac
+          done
+          echo "[mysql-shard-0] DONE n=$n ok=$ok empty=$empty ckpt=$ckpt fail=$fail"
+          if [ $ckpt -gt 0 ]; then exit 75; fi
+          exit 0
+        env:
+        - name: EFSPURGE_MAX_AGE_DAYS
+          value: "30"
+        - name: EFSPURGE_MAX_CONCURRENCY_SCANNING
+          value: "1000"
+        - name: EFSPURGE_MAX_CONCURRENCY_DELETION
+          value: "1000"
+        - name: EFSPURGE_MAX_CONCURRENT_DISCOVERY
+          value: "80"
+        - name: EFSPURGE_PHASE3_DELETION_WORKERS
+          value: "100"
+        - name: EFSPURGE_TASK_BATCH_SIZE
+          value: "10000"
+        - name: EFSPURGE_MEMORY_LIMIT_MB
+          value: "3500"
+        - name: EFSPURGE_MAX_DISCOVERY_DIRS
+          value: "2000000"
+        - name: EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE
+          value: "0"
+        - name: EFSPURGE_REMOVE_EMPTY_DIRS
+          value: "1"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+        volumeMounts:
+        - mountPath: /data
+          name: efs-volume
+        - mountPath: /tmp
+          name: tmp
+      volumes:
+      - name: efs-volume
+        persistentVolumeClaim:
+          claimName: efs-purge-claim
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: efspurge-mysql-shard-1
+  namespace: prod
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false
+  labels:
+    app: efspurge-mysql-shard
+    bucket: "1"
+spec:
+  backoffLimit: 20
+  activeDeadlineSeconds: 604800
+  ttlSecondsAfterFinished: 259200
+  template:
+    metadata:
+      labels:
+        app: efspurge-mysql-shard
+        bucket: "1"
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        fsGroup: 0
+        runAsUser: 0
+      containers:
+      - name: efspurge
+        image: ghcr.io/alonalmog82/asyncefspurge:2.3.2
+        imagePullPolicy: Always
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -u
+          echo "[mysql-shard-1] listing uuids (one-time, may take ~15m) @ $(date -u +%FT%TZ)"
+          ls -1 /data/api_files/mysql > /tmp/uuids.txt 2>/dev/null || true
+          total=$(wc -l < /tmp/uuids.txt)
+          mine=$(grep -cE '^[23]' /tmp/uuids.txt || true)
+          echo "[mysql-shard-1] total=$total mine=$mine"
+          n=0; ok=0; ckpt=0; fail=0; empty=0
+          for u in $(grep -E '^[23]' /tmp/uuids.txt); do
+            path="/data/api_files/mysql/$u"
+            [ -d "$path" ] || continue
+            n=$((n+1))
+            if [ $((n % 1000)) -eq 0 ]; then
+              echo "[mysql-shard-1] progress n=$n ok=$ok empty=$empty ckpt=$ckpt fail=$fail @ $(date -u +%FT%TZ)"
+            fi
+            entries=$(ls -A "$path" 2>/dev/null | head -1)
+            if [ -z "$entries" ]; then
+              rmdir "$path" 2>/dev/null && empty=$((empty+1))
+              continue
+            fi
+            EFSPURGE_CHECKPOINT_FILE="$path/.efspurge-checkpoint.json" \
+            EFSPURGE_DIR_DELETION_CHECKPOINT_FILE="$path/.efspurge-dircp.json" \
+            EFSPURGE_PHASE3_BATCH_SIZE=100000 \
+            efspurge "$path" --max-age-days 30 --remove-empty-dirs --resume --dir-deletion-resume
+            rc=$?
+            case $rc in
+              0)  ok=$((ok+1));;
+              75) ckpt=$((ckpt+1));;
+              *)  fail=$((fail+1)); echo "[mysql-shard-1] FAIL $u rc=$rc";;
+            esac
+          done
+          echo "[mysql-shard-1] DONE n=$n ok=$ok empty=$empty ckpt=$ckpt fail=$fail"
+          if [ $ckpt -gt 0 ]; then exit 75; fi
+          exit 0
+        env:
+        - name: EFSPURGE_MAX_AGE_DAYS
+          value: "30"
+        - name: EFSPURGE_MAX_CONCURRENCY_SCANNING
+          value: "1000"
+        - name: EFSPURGE_MAX_CONCURRENCY_DELETION
+          value: "1000"
+        - name: EFSPURGE_MAX_CONCURRENT_DISCOVERY
+          value: "80"
+        - name: EFSPURGE_PHASE3_DELETION_WORKERS
+          value: "100"
+        - name: EFSPURGE_TASK_BATCH_SIZE
+          value: "10000"
+        - name: EFSPURGE_MEMORY_LIMIT_MB
+          value: "3500"
+        - name: EFSPURGE_MAX_DISCOVERY_DIRS
+          value: "2000000"
+        - name: EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE
+          value: "0"
+        - name: EFSPURGE_REMOVE_EMPTY_DIRS
+          value: "1"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+        volumeMounts:
+        - mountPath: /data
+          name: efs-volume
+        - mountPath: /tmp
+          name: tmp
+      volumes:
+      - name: efs-volume
+        persistentVolumeClaim:
+          claimName: efs-purge-claim
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: efspurge-mysql-shard-2
+  namespace: prod
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false
+  labels:
+    app: efspurge-mysql-shard
+    bucket: "2"
+spec:
+  backoffLimit: 20
+  activeDeadlineSeconds: 604800
+  ttlSecondsAfterFinished: 259200
+  template:
+    metadata:
+      labels:
+        app: efspurge-mysql-shard
+        bucket: "2"
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        fsGroup: 0
+        runAsUser: 0
+      containers:
+      - name: efspurge
+        image: ghcr.io/alonalmog82/asyncefspurge:2.3.2
+        imagePullPolicy: Always
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -u
+          echo "[mysql-shard-2] listing uuids (one-time, may take ~15m) @ $(date -u +%FT%TZ)"
+          ls -1 /data/api_files/mysql > /tmp/uuids.txt 2>/dev/null || true
+          total=$(wc -l < /tmp/uuids.txt)
+          mine=$(grep -cE '^[45]' /tmp/uuids.txt || true)
+          echo "[mysql-shard-2] total=$total mine=$mine"
+          n=0; ok=0; ckpt=0; fail=0; empty=0
+          for u in $(grep -E '^[45]' /tmp/uuids.txt); do
+            path="/data/api_files/mysql/$u"
+            [ -d "$path" ] || continue
+            n=$((n+1))
+            if [ $((n % 1000)) -eq 0 ]; then
+              echo "[mysql-shard-2] progress n=$n ok=$ok empty=$empty ckpt=$ckpt fail=$fail @ $(date -u +%FT%TZ)"
+            fi
+            entries=$(ls -A "$path" 2>/dev/null | head -1)
+            if [ -z "$entries" ]; then
+              rmdir "$path" 2>/dev/null && empty=$((empty+1))
+              continue
+            fi
+            EFSPURGE_CHECKPOINT_FILE="$path/.efspurge-checkpoint.json" \
+            EFSPURGE_DIR_DELETION_CHECKPOINT_FILE="$path/.efspurge-dircp.json" \
+            EFSPURGE_PHASE3_BATCH_SIZE=100000 \
+            efspurge "$path" --max-age-days 30 --remove-empty-dirs --resume --dir-deletion-resume
+            rc=$?
+            case $rc in
+              0)  ok=$((ok+1));;
+              75) ckpt=$((ckpt+1));;
+              *)  fail=$((fail+1)); echo "[mysql-shard-2] FAIL $u rc=$rc";;
+            esac
+          done
+          echo "[mysql-shard-2] DONE n=$n ok=$ok empty=$empty ckpt=$ckpt fail=$fail"
+          if [ $ckpt -gt 0 ]; then exit 75; fi
+          exit 0
+        env:
+        - name: EFSPURGE_MAX_AGE_DAYS
+          value: "30"
+        - name: EFSPURGE_MAX_CONCURRENCY_SCANNING
+          value: "1000"
+        - name: EFSPURGE_MAX_CONCURRENCY_DELETION
+          value: "1000"
+        - name: EFSPURGE_MAX_CONCURRENT_DISCOVERY
+          value: "80"
+        - name: EFSPURGE_PHASE3_DELETION_WORKERS
+          value: "100"
+        - name: EFSPURGE_TASK_BATCH_SIZE
+          value: "10000"
+        - name: EFSPURGE_MEMORY_LIMIT_MB
+          value: "3500"
+        - name: EFSPURGE_MAX_DISCOVERY_DIRS
+          value: "2000000"
+        - name: EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE
+          value: "0"
+        - name: EFSPURGE_REMOVE_EMPTY_DIRS
+          value: "1"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+        volumeMounts:
+        - mountPath: /data
+          name: efs-volume
+        - mountPath: /tmp
+          name: tmp
+      volumes:
+      - name: efs-volume
+        persistentVolumeClaim:
+          claimName: efs-purge-claim
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: efspurge-mysql-shard-3
+  namespace: prod
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false
+  labels:
+    app: efspurge-mysql-shard
+    bucket: "3"
+spec:
+  backoffLimit: 20
+  activeDeadlineSeconds: 604800
+  ttlSecondsAfterFinished: 259200
+  template:
+    metadata:
+      labels:
+        app: efspurge-mysql-shard
+        bucket: "3"
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        fsGroup: 0
+        runAsUser: 0
+      containers:
+      - name: efspurge
+        image: ghcr.io/alonalmog82/asyncefspurge:2.3.2
+        imagePullPolicy: Always
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -u
+          echo "[mysql-shard-3] listing uuids (one-time, may take ~15m) @ $(date -u +%FT%TZ)"
+          ls -1 /data/api_files/mysql > /tmp/uuids.txt 2>/dev/null || true
+          total=$(wc -l < /tmp/uuids.txt)
+          mine=$(grep -cE '^[67]' /tmp/uuids.txt || true)
+          echo "[mysql-shard-3] total=$total mine=$mine"
+          n=0; ok=0; ckpt=0; fail=0; empty=0
+          for u in $(grep -E '^[67]' /tmp/uuids.txt); do
+            path="/data/api_files/mysql/$u"
+            [ -d "$path" ] || continue
+            n=$((n+1))
+            if [ $((n % 1000)) -eq 0 ]; then
+              echo "[mysql-shard-3] progress n=$n ok=$ok empty=$empty ckpt=$ckpt fail=$fail @ $(date -u +%FT%TZ)"
+            fi
+            entries=$(ls -A "$path" 2>/dev/null | head -1)
+            if [ -z "$entries" ]; then
+              rmdir "$path" 2>/dev/null && empty=$((empty+1))
+              continue
+            fi
+            EFSPURGE_CHECKPOINT_FILE="$path/.efspurge-checkpoint.json" \
+            EFSPURGE_DIR_DELETION_CHECKPOINT_FILE="$path/.efspurge-dircp.json" \
+            EFSPURGE_PHASE3_BATCH_SIZE=100000 \
+            efspurge "$path" --max-age-days 30 --remove-empty-dirs --resume --dir-deletion-resume
+            rc=$?
+            case $rc in
+              0)  ok=$((ok+1));;
+              75) ckpt=$((ckpt+1));;
+              *)  fail=$((fail+1)); echo "[mysql-shard-3] FAIL $u rc=$rc";;
+            esac
+          done
+          echo "[mysql-shard-3] DONE n=$n ok=$ok empty=$empty ckpt=$ckpt fail=$fail"
+          if [ $ckpt -gt 0 ]; then exit 75; fi
+          exit 0
+        env:
+        - name: EFSPURGE_MAX_AGE_DAYS
+          value: "30"
+        - name: EFSPURGE_MAX_CONCURRENCY_SCANNING
+          value: "1000"
+        - name: EFSPURGE_MAX_CONCURRENCY_DELETION
+          value: "1000"
+        - name: EFSPURGE_MAX_CONCURRENT_DISCOVERY
+          value: "80"
+        - name: EFSPURGE_PHASE3_DELETION_WORKERS
+          value: "100"
+        - name: EFSPURGE_TASK_BATCH_SIZE
+          value: "10000"
+        - name: EFSPURGE_MEMORY_LIMIT_MB
+          value: "3500"
+        - name: EFSPURGE_MAX_DISCOVERY_DIRS
+          value: "2000000"
+        - name: EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE
+          value: "0"
+        - name: EFSPURGE_REMOVE_EMPTY_DIRS
+          value: "1"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+        volumeMounts:
+        - mountPath: /data
+          name: efs-volume
+        - mountPath: /tmp
+          name: tmp
+      volumes:
+      - name: efs-volume
+        persistentVolumeClaim:
+          claimName: efs-purge-claim
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: efspurge-mysql-shard-4
+  namespace: prod
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false
+  labels:
+    app: efspurge-mysql-shard
+    bucket: "4"
+spec:
+  backoffLimit: 20
+  activeDeadlineSeconds: 604800
+  ttlSecondsAfterFinished: 259200
+  template:
+    metadata:
+      labels:
+        app: efspurge-mysql-shard
+        bucket: "4"
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        fsGroup: 0
+        runAsUser: 0
+      containers:
+      - name: efspurge
+        image: ghcr.io/alonalmog82/asyncefspurge:2.3.2
+        imagePullPolicy: Always
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -u
+          echo "[mysql-shard-4] listing uuids (one-time, may take ~15m) @ $(date -u +%FT%TZ)"
+          ls -1 /data/api_files/mysql > /tmp/uuids.txt 2>/dev/null || true
+          total=$(wc -l < /tmp/uuids.txt)
+          mine=$(grep -cE '^[89]' /tmp/uuids.txt || true)
+          echo "[mysql-shard-4] total=$total mine=$mine"
+          n=0; ok=0; ckpt=0; fail=0; empty=0
+          for u in $(grep -E '^[89]' /tmp/uuids.txt); do
+            path="/data/api_files/mysql/$u"
+            [ -d "$path" ] || continue
+            n=$((n+1))
+            if [ $((n % 1000)) -eq 0 ]; then
+              echo "[mysql-shard-4] progress n=$n ok=$ok empty=$empty ckpt=$ckpt fail=$fail @ $(date -u +%FT%TZ)"
+            fi
+            entries=$(ls -A "$path" 2>/dev/null | head -1)
+            if [ -z "$entries" ]; then
+              rmdir "$path" 2>/dev/null && empty=$((empty+1))
+              continue
+            fi
+            EFSPURGE_CHECKPOINT_FILE="$path/.efspurge-checkpoint.json" \
+            EFSPURGE_DIR_DELETION_CHECKPOINT_FILE="$path/.efspurge-dircp.json" \
+            EFSPURGE_PHASE3_BATCH_SIZE=100000 \
+            efspurge "$path" --max-age-days 30 --remove-empty-dirs --resume --dir-deletion-resume
+            rc=$?
+            case $rc in
+              0)  ok=$((ok+1));;
+              75) ckpt=$((ckpt+1));;
+              *)  fail=$((fail+1)); echo "[mysql-shard-4] FAIL $u rc=$rc";;
+            esac
+          done
+          echo "[mysql-shard-4] DONE n=$n ok=$ok empty=$empty ckpt=$ckpt fail=$fail"
+          if [ $ckpt -gt 0 ]; then exit 75; fi
+          exit 0
+        env:
+        - name: EFSPURGE_MAX_AGE_DAYS
+          value: "30"
+        - name: EFSPURGE_MAX_CONCURRENCY_SCANNING
+          value: "1000"
+        - name: EFSPURGE_MAX_CONCURRENCY_DELETION
+          value: "1000"
+        - name: EFSPURGE_MAX_CONCURRENT_DISCOVERY
+          value: "80"
+        - name: EFSPURGE_PHASE3_DELETION_WORKERS
+          value: "100"
+        - name: EFSPURGE_TASK_BATCH_SIZE
+          value: "10000"
+        - name: EFSPURGE_MEMORY_LIMIT_MB
+          value: "3500"
+        - name: EFSPURGE_MAX_DISCOVERY_DIRS
+          value: "2000000"
+        - name: EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE
+          value: "0"
+        - name: EFSPURGE_REMOVE_EMPTY_DIRS
+          value: "1"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+        volumeMounts:
+        - mountPath: /data
+          name: efs-volume
+        - mountPath: /tmp
+          name: tmp
+      volumes:
+      - name: efs-volume
+        persistentVolumeClaim:
+          claimName: efs-purge-claim
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: efspurge-mysql-shard-5
+  namespace: prod
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false
+  labels:
+    app: efspurge-mysql-shard
+    bucket: "5"
+spec:
+  backoffLimit: 20
+  activeDeadlineSeconds: 604800
+  ttlSecondsAfterFinished: 259200
+  template:
+    metadata:
+      labels:
+        app: efspurge-mysql-shard
+        bucket: "5"
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        fsGroup: 0
+        runAsUser: 0
+      containers:
+      - name: efspurge
+        image: ghcr.io/alonalmog82/asyncefspurge:2.3.2
+        imagePullPolicy: Always
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -u
+          echo "[mysql-shard-5] listing uuids (one-time, may take ~15m) @ $(date -u +%FT%TZ)"
+          ls -1 /data/api_files/mysql > /tmp/uuids.txt 2>/dev/null || true
+          total=$(wc -l < /tmp/uuids.txt)
+          mine=$(grep -cE '^[ab]' /tmp/uuids.txt || true)
+          echo "[mysql-shard-5] total=$total mine=$mine"
+          n=0; ok=0; ckpt=0; fail=0; empty=0
+          for u in $(grep -E '^[ab]' /tmp/uuids.txt); do
+            path="/data/api_files/mysql/$u"
+            [ -d "$path" ] || continue
+            n=$((n+1))
+            if [ $((n % 1000)) -eq 0 ]; then
+              echo "[mysql-shard-5] progress n=$n ok=$ok empty=$empty ckpt=$ckpt fail=$fail @ $(date -u +%FT%TZ)"
+            fi
+            entries=$(ls -A "$path" 2>/dev/null | head -1)
+            if [ -z "$entries" ]; then
+              rmdir "$path" 2>/dev/null && empty=$((empty+1))
+              continue
+            fi
+            EFSPURGE_CHECKPOINT_FILE="$path/.efspurge-checkpoint.json" \
+            EFSPURGE_DIR_DELETION_CHECKPOINT_FILE="$path/.efspurge-dircp.json" \
+            EFSPURGE_PHASE3_BATCH_SIZE=100000 \
+            efspurge "$path" --max-age-days 30 --remove-empty-dirs --resume --dir-deletion-resume
+            rc=$?
+            case $rc in
+              0)  ok=$((ok+1));;
+              75) ckpt=$((ckpt+1));;
+              *)  fail=$((fail+1)); echo "[mysql-shard-5] FAIL $u rc=$rc";;
+            esac
+          done
+          echo "[mysql-shard-5] DONE n=$n ok=$ok empty=$empty ckpt=$ckpt fail=$fail"
+          if [ $ckpt -gt 0 ]; then exit 75; fi
+          exit 0
+        env:
+        - name: EFSPURGE_MAX_AGE_DAYS
+          value: "30"
+        - name: EFSPURGE_MAX_CONCURRENCY_SCANNING
+          value: "1000"
+        - name: EFSPURGE_MAX_CONCURRENCY_DELETION
+          value: "1000"
+        - name: EFSPURGE_MAX_CONCURRENT_DISCOVERY
+          value: "80"
+        - name: EFSPURGE_PHASE3_DELETION_WORKERS
+          value: "100"
+        - name: EFSPURGE_TASK_BATCH_SIZE
+          value: "10000"
+        - name: EFSPURGE_MEMORY_LIMIT_MB
+          value: "3500"
+        - name: EFSPURGE_MAX_DISCOVERY_DIRS
+          value: "2000000"
+        - name: EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE
+          value: "0"
+        - name: EFSPURGE_REMOVE_EMPTY_DIRS
+          value: "1"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+        volumeMounts:
+        - mountPath: /data
+          name: efs-volume
+        - mountPath: /tmp
+          name: tmp
+      volumes:
+      - name: efs-volume
+        persistentVolumeClaim:
+          claimName: efs-purge-claim
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: efspurge-mysql-shard-6
+  namespace: prod
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false
+  labels:
+    app: efspurge-mysql-shard
+    bucket: "6"
+spec:
+  backoffLimit: 20
+  activeDeadlineSeconds: 604800
+  ttlSecondsAfterFinished: 259200
+  template:
+    metadata:
+      labels:
+        app: efspurge-mysql-shard
+        bucket: "6"
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        fsGroup: 0
+        runAsUser: 0
+      containers:
+      - name: efspurge
+        image: ghcr.io/alonalmog82/asyncefspurge:2.3.2
+        imagePullPolicy: Always
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -u
+          echo "[mysql-shard-6] listing uuids (one-time, may take ~15m) @ $(date -u +%FT%TZ)"
+          ls -1 /data/api_files/mysql > /tmp/uuids.txt 2>/dev/null || true
+          total=$(wc -l < /tmp/uuids.txt)
+          mine=$(grep -cE '^[cd]' /tmp/uuids.txt || true)
+          echo "[mysql-shard-6] total=$total mine=$mine"
+          n=0; ok=0; ckpt=0; fail=0; empty=0
+          for u in $(grep -E '^[cd]' /tmp/uuids.txt); do
+            path="/data/api_files/mysql/$u"
+            [ -d "$path" ] || continue
+            n=$((n+1))
+            if [ $((n % 1000)) -eq 0 ]; then
+              echo "[mysql-shard-6] progress n=$n ok=$ok empty=$empty ckpt=$ckpt fail=$fail @ $(date -u +%FT%TZ)"
+            fi
+            entries=$(ls -A "$path" 2>/dev/null | head -1)
+            if [ -z "$entries" ]; then
+              rmdir "$path" 2>/dev/null && empty=$((empty+1))
+              continue
+            fi
+            EFSPURGE_CHECKPOINT_FILE="$path/.efspurge-checkpoint.json" \
+            EFSPURGE_DIR_DELETION_CHECKPOINT_FILE="$path/.efspurge-dircp.json" \
+            EFSPURGE_PHASE3_BATCH_SIZE=100000 \
+            efspurge "$path" --max-age-days 30 --remove-empty-dirs --resume --dir-deletion-resume
+            rc=$?
+            case $rc in
+              0)  ok=$((ok+1));;
+              75) ckpt=$((ckpt+1));;
+              *)  fail=$((fail+1)); echo "[mysql-shard-6] FAIL $u rc=$rc";;
+            esac
+          done
+          echo "[mysql-shard-6] DONE n=$n ok=$ok empty=$empty ckpt=$ckpt fail=$fail"
+          if [ $ckpt -gt 0 ]; then exit 75; fi
+          exit 0
+        env:
+        - name: EFSPURGE_MAX_AGE_DAYS
+          value: "30"
+        - name: EFSPURGE_MAX_CONCURRENCY_SCANNING
+          value: "1000"
+        - name: EFSPURGE_MAX_CONCURRENCY_DELETION
+          value: "1000"
+        - name: EFSPURGE_MAX_CONCURRENT_DISCOVERY
+          value: "80"
+        - name: EFSPURGE_PHASE3_DELETION_WORKERS
+          value: "100"
+        - name: EFSPURGE_TASK_BATCH_SIZE
+          value: "10000"
+        - name: EFSPURGE_MEMORY_LIMIT_MB
+          value: "3500"
+        - name: EFSPURGE_MAX_DISCOVERY_DIRS
+          value: "2000000"
+        - name: EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE
+          value: "0"
+        - name: EFSPURGE_REMOVE_EMPTY_DIRS
+          value: "1"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+        volumeMounts:
+        - mountPath: /data
+          name: efs-volume
+        - mountPath: /tmp
+          name: tmp
+      volumes:
+      - name: efs-volume
+        persistentVolumeClaim:
+          claimName: efs-purge-claim
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: efspurge-mysql-shard-7
+  namespace: prod
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false
+  labels:
+    app: efspurge-mysql-shard
+    bucket: "7"
+spec:
+  backoffLimit: 20
+  activeDeadlineSeconds: 604800
+  ttlSecondsAfterFinished: 259200
+  template:
+    metadata:
+      labels:
+        app: efspurge-mysql-shard
+        bucket: "7"
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        fsGroup: 0
+        runAsUser: 0
+      containers:
+      - name: efspurge
+        image: ghcr.io/alonalmog82/asyncefspurge:2.3.2
+        imagePullPolicy: Always
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -u
+          echo "[mysql-shard-7] listing uuids (one-time, may take ~15m) @ $(date -u +%FT%TZ)"
+          ls -1 /data/api_files/mysql > /tmp/uuids.txt 2>/dev/null || true
+          total=$(wc -l < /tmp/uuids.txt)
+          mine=$(grep -cE '^[ef]' /tmp/uuids.txt || true)
+          echo "[mysql-shard-7] total=$total mine=$mine"
+          n=0; ok=0; ckpt=0; fail=0; empty=0
+          for u in $(grep -E '^[ef]' /tmp/uuids.txt); do
+            path="/data/api_files/mysql/$u"
+            [ -d "$path" ] || continue
+            n=$((n+1))
+            if [ $((n % 1000)) -eq 0 ]; then
+              echo "[mysql-shard-7] progress n=$n ok=$ok empty=$empty ckpt=$ckpt fail=$fail @ $(date -u +%FT%TZ)"
+            fi
+            entries=$(ls -A "$path" 2>/dev/null | head -1)
+            if [ -z "$entries" ]; then
+              rmdir "$path" 2>/dev/null && empty=$((empty+1))
+              continue
+            fi
+            EFSPURGE_CHECKPOINT_FILE="$path/.efspurge-checkpoint.json" \
+            EFSPURGE_DIR_DELETION_CHECKPOINT_FILE="$path/.efspurge-dircp.json" \
+            EFSPURGE_PHASE3_BATCH_SIZE=100000 \
+            efspurge "$path" --max-age-days 30 --remove-empty-dirs --resume --dir-deletion-resume
+            rc=$?
+            case $rc in
+              0)  ok=$((ok+1));;
+              75) ckpt=$((ckpt+1));;
+              *)  fail=$((fail+1)); echo "[mysql-shard-7] FAIL $u rc=$rc";;
+            esac
+          done
+          echo "[mysql-shard-7] DONE n=$n ok=$ok empty=$empty ckpt=$ckpt fail=$fail"
+          if [ $ckpt -gt 0 ]; then exit 75; fi
+          exit 0
+        env:
+        - name: EFSPURGE_MAX_AGE_DAYS
+          value: "30"
+        - name: EFSPURGE_MAX_CONCURRENCY_SCANNING
+          value: "1000"
+        - name: EFSPURGE_MAX_CONCURRENCY_DELETION
+          value: "1000"
+        - name: EFSPURGE_MAX_CONCURRENT_DISCOVERY
+          value: "80"
+        - name: EFSPURGE_PHASE3_DELETION_WORKERS
+          value: "100"
+        - name: EFSPURGE_TASK_BATCH_SIZE
+          value: "10000"
+        - name: EFSPURGE_MEMORY_LIMIT_MB
+          value: "3500"
+        - name: EFSPURGE_MAX_DISCOVERY_DIRS
+          value: "2000000"
+        - name: EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE
+          value: "0"
+        - name: EFSPURGE_REMOVE_EMPTY_DIRS
+          value: "1"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+          limits:
+            cpu: "2"
+            memory: 4Gi
+        volumeMounts:
+        - mountPath: /data
+          name: efs-volume
+        - mountPath: /tmp
+          name: tmp
+      volumes:
+      - name: efs-volume
+        persistentVolumeClaim:
+          claimName: efs-purge-claim
+      - name: tmp
+        emptyDir: {}

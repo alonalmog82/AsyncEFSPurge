@@ -117,6 +117,21 @@ def parse_args(args=None) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--no-eager-empty-rmdir",
+        dest="eager_empty_rmdir",
+        action="store_false",
+        default=os.getenv("EFSPURGE_EAGER_EMPTY_RMDIR", "1").strip().lower() not in ("0", "false", "no"),
+        help=(
+            "Disable eager empty-dir removal (3.0.0 default: enabled). "
+            "When enabled, Phase 2 workers rmdir directories that become empty "
+            "immediately, instead of deferring them to Phase 3 via the empty-dirs "
+            "sidecar; only writer races (ENOTEMPTY) and rmdir failures fall back "
+            "to the deferred path. Env var: EFSPURGE_EAGER_EMPTY_RMDIR "
+            "(set to 0/false/no to disable)."
+        ),
+    )
+
+    parser.add_argument(
         "--max-empty-dirs-to-delete",
         type=int,
         default=int(os.getenv("EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE", "500")),
@@ -326,6 +341,7 @@ def main() -> None:
         memory_limit_mb=args.memory_limit_mb,
         task_batch_size=args.task_batch_size,
         remove_empty_dirs=args.remove_empty_dirs,
+        eager_empty_rmdir=args.eager_empty_rmdir,
         max_empty_dirs_to_delete=args.max_empty_dirs_to_delete,
         max_discovery_dirs=args.max_discovery_dirs,
         max_concurrent_discovery=args.max_concurrent_discovery,

@@ -486,6 +486,7 @@ class AsyncEFSPurger:
         memory_limit_mb: int = 800,
         task_batch_size: int = 5000,
         remove_empty_dirs: bool = False,
+        eager_empty_rmdir: bool = True,
         max_empty_dirs_to_delete: int = 500,
         max_discovery_dirs: int = 0,
         max_concurrent_discovery: int = 20,
@@ -516,6 +517,11 @@ class AsyncEFSPurger:
             memory_limit_mb: Soft memory limit in MB (triggers back-pressure, 0 = disabled)
             task_batch_size: Maximum tasks to create at once (prevents OOM)
             remove_empty_dirs: If True, remove empty directories after scanning (post-order)
+            eager_empty_rmdir: If True (3.0.0 default), Phase 2 workers rmdir directories
+                that become empty immediately instead of deferring them to Phase 3 via
+                the empty-dirs sidecar. Only races (ENOTEMPTY) and rmdir failures fall
+                back to the deferred path. Prevents the monolithic-sidecar pathology
+                observed on billion-directory EFS trees.
             max_empty_dirs_to_delete: Maximum empty directories to delete per run (0 = unlimited, default: 500)
             max_discovery_dirs: Maximum directories to discover in Phase 1a (0 = use automatic limit based on memory)
             max_concurrent_discovery: Maximum concurrent directory/file scan workers (default: 20)
@@ -636,6 +642,7 @@ class AsyncEFSPurger:
         self.memory_limit_mb = memory_limit_mb
         self.task_batch_size = task_batch_size
         self.remove_empty_dirs = remove_empty_dirs
+        self.eager_empty_rmdir = eager_empty_rmdir
         self.max_empty_dirs_to_delete = max_empty_dirs_to_delete
         self.max_concurrent_discovery = max(1, max_concurrent_discovery)
         self.queue_maxsize = queue_maxsize
@@ -685,6 +692,7 @@ class AsyncEFSPurger:
             "memory_backpressure_events": 0,
             "empty_dirs_to_delete": 0,  # Directories that would be deleted (increments in dry-run)
             "empty_dirs_deleted": 0,  # Directories actually deleted (0 in dry-run)
+            "empty_dirs_eager_deleted": 0,  # Empty dirs rmdir'd immediately mid-scan (3.0.0 eager mode)
         }
 
         # Stuck detection: track progress for detecting hangs
@@ -805,6 +813,54 @@ class AsyncEFSPurger:
 
             # Progress logging is handled by _background_progress_reporter()
             # Removed duplicate logging here to prevent duplicate log entries
+
+    async def _eager_rmdir_if_empty(self, directory: Path) -> bool:
+        """Attempt immediate removal of a directory found empty mid-scan (3.0.0).
+
+        Returns True when the directory must NOT be added to the deferred
+        empty_dirs set: either it was rmdir'd on the spot, or it vanished
+        (ENOENT — writer removed it) leaving nothing to defer. Returns False
+        when the directory must be deferred to Phase 3: the shared per-run
+        deletion budget (max_empty_dirs_to_delete) is exhausted, a writer raced
+        us (ENOTEMPTY), or rmdir failed after EACCES retries.
+
+        Eager deletions count against the same per-run budget as Phase 1b and
+        Phase 3, so max_empty_dirs_to_delete keeps its "maximum deletions per
+        run" meaning with eager mode on. Deletions are additionally bounded by
+        scan throughput — at most one attempt per scanned directory.
+        """
+        # Respect the per-run deletion budget shared with Phase 1b/3 (0 = unlimited).
+        # Without this check, eager mode would void max_empty_dirs_to_delete entirely.
+        if self.max_empty_dirs_to_delete > 0:
+            async with self.stats_lock:
+                if self.stats["empty_dirs_deleted"] >= self.max_empty_dirs_to_delete:
+                    return False
+        try:
+            await async_rmdir_with_eacces_retry(directory)
+        except OSError as e:
+            if e.errno == errno.ENOENT:
+                # Directory vanished between the emptiness check and rmdir.
+                # Nothing to defer — the old deferred path also dropped ENOENT.
+                return True
+            if e.errno == errno.ENOTEMPTY:
+                # Writer created content between the emptiness check and rmdir.
+                # Defer; Phase 3 re-checks emptiness before deleting.
+                return False
+            if e.errno == errno.EACCES:
+                # EACCES exhausted its in-rmdir retries; Phase 3 retries again.
+                await self._log_eacces_throttled(
+                    "phase2.eager_rmdir",
+                    "Eager rmdir EACCES, deferring to Phase 3",
+                    directory,
+                    e,
+                )
+                return False
+            # Other OSError (EPERM, EIO, ...): defer rather than drop the dir.
+            # DEBUG only — Phase 3's error handling will surface persistent failures.
+            self.logger.debug(f"Eager rmdir failed, deferring to Phase 3: {directory} error={e!s}")
+            return False
+        await self.update_stats(empty_dirs_to_delete=1, empty_dirs_deleted=1, empty_dirs_eager_deleted=1)
+        return True
 
     async def check_memory_pressure(self) -> tuple[bool, float]:
         """
@@ -2835,7 +2891,18 @@ class AsyncEFSPurger:
                                 except (OSError, RuntimeError):
                                     dir_resolved = directory
                                 if dir_resolved != root_resolved:
-                                    self.empty_dirs.add(directory)
+                                    # 3.0.0 eager mode: rmdir immediately instead of
+                                    # accumulating into the empty-dirs sidecar. The
+                                    # monolithic sidecar (billions of stale entries on
+                                    # whale-scale trees) is what made Phase 3 drain and
+                                    # checkpoint saves pathological — see CHANGELOG 3.0.0.
+                                    handled_eagerly = (
+                                        self.eager_empty_rmdir
+                                        and not self.dry_run
+                                        and await self._eager_rmdir_if_empty(directory)
+                                    )
+                                    if not handled_eagerly:
+                                        self.empty_dirs.add(directory)
                         except (FileNotFoundError, PermissionError, OSError):
                             pass  # Directory gone or inaccessible
 
@@ -3304,6 +3371,9 @@ class AsyncEFSPurger:
                     progress_data["files_scanned"] = current_files
                     progress_data["files_purged"] = self.stats["files_purged"]
                     progress_data["dirs_scanned"] = current_dirs
+                    eager_deleted = self.stats.get("empty_dirs_eager_deleted", 0)
+                    if eager_deleted > 0:
+                        progress_data["empty_dirs_eager_deleted"] = eager_deleted
                     # Add files/dirs to purge if non-zero
                     if self.stats["files_to_purge"] > 0:
                         progress_data["files_to_purge"] = self.stats["files_to_purge"]
@@ -3502,6 +3572,7 @@ class AsyncEFSPurger:
                 "memory_limit_mb": self.memory_limit_mb,
                 "task_batch_size": self.task_batch_size,
                 "remove_empty_dirs": self.remove_empty_dirs,
+                "eager_empty_rmdir": self.eager_empty_rmdir,
                 "max_empty_dirs_to_delete": self.max_empty_dirs_to_delete,
                 "max_concurrent_discovery": self.max_concurrent_discovery,
                 "queue_maxsize": self.queue_maxsize,
@@ -3772,6 +3843,7 @@ async def async_main(
     memory_limit_mb: int = 800,
     task_batch_size: int = 5000,
     remove_empty_dirs: bool = False,
+    eager_empty_rmdir: bool = True,
     max_empty_dirs_to_delete: int = 500,
     max_discovery_dirs: int = 0,
     max_concurrent_discovery: int = 20,
@@ -3827,6 +3899,7 @@ async def async_main(
         memory_limit_mb=memory_limit_mb,
         task_batch_size=task_batch_size,
         remove_empty_dirs=remove_empty_dirs,
+        eager_empty_rmdir=eager_empty_rmdir,
         max_empty_dirs_to_delete=max_empty_dirs_to_delete,
         max_discovery_dirs=max_discovery_dirs,
         max_concurrent_discovery=max_concurrent_discovery,

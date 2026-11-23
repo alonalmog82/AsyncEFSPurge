@@ -155,7 +155,8 @@ options:
   --resume                  Resume Phase 2 from checkpoint file (requires --checkpoint-file). Skips Phase 1.
   --dry-run                 Don't actually delete files, just report what would be deleted
   --remove-empty-dirs       Remove empty directories (two-pass: Phase 1 before scan, Phase 3 after scan)
-  --max-empty-dirs-to-delete N  Maximum empty directories to delete per run (0 = unlimited, default: 500)
+  --no-eager-empty-rmdir    Disable eager empty-dir removal (3.0.0 default: Phase 2 rmdirs dirs that become empty immediately instead of deferring them to Phase 3)
+  --max-empty-dirs-to-delete N  Maximum empty directories to delete per run, shared across eager + Phase 1b/3 (0 = unlimited, default: 500)
   --no-uvloop               Disable uvloop, use default asyncio event loop (uvloop enabled by default on Linux/macOS)
   --log-level LEVEL         Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL (default: INFO)
   --version                 Show version and exit
@@ -207,6 +208,73 @@ efspurge /mnt/efs --max-age-days 30 --remove-empty-dirs --max-empty-dirs-to-dele
 # This avoids expensive os.stat() calls on files and is much faster for deep directory structures
 efspurge /mnt/efs --max-age-days 0 --remove-empty-dirs
 ```
+
+**Eager empty-dir removal (3.0.0 default):**
+```bash
+# Since 3.0.0, Phase 2 workers rmdir directories that become empty immediately,
+# instead of deferring them to Phase 3 via the empty-dirs sidecar. This prevents
+# the sidecar from growing monolithic on billion-directory trees.
+efspurge /mnt/efs --max-age-days 30 --remove-empty-dirs
+
+# Restore the pre-3.0.0 deferred-only behaviour
+efspurge /mnt/efs --max-age-days 30 --remove-empty-dirs --no-eager-empty-rmdir
+# or: EFSPURGE_EAGER_EMPTY_RMDIR=0
+```
+
+Eager deletions share the same per-run budget as Phase 1b/Phase 3
+(`--max-empty-dirs-to-delete`, default 500, `0` = unlimited); writer races and
+rmdir failures still defer to Phase 3. The new `empty_dirs_eager_deleted` stat
+appears in progress logs.
+
+## Pathological Trees: Per-Uuid Sharding Playbook
+
+On a tree with **billions of directories and millions of top-level uuid dirs**
+(e.g. `api_files/<source>/<uuid>/...` written by data-pipeline workers), a
+single monolithic purger run hits walls no configuration can fix: one
+checkpoint file accumulates the entire empty-dir frontier (20+ GB gzipped in
+production, mostly stale paths), checkpoint saves become slower than the work,
+and one process's restart granularity is the whole tree.
+
+The production-proven fix (validated 2026-11: 8 Jobs cleaned a 1.6M-uuid shard
+in ~3.5 days, zero checkpoint exits, where the monolithic run had never
+completed a full pass in 3.5 months):
+
+1. **Split the shard across N Jobs**, bucketed by uuid prefix (uuids are hex,
+   so the first hex char gives 16 naturally balanced buckets — pair them for 8
+   Jobs).
+2. **Bash-triage each uuid before invoking the purger** — a depth-1 emptiness
+   probe costs one directory read; empty uuids are `rmdir`'d directly at shell
+   speed (atomic — fails safely with `ENOTEMPTY` if a writer races you), and
+   only non-empty uuids pay the purger's startup cost:
+   ```sh
+   for u in $(grep -E "^[01]" /tmp/uuids.txt); do
+     path="/data/api_files/<shard>/$u"
+     [ -d "$path" ] || continue
+     entries=$(ls -A "$path" 2>/dev/null | head -1)
+     if [ -z "$entries" ]; then
+       rmdir "$path" 2>/dev/null && empty=$((empty+1))
+       continue
+     fi
+     EFSPURGE_CHECKPOINT_FILE="$path/.efspurge-checkpoint.json" \
+     EFSPURGE_DIR_DELETION_CHECKPOINT_FILE="$path/.efspurge-dircp.json" \
+     EFSPURGE_PHASE3_BATCH_SIZE=100000 \
+     efspurge "$path" --max-age-days 30 --remove-empty-dirs --resume --dir-deletion-resume
+   done
+   ```
+3. **Per-uuid checkpoint files** live inside each uuid's own directory, so
+   sidecars stay tiny, checkpoint saves are microseconds, and a hung NFS call
+   only poisons one uuid. Crash containment and parallelism come free from
+   Kubernetes Job semantics — no in-process scheduler required.
+4. Each Job re-lists the uuid dir once at startup (a full `ls -1` of a
+   million-entry root can take 10-20 minutes on NFS — budget for it), tallies
+   `ok`/`empty`/`ckpt`/`fail`, and exits 75 if any uuid checkpointed so the Job
+   retries the bucket (completed uuids re-scan cheaply from their per-uuid
+   checkpoints).
+
+A worked end-to-end manifest lives in `scripts/mysql-split.yaml` (8 Jobs,
+`efspurge-mysql-shard-{0..7}`). After the fleet completes, a fresh
+`--remove-empty-dirs` run over the shard root becomes a fast completion check:
+the same tree that could not finish in months completed a full pass in hours.
 
 ## Deployment
 
@@ -543,6 +611,7 @@ ruff format .
 - `EFSPURGE_MEMORY_LIMIT_MB=N` - Soft memory limit in MB, triggers back-pressure (default: 800)
 - `EFSPURGE_TASK_BATCH_SIZE=N` - Maximum tasks to create at once, prevents OOM (default: 5000)
 - `EFSPURGE_REMOVE_EMPTY_DIRS=1` - Enable empty directory removal (same as `--remove-empty-dirs` flag)
+- `EFSPURGE_EAGER_EMPTY_RMDIR=0` - Disable 3.0.0 eager empty-dir removal (same as `--no-eager-empty-rmdir` flag)
 - `EFSPURGE_MAX_EMPTY_DIRS_TO_DELETE=N` - Maximum empty directories to delete per run (0 = unlimited, default: 500)
 - `EFSPURGE_MAX_CONCURRENT_DISCOVERY=N` - Maximum concurrent scan workers for directory traversal (default: 20)
 - `EFSPURGE_MAX_DISCOVERY_DIRS=N` - Maximum directories to discover in Phase 1a (0 = auto based on memory limit)

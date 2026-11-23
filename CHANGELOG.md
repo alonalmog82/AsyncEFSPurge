@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.0] - 2026-11-23
+
+### Changed (major — default behaviour)
+
+- **Eager empty-dir removal is now the default.** When a Phase 2 worker observes that a directory it just scanned became empty (all its aged files purged), it immediately attempts `rmdir` on the spot instead of appending the path to the deferred `empty_dirs` set — the set that is flushed to the `<checkpoint>.empty_dirs.gz` sidecar on every checkpoint save. Only writer races (`ENOTEMPTY`), rmdir failures (EACCES retries exhausted, other `OSError`), and an exhausted per-run budget fall back to the deferred Phase 3 path. Disable with `--no-eager-empty-rmdir` or `EFSPURGE_EAGER_EMPTY_RMDIR=0` to restore the pre-3.0.0 deferred-only behaviour.
+
+  **Why this is the headline fix of 3.0.0** (production evidence, 2026-09 → 2026-11, ~1.6M-uuid / multi-billion-directory EFS shard): the deferred sidecar grew monolithic — 20+ GB gzipped, billions of entries, most of them **stale** (paths already deleted by writers or earlier passes). Consequences measured in prod: checkpoint saves became so heavy they timed out against EFS NFS latency spikes ("Checkpoint write timed out (EFS NFS open/write syscall hung)"), a `--phase3-only` drain of the sidecar churned 100k stale entries in ~6.5 minutes with zero deletions (`total_empty_dirs_to_delete: 0`), and the whale slowed to ~10% of its normal scan rate. Eager removal prevents the monolith from ever forming: empty leaves — the overwhelming majority of entries — never enter the sidecar at all.
+
+  Semantics of the change:
+  - Eager deletions count against the same **shared per-run budget** as Phase 1b and Phase 3 (`max_empty_dirs_to_delete`, default 500, `0` = unlimited), so the cap keeps its "maximum deletions per run" meaning. Once the budget is exhausted, empty dirs defer exactly as before.
+  - `ENOENT` (writer removed the dir between the emptiness check and our `rmdir`) is neither deleted nor deferred — matching the historical deferred-path behaviour of dropping vanished dirs.
+  - The root directory is never eager-removed (same guard as the deferred path).
+  - `dry_run` never rmdir's: dry runs defer and count under `empty_dirs_to_delete` exactly as before.
+  - New stat `empty_dirs_eager_deleted` appears in progress logs and the startup line now records `eager_empty_rmdir`.
+  - Parents that become empty only after an eager child removal are **not** re-checked in the same run (the Phase 3 cascade used to do this for deferred deletions). They are picked up by the next run's scan — or by the per-uuid sharding playbook below, which handles them at bash speed.
+
+### Added
+
+- **`--no-eager-empty-rmdir` / `EFSPURGE_EAGER_EMPTY_RMDIR`** — opt-out for the new default (see above).
+- **README: "Pathological trees: per-uuid sharding playbook"** — documents the production-proven ops pattern for trees where even a healthy purger run is the wrong tool: split the shard across N Jobs bucketed by uuid prefix, bash-triage each uuid (`ls -A | head -1`) so empty ones are rmdir'd directly at shell speed, and give non-empty ones a single efspurge invocation with a per-uuid checkpoint file. Fresh small sidecars replace the monolith structurally. Validated 2026-11-17 → 2026-11-21: 8 Jobs cleaned 1.57M uuids (~1.41M full scans, ~190k direct empty rmdirs) in ~3.5 days with **zero** checkpoint exits, where the monolithic whale had not completed a single full pass in 3.5 months.
+
 ## [2.3.2] - 2026-09-09
 
 ### Fixed

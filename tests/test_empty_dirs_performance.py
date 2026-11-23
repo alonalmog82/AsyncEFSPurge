@@ -106,6 +106,10 @@ async def test_semaphore_released_early(temp_dir):
         root_path=str(temp_dir),
         max_age_days=30,
         remove_empty_dirs=True,
+        # This test instruments Phase 3's semaphore machinery directly; eager
+        # rmdir (3.0.0 default) would delete the dirs during the Phase 2 scan
+        # and leave Phase 3 nothing to do. Pin the deferred path.
+        eager_empty_rmdir=False,
         max_concurrency_deletion=10,  # Low concurrency to test semaphore behavior
         dry_run=False,
     )
@@ -197,6 +201,10 @@ async def test_queue_processing_with_memory_checks(temp_dir):
         root_path=str(temp_dir),
         max_age_days=30,
         remove_empty_dirs=True,
+        # This test instruments Phase 3's producer/queue machinery directly;
+        # eager rmdir (3.0.0 default) would delete the dirs during the Phase 2
+        # scan and leave Phase 3 nothing to do. Pin the deferred path.
+        eager_empty_rmdir=False,
         max_concurrency_deletion=1000,
         memory_limit_mb=500,  # Reasonable limit
         max_empty_dirs_to_delete=0,

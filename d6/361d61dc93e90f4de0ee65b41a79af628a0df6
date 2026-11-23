@@ -1,0 +1,59 @@
+tests/test_empty_dirs_performance.py
+  s_7eae92401defc7::t_ff157bb11d4111 204-207
+  s_7eae92401defc7::t_9fc37535fdefa7 109-112
+README.md
+  s_7eae92401defc7::t_2ab0e7cf4232e4 212-278
+  s_7eae92401defc7::t_f871dc5abc81b4 614
+  s_7eae92401defc7::t_a7d9426f34d6db 158-159
+CHANGELOG.md
+  s_7eae92401defc7::t_faf6c15d62f5db 8-28
+scripts/mysql-split.yaml
+  s_7eae92401defc7::t_253af72798e1da 1-853
+src/efspurge/purger.py
+  s_7eae92401defc7::t_2fbc7475ecb161 520-524
+  s_7eae92401defc7::t_4d9049f81f468a 645
+  s_7eae92401defc7::t_3f3444b75fbd4c 695
+  s_7eae92401defc7::t_d68dfd16c625e4 489
+  s_7eae92401defc7::t_13e1bc7507509c 823-825,827-830,832-837
+  s_7eae92401defc7::t_6727112ec0f59d 849-860
+  s_7eae92401defc7::t_86b005d395f806 2894-2905
+  s_7eae92401defc7::t_26a82435f7211f 3575
+  s_7eae92401defc7::t_242e329a0a57a7 3846
+  s_7eae92401defc7::t_375b61d9a56afd 3374-3376
+  s_7eae92401defc7::t_6fad5eb803149f 3902
+  s_7eae92401defc7::t_7f01ea5ce4f3a5 817-822,826,831,838-848,861-864
+src/efspurge/cli.py
+  s_7eae92401defc7::t_3a40cdc8fcc8a1 344
+  s_7eae92401defc7::t_99fb3096bb9a7a 120-133
+  s_b1ca86226bc3be::t_3275ccfa1768c1 119
+tests/test_eager_empty_rmdir.py
+  s_7eae92401defc7::t_bf9b5c50303aae 111
+  s_7eae92401defc7::t_ac7c3402b379e0 1-80,82-97,99-110,112-205
+  s_7eae92401defc7::t_59085dc10d8699 81,98
+pyproject.toml
+  s_7eae92401defc7::t_0ba42196be6a38 7
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.20",
+  "base_commit_sha": "d6361d61dc93e90f4de0ee65b41a79af628a0df6",
+  "prompts": {},
+  "sessions": {
+    "s_7eae92401defc7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6ed0febf-2d86-43a5-8ffb-4062a300ab8a",
+        "model": "zai-org/GLM-5.3"
+      },
+      "human_author": "Alon Almog <alon.almog@boomi.com>"
+    },
+    "s_b1ca86226bc3be": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "058cd8de-5683-4c88-bdb1-4c36ea948df4",
+        "model": "unknown"
+      },
+      "human_author": "Alon Almog <alon.almog@boomi.com>"
+    }
+  }
+}
